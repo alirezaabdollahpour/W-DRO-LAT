@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-PyTorch Checkpoint Downloader for Google Drive
-Optimized for downloading .pt checkpoint files from Google Drive folders.
-Supports multiple download methods with fallback strategies.
-"""
+
 
 import os
 import sys
@@ -32,15 +28,7 @@ class CheckpointFile:
 
 
 class PyTorchCheckpointDownloader:
-    """
-    A robust downloader for PyTorch checkpoint files from Google Drive.
-    
-    Supports multiple download methods:
-    1. gdown with folder download
-    2. gdown with individual file IDs
-    3. curl with cookie handling
-    4. wget with authentication
-    """
+
     
     def __init__(self, download_path: str, timeout: int = 600):
         """
@@ -407,13 +395,7 @@ def main():
         timeout=600  # 10 minutes timeout
     )
     
-    # Option 2: Specify exact files if you know them (uncomment and modify as needed)
-    # specific_files = ["checkpoint_epoch_100.pt", "best_model.pt", "final_weights.pt"]
-    # downloader = PyTorchCheckpointDownloader(
-    #     download_path=DOWNLOAD_PATH,
-    #     timeout=600,
-    #     expected_files=specific_files
-    # )
+
     
     # Start download
     success = downloader.download_checkpoints(DRIVE_URL)
