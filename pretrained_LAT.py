@@ -23,7 +23,8 @@ Notes
 -----
 * --inp-eps, --inp-step-size are in **pixel units** (e.g., 8/255).
 * Pretrained loader is robust to common checkpoint formats:
-  - raw state_dict, or a dict containing "state_dict" / "model" (optionally with "module." prefix).
+  - raw state_dict, or a dict containing "state_dict" / "model" (optionally with "module." prefix),
+    or wrapper dicts like {"last": <state_dict>, "best": <state_dict>, "swa_last": ..., ...}.
 """
 
 import argparse
@@ -42,13 +43,9 @@ from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as T
 import numpy as np
+import warnings
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
-
+warnings.filterwarnings("ignore", category=UserWarning)
 # import your utils-style models
 from model import ResNet18 as ResNet18Plain
 from model import PreActResNet18
@@ -177,8 +174,6 @@ class HeadFromBackbone(nn.Module):
         cl = self.cut_layer
 
         if cl == "conv1":
-            # We assume u is already at the output of conv1(+bn+relu for plain).
-            # Continue with the rest of the network:
             z = self.base.layer1(u)
             z = self.base.layer2(z)
             z = self.base.layer3(z)
@@ -204,7 +199,6 @@ class HeadFromBackbone(nn.Module):
             return self._finish_from_layer4(u)
 
         elif cl == "avgpool":
-            # Expect pooled (flattened) features; support NHWC map just in case.
             if u.dim() == 4:
                 u = F.avg_pool2d(u, 4)
                 u = u.view(u.size(0), -1)
@@ -232,16 +226,13 @@ class PhiFromBackbone(nn.Module):
         cl = self.cut_layer
 
         if cl == "conv1":
-            # Match each backbone's real pre-processing as closely as possible
             if hasattr(self.base, "normalize"):
                 x = self.base.normalize(x)
             x = self.base.conv1(x)
-            # plain ResNet has bn1+relu after conv1; PreActResNet does not
             if hasattr(self.base, "bn1"):
                 x = F.relu(self.base.bn1(x))
             return x
 
-        # For block outputs we rely on the backbone's own forward with return_features
         block_map = {"layer1": 1, "layer2": 2, "layer3": 3, "layer4": 4, "avgpool": 5}
         rb = block_map[cl]
         return self.base(x, return_features=True, return_block=rb)
@@ -254,8 +245,6 @@ def build_split_resnet18(
 ):
     """
     Build (Phi, Head) from a utils-style ResNet18 backbone.
-    - If 'base' is provided, it must be an instance of your utils-style model (ResNet18 or PreActResNet18).
-    - If 'base' is None, we default to PreActResNet18(num_classes=10, model_width=64).
     """
     if base is None:
         base = PreActResNet18(n_cls=num_classes, model_width=64)
@@ -269,59 +258,99 @@ def build_split_resnet18(
 # Pretrained loading helpers for utils-style backbones
 # -----------------------------
 
-def _strip_prefixes(sd: dict) -> dict:
-    """Strip common prefixes like 'module.' or 'model.' from a state dict."""
+def _looks_like_state_dict(obj) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    if len(obj) == 0:
+        return False
+    tensorish = 0
+    total = 0
+    for k, v in obj.items():
+        if not isinstance(k, str):
+            return False
+        total += 1
+        if isinstance(v, (torch.Tensor, nn.Parameter)):
+            tensorish += 1
+    return (tensorish >= max(1, total // 2)) and any("." in k for k in obj.keys())
+
+def _unwrap_state_dict(maybe_sd):
+    """
+    Accepts either:
+      - a raw state_dict
+      - a checkpoint dict containing nested state dicts under:
+          'state_dict', 'model', 'net', 'ema_state', 'model_ema', 'ema',
+          'model_state', 'model_state_dict', 'weights', 'params',
+          or wrappers like: {'last': sd, 'best': sd, 'swa_last': sd, 'swa_best': sd}
+    Returns a clean state_dict with common prefixes stripped and fc/linear remapped if needed.
+    """
+    if _looks_like_state_dict(maybe_sd):
+        sd = maybe_sd
+    elif isinstance(maybe_sd, dict):
+        priority = [
+            "state_dict", "model", "net",
+            "ema_state", "model_ema", "ema",
+            "model_state", "model_state_dict",
+            "weights", "params",
+            "last", "best", "swa_last", "swa_best",
+        ]
+        sd = None
+
+        for k in priority:
+            if k in maybe_sd:
+                cand = maybe_sd[k]
+                if _looks_like_state_dict(cand):
+                    sd = cand
+                    break
+                if isinstance(cand, dict) and "state_dict" in cand and _looks_like_state_dict(cand["state_dict"]):
+                    sd = cand["state_dict"]
+                    break
+
+        if sd is None:
+            best = None
+            best_len = -1
+            for v in maybe_sd.values():
+                if _looks_like_state_dict(v) and len(v) > best_len:
+                    best = v
+                    best_len = len(v)
+                elif isinstance(v, dict) and "state_dict" in v and _looks_like_state_dict(v["state_dict"]):
+                    if len(v["state_dict"]) > best_len:
+                        best = v["state_dict"]
+                        best_len = len(v["state_dict"])
+            if best is not None:
+                sd = best
+
+        if sd is None:
+            sd = maybe_sd
+    else:
+        sd = maybe_sd
+
     cleaned = {}
     for k, v in sd.items():
+        if not isinstance(k, str):
+            continue
         if k.startswith("module."):
-            cleaned[k[len("module.") :]] = v
+            k2 = k[len("module."):]
         elif k.startswith("model."):
-            cleaned[k[len("model.") :]] = v
+            k2 = k[len("model."):]
         else:
-            cleaned[k] = v
-    return cleaned
+            k2 = k
+        cleaned[k2] = v
 
-def _looks_like_state_dict(d: dict) -> bool:
-    # Heuristic: tensors as values and keys look like parameter names
-    return any(isinstance(v, torch.Tensor) for v in d.values())
+    remapped = {}
+    for k, v in cleaned.items():
+        if k.startswith("fc."):
+            remapped["linear." + k[len("fc."):]] = v
+        else:
+            remapped[k] = v
 
-def _extract_state_dict(ckpt: dict) -> dict:
-    """
-    Robustly extract a state_dict from:
-      - raw state dict
-      - {state_dict: ...}, {model: ...}, {net: ...}, {weights: ...}, {params: ...}
-      - EPFL-style wrappers: {last: {state_dict: ...}, best: {...}, swa_last: {...}, swa_best: {...}}
-    """
-    if not isinstance(ckpt, dict):
-        raise RuntimeError("Checkpoint is not a dictionary; cannot extract a state_dict.")
+    final_sd = {}
+    for k, v in remapped.items():
+        if k.startswith("linear.") and "fc.weight" in remapped or "fc.bias" in remapped:
+            final_sd[k] = v
+        else:
+            final_sd[k] = v
+    return final_sd
 
-    # 1) Direct top-level containers
-    for key in ["state_dict", "model", "net", "weights", "params"]:
-        if key in ckpt and isinstance(ckpt[key], dict):
-            inner = ckpt[key]
-            if _looks_like_state_dict(inner):
-                return _strip_prefixes(inner)
-
-    # 2) EPFL-style multi-snapshot wrappers
-    for wrapper_key in ["best", "last", "swa_best", "swa_last", "ema", "model_ema"]:
-        if wrapper_key in ckpt and isinstance(ckpt[wrapper_key], dict):
-            inner = ckpt[wrapper_key]
-            # inner might directly be a state dict
-            if _looks_like_state_dict(inner):
-                return _strip_prefixes(inner)
-            # inner might contain another layer with 'state_dict' / 'model' / ...
-            for key in ["state_dict", "model", "net", "weights", "params"]:
-                if key in inner and isinstance(inner[key], dict) and _looks_like_state_dict(inner[key]):
-                    return _strip_prefixes(inner[key])
-
-    # 3) Maybe the whole ckpt is already a raw state dict
-    if _looks_like_state_dict(ckpt):
-        return _strip_prefixes(ckpt)
-
-    raise RuntimeError(
-        "Could not find a state_dict in the checkpoint. "
-        "Tried keys: state_dict/model/net/weights/params and wrappers best/last/swa_*."
-    )
 
 def load_pretrained_resnet18(
     pretrained_path: str,
@@ -331,39 +360,40 @@ def load_pretrained_resnet18(
 ):
     """
     Load a PRETRAINED utils-style backbone (either ResNet18 plain or PreActResNet18)
-    trained on CIFAR-10 from EPFL's repo.
-
-    Auto-detects architecture from the checkpoint keys:
-      - If a ROOT-LEVEL key starts with 'bn1.'  -> plain ResNet18
-      - Else if a ROOT-LEVEL key starts with 'bn.' -> PreActResNet18
-      - Else defaults to PreActResNet18
+    trained on CIFAR-10 from EPFL's repo (or similar).
     """
-    # Default fresh model if no path provided
     if not pretrained_path:
         return PreActResNet18(n_cls=num_classes, model_width=64)
 
     ckpt = torch.load(pretrained_path, map_location=device)
-    sd = _extract_state_dict(ckpt)  # <-- robust extraction
+    sd = _unwrap_state_dict(ckpt)
 
-    # Root key detection (only the first token before '.')
     root_keys = {k.split('.', 1)[0] for k in sd.keys()}
-    if "bn1" in root_keys:   # plain (has root bn1)
+    if "bn1" in root_keys:
         base = ResNet18Plain(n_cls=num_classes, model_width=64,
                              normalize_features=False, normalize_logits=False)
         arch = "ResNet18 (plain)"
-    elif "bn" in root_keys:  # preact (has root bn)
+    elif "bn" in root_keys:
         base = PreActResNet18(n_cls=num_classes, model_width=64,
                               normalize_features=False, normalize_logits=False)
         arch = "PreActResNet18"
     else:
-        # Fallback to PreActResNet18 (most common in the repo)
         base = PreActResNet18(n_cls=num_classes, model_width=64,
                               normalize_features=False, normalize_logits=False)
         arch = "PreActResNet18 (fallback)"
 
-    missing, unexpected = base.load_state_dict(sd, strict=False)  # load non-strict first
+    missing, unexpected = base.load_state_dict(sd, strict=False)
+
     if strict and (len(missing) > 0 or len(unexpected) > 0):
-        raise RuntimeError(f"Strict load failed. Missing keys: {missing}, Unexpected keys: {unexpected}")
+        raise RuntimeError(
+            "Strict load failed.\n"
+            f"  Architecture detected: {arch}\n"
+            f"  Missing keys: {list(missing)}\n"
+            f"  Unexpected keys: {list(unexpected)}\n"
+            "Hint: your checkpoint may store weights under nested keys (e.g., 'last', 'best'). "
+            "This loader now unwraps those automatically. If you still see this, your checkpoint "
+            "may be for a different architecture."
+        )
 
     print(f"[Pretrained] Loaded {arch} weights from: {pretrained_path}")
     if missing:
@@ -372,7 +402,6 @@ def load_pretrained_resnet18(
         print(f"[Pretrained] Unexpected keys (ignored): {unexpected}")
 
     return base
-
 
 
 # -----------------------------
@@ -620,7 +649,7 @@ def jacobian_aware_latent_eps(phi, loader, device, inp_eps: float, p_input, n_ba
     Returns (L_hat, eps_latent_target). In this code, **eps_latent_target = L_hat**,
     matching the provided "good code".
     """
-    _ = _num_input_dims_from_loader(loader)  # kept for parity; not used when eps_latent_target=L_hat
+    _ = _num_input_dims_from_loader(loader)
     L_hat = estimate_L_hat(phi, loader, device, n_batches=n_batches, power_iters=power_iters)
     eps_latent_target = L_hat
     return L_hat, eps_latent_target
@@ -631,33 +660,66 @@ def jacobian_aware_latent_eps(phi, loader, device, inp_eps: float, p_input, n_ba
 # -----------------------------
 
 def train_one_epoch(phi, head, loader, optimizer, device, method, inner_cfg: InnerConfig, head_only: bool):
+    """
+    Rigorous outer gradient:
+      1) Solve inner problem in latent space -> delta_star (detached).
+      2) Compute u_adv = u0 + delta_star (delta_star treated constant).
+      3) Compute loss = CE(head(u_adv), y). (For WRM, penalty only for logging.)
+      4) g_u = d loss / d u_adv.
+      5) Head grads: ∂ loss / ∂ θ_h via autograd.grad(loss, head.parameters()).
+      6) Phi grads: autograd.grad(u0, phi.parameters(), grad_outputs=g_u) = (∇_u ℓ) J_{θ_φ} u0.
+    """
     phi.train(not head_only)
     head.train()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
+
     for x, y in loader:
         x = x.to(device); y = y.to(device)
+
+        # Reset grads
         optimizer.zero_grad()
-        u0 = phi(x)
-        if method == "erm":
-            logits = head(u0)
-            loss = F.cross_entropy(logits, y)
-            loss.backward()
-        else:
-            delta_star, _ = inner_max_delta(u0.detach() if head_only else u0, head, y, inner_cfg)
-            logits = head(u0 + delta_star.detach())
-            if method == "wrm-latent":
-                penalty = 0.5 * inner_cfg.gamma * (delta_star.view(delta_star.size(0), -1).pow(2).sum(dim=1)).mean()
-                loss = F.cross_entropy(logits, y) - penalty
-            else:
-                loss = F.cross_entropy(logits, y)
-            loss.backward()
+
+        # Forward to latent (ensure we can differentiate w.r.t. phi params)
+        u0 = phi(x)  # u0 depends on θ_φ
+
+        # Inner maximization (no gradient to u* mapping; we will detach delta*)
+        delta_star, info_inner = inner_max_delta(u0.detach() if head_only else u0, head, y, inner_cfg)
+        u_adv = u0 + delta_star.detach()  # treat argmax output as constant (Danskin)
+
+        # Outer objective: ONLY CE at u* (WRM penalty is not backpropagated)
+        logits = head(u_adv)
+        ce_loss = F.cross_entropy(logits, y, reduction='mean')
+
+        # ---- Compute rigorous gradients explicitly ----
+        # 1) Gradient wrt head parameters
+        head_params = [p for p in head.parameters() if p.requires_grad]
+        if len(head_params) > 0:
+            head_grads = torch.autograd.grad(ce_loss, head_params, retain_graph=True, allow_unused=True)
+            for p, g in zip(head_params, head_grads):
+                if g is not None:
+                    p.grad = g.detach()
+
+        # 2) Gradient wrt phi parameters via (∇_u ℓ) J_{θ_φ} u0
+        phi_params = [p for p in phi.parameters() if p.requires_grad]
+        if (not head_only) and len(phi_params) > 0:
+            # ∇_u ℓ at u* (u_adv)
+            g_u = torch.autograd.grad(ce_loss, u_adv, retain_graph=True)[0]
+            # vJP through u0 = Φ(x)
+            phi_grads = torch.autograd.grad(u0, phi_params, grad_outputs=g_u, retain_graph=False, allow_unused=True)
+            for p, g in zip(phi_params, phi_grads):
+                if g is not None:
+                    p.grad = g.detach()
+
+        # Step
         optimizer.step()
+
         with torch.no_grad():
-            total_loss += loss.item() * x.size(0)
+            total_loss += ce_loss.item() * x.size(0)
             total_correct += (logits.argmax(dim=1) == y).sum().item()
             total_samples += x.size(0)
+
     return total_loss / total_samples, total_correct / total_samples
 
 @torch.no_grad()
@@ -882,7 +944,7 @@ def parse_args():
         choices=["conv1", "layer1", "layer2", "layer3", "layer4", "avgpool"],
         help="Layer where the model is split; adversary lives in this latent space.")
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.01,  # slightly lower LR for fine-tuning
+    parser.add_argument("--lr", type=float, default=0.01,
                         help="Learning rate for fine-tuning.")
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
@@ -1047,7 +1109,6 @@ def main():
                       f"using {args.wrm_init_batches} batch(es) (target latent eps={base_inner_cfg.eps:.6f}).")
             jacobian_ready = True
 
-        # Legacy adversarial start at epoch 1 (no split)
         if (not use_split_schedule) and in_adv_phase and args.jacobian_aware and (not jacobian_ready):
             L_hat_used, eps_latent_target_used = jacobian_aware_latent_eps(
                 phi, trainloader, device,
@@ -1083,7 +1144,7 @@ def main():
             wrm_alpha_min=base_inner_cfg.wrm_alpha_min, wrm_alpha_max=base_inner_cfg.wrm_alpha_max
         )
 
-        # Train + eval
+        # Train + eval (rigorous outer gradient implemented inside)
         train_loss, train_acc = train_one_epoch(phi, head, trainloader, optimizer, device, current_method, epoch_inner_cfg, args.head_only)
         test_loss, test_acc = evaluate(phi, head, testloader, device)
         robust_acc, rinfo = evaluate_under_latent_attack(phi, head, testloader, device, args.eval_attack, epoch_inner_cfg)
@@ -1126,7 +1187,6 @@ def main():
             msg += f" | L_hat {L_hat_used:.4f} → eps_latent {base_inner_cfg.eps:.5f}"
         print(msg)
 
-        # CSV
         append_row(args.log_csv, {
             "run_id": run_id,
             "time_iso": datetime.now().isoformat(timespec="seconds"),
