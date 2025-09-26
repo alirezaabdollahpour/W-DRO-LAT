@@ -53,18 +53,25 @@ from model import PreActResNet18
 # -----------------------------
 # Utilities
 # -----------------------------
+seed = 1
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
 
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
 
-def set_seed(seed: int = 1):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
+# def set_seed(seed: int = 1):
+    # torch.manual_seed(seed)
+    # torch.cuda.manual_seed_all(seed)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    # import random
+    # random.seed(seed)
+    # np.random.seed(seed)
 
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -940,11 +947,11 @@ def parse_args():
                         help="(Legacy) Training method if no split schedule is specified.")
 
     # Model / optimization
-    parser.add_argument("--cut-layer", type=str, default="layer2",
+    parser.add_argument("--cut-layer", type=str, default="layer4",
         choices=["conv1", "layer1", "layer2", "layer3", "layer4", "avgpool"],
         help="Layer where the model is split; adversary lives in this latent space.")
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.01,
+    parser.add_argument("--lr", type=float, default=0.1,
                         help="Learning rate for fine-tuning.")
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
@@ -1018,7 +1025,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
+    # set_seed(args.seed)
     device = get_device()
     print("Using device:", device)
 
