@@ -26,3 +26,5 @@ cifar10_variants/
 cifar10_variants/*
 *.npy
 *.npz
+figures/
+figures/*
