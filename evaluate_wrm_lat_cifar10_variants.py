@@ -9,19 +9,21 @@ What this script does
 2) Reconstructs your utils-style backbone (PreActResNet18 or ResNet18Plain)
    from a **future-proof checkpoint** you saved (with keys: arch, arch_init, state_dict, cut_layer, args, ...).
 3) Applies the **same CIFAR-10 normalization** used in your WRM-LAT code and evaluates clean accuracy.
+4) Optionally evaluates **input-space PGD** (pixel units) on CIFAR-10/10.1/10.2.
 
 Notes
 -----
-* We evaluate using the **backbone forward** directly (no phi/head split needed for clean eval).
-* If you trained with CIFAR10 normalization in the dataloaders (as in your script), we do the same here.
+* We evaluate using the **backbone forward** directly (no phi/head split needed for clean or PGD eval).
+* Datasets are normalized with CIFAR10 mean/std. For PGD, we perturb in pixel space [0,1]
+  and then re-normalize before feeding into the model (matching your training-eval style).
 * The checkpoint loader matches the format you used in your saving block (arch/arch_init/state_dict/... on CPU).
 
 Usage
 -----
 python evaluate_wrm_lat_cifar10_variants.py \
   --ckpt /path/to/your_saved_wrm_lat.ckpt \
-  --batch-size 256 --num-workers 4
-
+  --batch-size 256 --num-workers 4 \
+  --inp-eps 0.031372549 --inp-steps 20 --inp-restarts 5
 """
 
 import os
@@ -33,38 +35,43 @@ from urllib.request import urlretrieve
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-import torchvision
-import torchvision.transforms as T
-
-# ---- import your utils-style models (same as in your WRM-LAT script) ----
+from tqdm.auto import tqdm
 from model import ResNet18 as ResNet18Plain  # alias kept consistent with your code
 from model import PreActResNet18
+
+from utils import (
+    auto_pgd_step_size,
+    evaluate_under_input_pgd,
+    dataloader_seed,
+    get_cifar10_loader,
+    get_device,
+    set_deterministic,
+    to_normalized,
+    unwrap_state_dict,
+)
 
 # -----------------------------
 # Globals & utilities
 # -----------------------------
-CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
-CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
-
-
-def get_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def set_deterministic(seed: int = 1):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    np.random.seed(seed)
+def _infer_arch_from_state_dict(sd: dict) -> str:
+    """
+    Simple heuristic:
+      - if top-level has 'bn1' (root BN at stem), assume ResNet18Plain
+      - if top-level has 'bn' (tail BN as in PreAct), assume PreActResNet18
+    """
+    roots = {k.split(".", 1)[0] for k in sd.keys()}
+    if "bn1" in roots:
+        return "ResNet18Plain"
+    if "bn" in roots:
+        return "PreActResNet18"
+    # default to PreActResNet18
+    return "PreActResNet18"
 
 
 # -----------------------------
 # Checkpoint loader (matches your WRM-LAT save format)
 # -----------------------------
-
 def load_backbone_from_ckpt(path: str, device: torch.device):
     ckpt = torch.load(path, map_location="cpu")
 
@@ -105,7 +112,6 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
 # -----------------------------
 # Download & load CIFAR-10.1 / CIFAR-10.2
 # -----------------------------
-
 def download_cifar10_variants(data_dir: str = "./cifar10_variants"):
     os.makedirs(data_dir, exist_ok=True)
 
@@ -120,8 +126,8 @@ def download_cifar10_variants(data_dir: str = "./cifar10_variants"):
         "cifar102_test.npy": "https://github.com/modestyachts/cifar-10.2/raw/61b0e3ac09809a2351379fb54331668cc9c975c4/cifar102_test.npy",
     }
 
-    def _dl(url_map):
-        for fname, url in url_map.items():
+    def _dl(url_map, desc):
+        for fname, url in tqdm(url_map.items(), desc=desc, leave=False):
             fpath = os.path.join(data_dir, fname)
             if not os.path.exists(fpath):
                 print(f"Downloading {fname} ...")
@@ -131,8 +137,8 @@ def download_cifar10_variants(data_dir: str = "./cifar10_variants"):
                 print(f"  ✓ {fname} already exists")
 
     print("[download] CIFAR-10.1 & CIFAR-10.2")
-    _dl(c10_1)
-    _dl(c10_2)
+    _dl(c10_1, "CIFAR-10.1 files")
+    _dl(c10_2, "CIFAR-10.2 files")
 
     return {
         "c10_1_data": os.path.join(data_dir, "cifar10.1_v6_data.npy"),
@@ -153,19 +159,12 @@ def _to_nchw_float01(arr: np.ndarray) -> np.ndarray:
     return a
 
 
-def _normalize_in_place(t: torch.Tensor, mean=CIFAR10_MEAN, std=CIFAR10_STD) -> torch.Tensor:
-    # t: (N, C, H, W) in [0,1]
-    m = torch.tensor(mean, dtype=t.dtype).view(1, 3, 1, 1)
-    s = torch.tensor(std, dtype=t.dtype).view(1, 3, 1, 1)
-    return (t - m) / s
-
-
 def load_cifar10_1_as_dataset(data_path: str, labels_path: str) -> TensorDataset:
     data = np.load(data_path)
     labels = np.load(labels_path)
     x = torch.from_numpy(_to_nchw_float01(data)).float()
     y = torch.from_numpy(np.array(labels, dtype=np.int64)).long()
-    x = _normalize_in_place(x)
+    x = to_normalized(x)
     return TensorDataset(x, y)
 
 
@@ -200,52 +199,62 @@ def load_cifar10_2_test_as_dataset(file_path: str) -> TensorDataset:
 
     x = torch.from_numpy(_to_nchw_float01(images)).float()
     y = torch.from_numpy(np.array(labels, dtype=np.int64)).long()
-    x = _normalize_in_place(x)
+    x = to_normalized(x)
     return TensorDataset(x, y)
-
-
-# -----------------------------
-# Standard CIFAR-10 test loader (with the same normalization)
-# -----------------------------
-
-def get_cifar10_test_loader(batch_size=256, num_workers=2):
-    transform_test = T.Compose([
-        T.ToTensor(),
-        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-    ])
-    testset = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
-    return DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True), len(testset)
-
-
 # -----------------------------
 # Evaluation
 # -----------------------------
-
 @torch.no_grad()
 def eval_clean(base_model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     base_model.eval()
     total, correct = 0, 0
-    for x, y in loader:
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    progress = tqdm(loader, desc="Clean Eval", leave=False, total=total_batches)
+    for x, y in progress:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         logits = base_model(x)
         pred = logits.argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
-    return 100.0 * correct / max(1, total)
+    dataset_size = len(loader.dataset) if hasattr(loader, "dataset") else total
+    if hasattr(loader, "dataset") and total != dataset_size:
+        raise RuntimeError(
+            f"eval_clean consumed {total} samples but dataset has {dataset_size}."
+            " Ensure DataLoader iterates the full set."
+        )
+    progress.close()
+    return 100.0 * correct / max(1, dataset_size)
 
 
 # -----------------------------
 # Main
 # -----------------------------
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Evaluate WRM-LAT checkpoint on CIFAR-10 / 10.1 / 10.2")
+    p = argparse.ArgumentParser(description="Evaluate WRM-LAT checkpoint on CIFAR-10 / 10.1 / 10.2 (+ optional input-PGD)")
     p.add_argument("--ckpt", type=str, required=True, help="Path to saved WRM-LAT checkpoint (.ckpt/.pth)")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-json", type=str, default="cifar10_variants_eval.json")
+
+    # Optional: evaluate a clean/natural pretrained backbone instead of WRM-LAT ckpt
+    p.add_argument("--natural-model", action="store_true",
+                   help="If set, load a natural/clean pretrained backbone from a .pt/.pth file instead of the WRM ckpt")
+    p.add_argument("--natural-model-path", type=str, default=".",
+                   help="Path to the natural model .pt/.pth file (e.g., /mnt/.../R2.pt)")
+
+    # Input-space PGD config (pixel units)
+    p.add_argument("--inp-p", type=str, default="inf", choices=["2", "inf"],
+                   help="Norm for input-space PGD evaluation")
+    p.add_argument("--inp-eps", type=float, default=8/255,
+                   help="Epsilon (pixel units) for input-space PGD")
+    p.add_argument("--inp-steps", type=int, default=0,
+                   help="Steps for input-space PGD (0 disables PGD evaluation)")
+    p.add_argument("--inp-step-size", type=float, default=0.0,
+                   help="Step size for input-space PGD (pixel units). If <=0, auto = 2*eps/steps")
+    p.add_argument("--inp-restarts", type=int, default=5,
+                   help="Random restarts for input-space PGD")
     return p.parse_args()
 
 
@@ -259,8 +268,41 @@ def main():
     base, meta = load_backbone_from_ckpt(args.ckpt, device)
     print(f"[ckpt] arch={meta['arch']}  cut_layer={meta['cut_layer']}  epoch={meta['epoch']}  date={meta['date']}")
 
+    # ---- Robust NATURAL (clean) model block ----
+    # If requested, REPLACE 'base' with a clean pretrained backbone loaded from a raw .pt/.pth
+    if args.natural_model:
+        nat_path = args.natural_model_path
+        if not os.path.isfile(nat_path):
+            raise FileNotFoundError(f"--natural-model was set, but file not found: {nat_path}")
+
+        print(f"[natural] Loading clean pretrained backbone from: {nat_path}")
+        ckpt_nat = torch.load(nat_path, map_location="cpu")
+        sd_nat = unwrap_state_dict(ckpt_nat)
+        nat_arch = _infer_arch_from_state_dict(sd_nat)
+        nat_init = dict(n_cls=10, model_width=64, normalize_features=False, normalize_logits=False)
+
+        if nat_arch == "PreActResNet18":
+            base_nat = PreActResNet18(**nat_init)
+        else:
+            base_nat = ResNet18Plain(**nat_init)
+
+        missing, unexpected = base_nat.load_state_dict(sd_nat, strict=False)
+        if missing or unexpected:
+            print(f"[natural] non-strict load => missing={missing}, unexpected={unexpected}")
+
+        base = base_nat  # replace the model to be evaluated
+        base.to(device).eval()
+        print(f"[natural] Loaded as {nat_arch}. (Normalization remains as in this eval script.)")
+
     # 2) CIFAR-10 test loader
-    c10_loader, c10_len = get_cifar10_test_loader(batch_size=args.batch_size, num_workers=args.num_workers)
+    c10_loader, c10_len = get_cifar10_loader(
+        "test",
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle_train=False,
+        augment_train=False,
+        seed=args.seed,
+    )
     print(f"✓ CIFAR-10 test set: {c10_len} samples")
 
     # 3) Download + set up CIFAR-10.1 & 10.2
@@ -269,8 +311,30 @@ def main():
     c101_ds = load_cifar10_1_as_dataset(paths["c10_1_data"], paths["c10_1_labels"]) if os.path.exists(paths["c10_1_data"]) else None
     c102_ds = load_cifar10_2_test_as_dataset(paths["c10_2_test"]) if os.path.exists(paths["c10_2_test"]) else None
 
-    c101_loader = DataLoader(c101_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True) if c101_ds is not None else None
-    c102_loader = DataLoader(c102_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True) if c102_ds is not None else None
+    c101_loader = None
+    if c101_ds is not None:
+        gen_c101, worker_c101 = dataloader_seed(args.seed, offset=2)
+        c101_loader = DataLoader(
+            c101_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            worker_init_fn=worker_c101,
+            generator=gen_c101,
+        )
+    c102_loader = None
+    if c102_ds is not None:
+        gen_c102, worker_c102 = dataloader_seed(args.seed, offset=3)
+        c102_loader = DataLoader(
+            c102_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            worker_init_fn=worker_c102,
+            generator=gen_c102,
+        )
 
     # 4) Evaluate
     results = {
@@ -280,6 +344,8 @@ def main():
         "arch": meta["arch"],
         "arch_init": meta["arch_init"],
         "cut_layer": meta["cut_layer"],
+        "used_natural_model": bool(args.natural_model),
+        "natural_model_path": os.path.abspath(args.natural_model_path) if args.natural_model else None,
         "scores": {},
     }
 
@@ -301,6 +367,66 @@ def main():
         results["scores"]["cifar10.2_test"] = round(acc_c102, 2)
     else:
         print("  CIFAR-10.2 : (not available)")
+
+    # 4.b) Optional: Input-space PGD evaluation (pixel units)
+    if args.inp_steps > 0 and args.inp_eps > 0:
+        print("\nEvaluating input-space PGD (pixel units)...")
+        p_value = 2 if args.inp_p == "2" else float("inf")
+        step_size_used = auto_pgd_step_size(p_value, args.inp_eps, args.inp_steps, args.inp_step_size)
+        results["scores"]["pgd_params"] = {
+            "p": args.inp_p,
+            "eps": args.inp_eps,
+            "steps": args.inp_steps,
+            "step_size": step_size_used,
+            "restarts": args.inp_restarts,
+        }
+
+        phi_identity = nn.Identity().to(device)
+
+        def run_input_pgd(loader):
+            return evaluate_under_input_pgd(
+                phi_identity,
+                base,
+                loader,
+                device,
+                p=p_value,
+                eps=args.inp_eps,
+                steps=args.inp_steps,
+                step_size=step_size_used,
+                restarts=args.inp_restarts,
+            )
+
+        acc_pgd_c10, info_c10 = run_input_pgd(c10_loader)
+        print(f"  CIFAR-10   PGD: {acc_pgd_c10:.2f}% (avg L2 {info_c10['avg_l2']:.3f}, Linf {info_c10['avg_linf']:.3f})")
+        results["scores"]["cifar10_pgd"] = {
+            "acc": round(acc_pgd_c10, 2),
+            "avg_l2": round(info_c10["avg_l2"], 4),
+            "avg_linf": round(info_c10["avg_linf"], 4),
+        }
+
+        if c101_loader is not None:
+            acc_pgd_c101, info_c101 = run_input_pgd(c101_loader)
+            print(f"  CIFAR-10.1 PGD: {acc_pgd_c101:.2f}% (avg L2 {info_c101['avg_l2']:.3f}, Linf {info_c101['avg_linf']:.3f})")
+            results["scores"]["cifar10.1_v6_pgd"] = {
+                "acc": round(acc_pgd_c101, 2),
+                "avg_l2": round(info_c101["avg_l2"], 4),
+                "avg_linf": round(info_c101["avg_linf"], 4),
+            }
+        else:
+            print("  CIFAR-10.1 PGD: (not available)")
+
+        if c102_loader is not None:
+            acc_pgd_c102, info_c102 = run_input_pgd(c102_loader)
+            print(f"  CIFAR-10.2 PGD: {acc_pgd_c102:.2f}% (avg L2 {info_c102['avg_l2']:.3f}, Linf {info_c102['avg_linf']:.3f})")
+            results["scores"]["cifar10.2_test_pgd"] = {
+                "acc": round(acc_pgd_c102, 2),
+                "avg_l2": round(info_c102["avg_l2"], 4),
+                "avg_linf": round(info_c102["avg_linf"], 4),
+            }
+        else:
+            print("  CIFAR-10.2 PGD: (not available)")
+    else:
+        print("\nInput-space PGD: disabled (use --inp-steps > 0 to enable)")
 
     # 5) Save JSON
     with open(args.save_json, "w") as f:

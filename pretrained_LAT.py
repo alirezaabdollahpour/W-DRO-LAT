@@ -40,65 +40,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torchvision
-import torchvision.transforms as T
 import numpy as np
 import warnings
+from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore", category=UserWarning)
-# import your utils-style models
+
 from model import ResNet18 as ResNet18Plain
 from model import PreActResNet18
 
-# -----------------------------
-# Utilities
-# -----------------------------
-seed = 1
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-
-
-CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
-CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
-
-# def set_seed(seed: int = 1):
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
-    # import random
-    # random.seed(seed)
-    # np.random.seed(seed)
-
-def get_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def per_sample_l2_normalize(t: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    B = t.size(0)
-    flat = t.view(B, -1)
-    norms = flat.norm(p=2, dim=1).clamp(min=eps)  # (B,)
-    reshape = (B,) + (1,) * (t.dim() - 1)
-    return t / norms.view(reshape)
-
-def to_pixel(x_norm: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor(CIFAR10_MEAN, device=x_norm.device).view(1, 3, 1, 1)
-    std  = torch.tensor(CIFAR10_STD,  device=x_norm.device).view(1, 3, 1, 1)
-    return (x_norm * std) + mean
-
-def to_normalized(x_pix: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor(CIFAR10_MEAN, device=x_pix.device).view(1, 3, 1, 1)
-    std  = torch.tensor(CIFAR10_STD,  device=x_pix.device).view(1, 3, 1, 1)
-    return (x_pix - mean) / std
-
-def auto_pgd_step_size(p, eps: float, steps: int, user_step_size: float) -> float:
-    if user_step_size is not None and user_step_size > 0:
-        return float(user_step_size)
-    steps = max(1, int(steps))
-    return float(2.0 * eps / steps)
-
+from utils import (
+    auto_pgd_step_size,
+    evaluate_under_input_pgd,
+    get_device,
+    get_cifar10_loaders,
+    per_sample_l2_normalize,
+    project_onto_lp_ball,
+    set_deterministic,
+    unwrap_state_dict,
+)
 
 # -----------------------------
 # Model split: (Phi, Head) for EPFL utils-style backbones
@@ -265,100 +225,6 @@ def build_split_resnet18(
 # Pretrained loading helpers for utils-style backbones
 # -----------------------------
 
-def _looks_like_state_dict(obj) -> bool:
-    if not isinstance(obj, dict):
-        return False
-    if len(obj) == 0:
-        return False
-    tensorish = 0
-    total = 0
-    for k, v in obj.items():
-        if not isinstance(k, str):
-            return False
-        total += 1
-        if isinstance(v, (torch.Tensor, nn.Parameter)):
-            tensorish += 1
-    return (tensorish >= max(1, total // 2)) and any("." in k for k in obj.keys())
-
-def _unwrap_state_dict(maybe_sd):
-    """
-    Accepts either:
-      - a raw state_dict
-      - a checkpoint dict containing nested state dicts under:
-          'state_dict', 'model', 'net', 'ema_state', 'model_ema', 'ema',
-          'model_state', 'model_state_dict', 'weights', 'params',
-          or wrappers like: {'last': sd, 'best': sd, 'swa_last': sd, 'swa_best': sd}
-    Returns a clean state_dict with common prefixes stripped and fc/linear remapped if needed.
-    """
-    if _looks_like_state_dict(maybe_sd):
-        sd = maybe_sd
-    elif isinstance(maybe_sd, dict):
-        priority = [
-            "state_dict", "model", "net",
-            "ema_state", "model_ema", "ema",
-            "model_state", "model_state_dict",
-            "weights", "params",
-            "last", "best", "swa_last", "swa_best",
-        ]
-        sd = None
-
-        for k in priority:
-            if k in maybe_sd:
-                cand = maybe_sd[k]
-                if _looks_like_state_dict(cand):
-                    sd = cand
-                    break
-                if isinstance(cand, dict) and "state_dict" in cand and _looks_like_state_dict(cand["state_dict"]):
-                    sd = cand["state_dict"]
-                    break
-
-        if sd is None:
-            best = None
-            best_len = -1
-            for v in maybe_sd.values():
-                if _looks_like_state_dict(v) and len(v) > best_len:
-                    best = v
-                    best_len = len(v)
-                elif isinstance(v, dict) and "state_dict" in v and _looks_like_state_dict(v["state_dict"]):
-                    if len(v["state_dict"]) > best_len:
-                        best = v["state_dict"]
-                        best_len = len(v["state_dict"])
-            if best is not None:
-                sd = best
-
-        if sd is None:
-            sd = maybe_sd
-    else:
-        sd = maybe_sd
-
-    cleaned = {}
-    for k, v in sd.items():
-        if not isinstance(k, str):
-            continue
-        if k.startswith("module."):
-            k2 = k[len("module."):]
-        elif k.startswith("model."):
-            k2 = k[len("model."):]
-        else:
-            k2 = k
-        cleaned[k2] = v
-
-    remapped = {}
-    for k, v in cleaned.items():
-        if k.startswith("fc."):
-            remapped["linear." + k[len("fc."):]] = v
-        else:
-            remapped[k] = v
-
-    final_sd = {}
-    for k, v in remapped.items():
-        if k.startswith("linear.") and "fc.weight" in remapped or "fc.bias" in remapped:
-            final_sd[k] = v
-        else:
-            final_sd[k] = v
-    return final_sd
-
-
 def load_pretrained_resnet18(
     pretrained_path: str,
     num_classes: int = 10,
@@ -373,7 +239,7 @@ def load_pretrained_resnet18(
         return PreActResNet18(n_cls=num_classes, model_width=64)
 
     ckpt = torch.load(pretrained_path, map_location=device)
-    sd = _unwrap_state_dict(ckpt)
+    sd = unwrap_state_dict(ckpt)
 
     root_keys = {k.split('.', 1)[0] for k in sd.keys()}
     if "bn1" in root_keys:
@@ -414,19 +280,6 @@ def load_pretrained_resnet18(
 # -----------------------------
 # Latent adversary primitives
 # -----------------------------
-
-def project_onto_lp_ball(delta: torch.Tensor, eps: float, p: int) -> torch.Tensor:
-    if p == 2:
-        flat = delta.view(delta.size(0), -1)
-        norms = flat.norm(p=2, dim=1, keepdim=True).clamp(min=1e-12)
-        factors = (eps / norms).clamp(max=1.0)
-        flat = flat * factors
-        return flat.view_as(delta)
-    elif p == float('inf') or p == "inf":
-        return delta.clamp(min=-eps, max=eps)
-    else:
-        raise ValueError("Only L2 and Linf norms are supported for projection.")
-
 @dataclass
 class InnerConfig:
     method: str  # 'pgd-latent' or 'wrm-latent'
@@ -557,14 +410,16 @@ def inner_max_delta(u0: torch.Tensor,
 # -----------------------------
 
 @torch.no_grad()
-def _take_first_batches(loader, n):
+def _take_first_batches(loader, n, desc: Optional[str] = None):
     it = iter(loader)
     batches = []
-    for _ in range(n):
+    progress = tqdm(range(n), desc=desc or "Prefetch", leave=False)
+    for _ in progress:
         try:
             batches.append(next(it))
         except StopIteration:
             break
+    progress.close()
     return batches
 
 def wrm_init_gamma(phi, head, loader, device, target_eps_latent: float, n_batches: int = 2) -> float:
@@ -572,7 +427,7 @@ def wrm_init_gamma(phi, head, loader, device, target_eps_latent: float, n_batche
     γ₀ ≈ E[||∇_u L||₂] / target_eps_latent   (computed on clean batches).
     """
     phi.eval(); head.eval()
-    batches = _take_first_batches(loader, max(1, n_batches))
+    batches = _take_first_batches(loader, max(1, n_batches), desc="WRM γ init")
     norms = []
     for x, y in batches:
         x = x.to(device)
@@ -591,7 +446,7 @@ def wrm_init_gamma(phi, head, loader, device, target_eps_latent: float, n_batche
 
 def wrm_estimate_avg_l2(phi, head, loader, device, inner_cfg: InnerConfig, n_batches: int = 1) -> float:
     phi.eval(); head.eval()
-    batches = _take_first_batches(loader, max(1, n_batches))
+    batches = _take_first_batches(loader, max(1, n_batches), desc="WRM avg L2")
     vals = []
     for x, y in batches:
         x = x.to(device); y = y.to(device)
@@ -615,7 +470,6 @@ def wrm_estimate_avg_l2(phi, head, loader, device, inner_cfg: InnerConfig, n_bat
 # -----------------------------
 # Jacobian-aware mapping helpers
 # -----------------------------
-
 @torch.no_grad()
 def _num_input_dims_from_loader(loader) -> int:
     for x, _ in _take_first_batches(loader, 1):
@@ -630,7 +484,7 @@ def estimate_L_hat(phi, loader, device, n_batches: int = 2, power_iters: int = 1
     phi.eval()
     L_vals = []
     iters = max(1, int(power_iters))
-    batches = _take_first_batches(loader, max(1, n_batches))
+    batches = _take_first_batches(loader, max(1, n_batches), desc="L-hat batches")
     for x, _ in batches:
         x_init = x.to(device).detach()
         for _ in range(iters):
@@ -682,7 +536,9 @@ def train_one_epoch(phi, head, loader, optimizer, device, method, inner_cfg: Inn
     total_correct = 0
     total_samples = 0
 
-    for x, y in loader:
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    progress = tqdm(loader, desc="Train", leave=False, total=total_batches)
+    for x, y in progress:
         x = x.to(device); y = y.to(device)
 
         # Reset grads
@@ -727,6 +583,7 @@ def train_one_epoch(phi, head, loader, optimizer, device, method, inner_cfg: Inn
             total_correct += (logits.argmax(dim=1) == y).sum().item()
             total_samples += x.size(0)
 
+    progress.close()
     return total_loss / total_samples, total_correct / total_samples
 
 @torch.no_grad()
@@ -735,13 +592,22 @@ def evaluate(phi, head, loader, device):
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
-    for x, y in loader:
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    progress = tqdm(loader, desc="Eval", leave=False, total=total_batches)
+    for x, y in progress:
         x = x.to(device); y = y.to(device)
         logits = head(phi(x))
         total_loss += F.cross_entropy(logits, y, reduction="sum").item()
         total_correct += (logits.argmax(dim=1) == y).sum().item()
         total_samples += x.size(0)
-    return total_loss / total_samples, total_correct / total_samples
+    dataset_size = len(loader.dataset) if hasattr(loader, "dataset") else total_samples
+    if hasattr(loader, "dataset") and total_samples != dataset_size:
+        raise RuntimeError(
+            f"evaluate consumed {total_samples} samples but dataset has {dataset_size}."
+            " Ensure DataLoader iterates the full set."
+        )
+    progress.close()
+    return total_loss / max(1, dataset_size), total_correct / max(1, dataset_size)
 
 def evaluate_under_latent_attack(phi, head, loader, device, method_for_eval: str, inner_cfg: InnerConfig):
     phi.eval(); head.eval()
@@ -749,7 +615,9 @@ def evaluate_under_latent_attack(phi, head, loader, device, method_for_eval: str
     total_samples = 0
     avg_l2 = avg_linf = avg_penalty = 0.0
     n_batches = 0
-    for x, y in loader:
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    progress = tqdm(loader, desc=f"Latent {method_for_eval}", leave=False, total=total_batches)
+    for x, y in progress:
         x = x.to(device); y = y.to(device)
         with torch.enable_grad():
             u0 = phi(x)
@@ -776,108 +644,18 @@ def evaluate_under_latent_attack(phi, head, loader, device, method_for_eval: str
             avg_linf += info["avg_linf"]
             if info["penalty"] is not None:
                 avg_penalty += info["penalty"]
-    robust_acc = total_correct / total_samples
+    dataset_size = len(loader.dataset) if hasattr(loader, "dataset") else total_samples
+    if hasattr(loader, "dataset") and total_samples != dataset_size:
+        raise RuntimeError(
+            f"evaluate_under_latent_attack consumed {total_samples} samples but dataset has {dataset_size}."
+            " Ensure DataLoader iterates the full set."
+        )
+    robust_acc = total_correct / max(1, dataset_size)
     avg_l2 /= max(1, n_batches)
     avg_linf /= max(1, n_batches)
     avg_penalty = (avg_penalty / max(1, n_batches)) if avg_penalty != 0.0 else None
+    progress.close()
     return robust_acc, {"avg_l2": avg_l2, "avg_linf": avg_linf, "avg_penalty": avg_penalty}
-
-
-# -----------------------------
-# Input-space PGD eval — **PIXEL SPACE**
-# -----------------------------
-
-def _random_start_input_ball_pix(x0_pix: torch.Tensor, eps: float, p) -> torch.Tensor:
-    if p == 2:
-        z = torch.randn_like(x0_pix)
-        z = per_sample_l2_normalize(z)
-        B = x0_pix.size(0)
-        r = torch.rand(B, device=x0_pix.device).view(B, *([1] * (x0_pix.dim() - 1)))
-        delta0 = z * (r * eps)
-    else:
-        delta0 = torch.empty_like(x0_pix).uniform_(-eps, eps)
-    return (x0_pix + delta0).clamp(0.0, 1.0)
-
-def evaluate_under_input_pgd(phi, head, loader, device, p, eps, steps, step_size, restarts: int = 1):
-    phi.eval(); head.eval()
-    total_correct = 0
-    total = 0
-    avg_l2 = 0.0
-    avg_linf = 0.0
-    n_batches = 0
-
-    step_size = auto_pgd_step_size(p, eps, steps, step_size)
-    restarts = max(1, int(restarts))
-
-    for x_norm, y in loader:
-        x_norm = x_norm.to(device)
-        y = y.to(device)
-        x0_pix = to_pixel(x_norm).detach()
-
-        best_delta = torch.zeros_like(x0_pix)
-        best_loss = torch.full((x0_pix.size(0),), -1e9, device=device)
-
-        for _ in range(restarts):
-            x_pix = _random_start_input_ball_pix(x0_pix, eps, p).detach().requires_grad_(True)
-            for _ in range(steps):
-                logits = head(phi(to_normalized(x_pix)))
-                loss_mean = F.cross_entropy(logits, y, reduction='mean')
-                g_pix = torch.autograd.grad(loss_mean, x_pix, retain_graph=False, create_graph=False)[0]
-                with torch.no_grad():
-                    step = step_size * (per_sample_l2_normalize(g_pix) if p == 2 else torch.sign(g_pix))
-                    x_pix = x_pix + step
-                    delta_pix = x_pix - x0_pix
-                    delta_pix = project_onto_lp_ball(delta_pix, eps, 2 if p == 2 else float('inf'))
-                    x_pix = (x0_pix + delta_pix).clamp(0.0, 1.0)
-                    x_pix.requires_grad_(True)
-
-            with torch.no_grad():
-                logits = head(phi(to_normalized(x_pix)))
-                loss_vec = F.cross_entropy(logits, y, reduction='none')
-                delta_pix = (x_pix - x0_pix).detach()
-                mask = loss_vec > best_loss
-                if mask.any():
-                    best_loss[mask] = loss_vec[mask]
-                    best_delta[mask] = delta_pix[mask]
-
-        with torch.no_grad():
-            x_adv_best_pix = (x0_pix + best_delta).clamp(0.0, 1.0)
-            logits = head(phi(to_normalized(x_adv_best_pix)))
-            total_correct += (logits.argmax(dim=1) == y).sum().item()
-            total += x_norm.size(0)
-            d = best_delta
-            avg_l2 += d.view(d.size(0), -1).norm(p=2, dim=1).mean().item()
-            avg_linf += d.abs().view(d.size(0), -1).max(dim=1)[0].mean().item()
-            n_batches += 1
-
-    acc = total_correct / total
-    avg_l2 /= max(1, n_batches)
-    avg_linf /= max(1, n_batches)
-    return acc, {"avg_l2": avg_l2, "avg_linf": avg_linf}
-
-
-# -----------------------------
-# Data
-# -----------------------------
-
-def get_cifar10_loaders(batch_size=128, num_workers=2):
-    transform_train = T.Compose([
-        T.RandomCrop(32, padding=4),
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-    ])
-    transform_test = T.Compose([
-        T.ToTensor(),
-        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-    ])
-    trainset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
-    testset  = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
-    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    testloader  = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    return trainloader, testloader
-
-
 # -----------------------------
 # CSV logging helpers
 # -----------------------------
@@ -1025,7 +803,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    # set_seed(args.seed)
+    set_deterministic(args.seed)
     device = get_device()
     print("Using device:", device)
 
@@ -1043,7 +821,7 @@ def main():
     p_input  = 2 if str(args.inp_p) == "2" else float('inf')
 
     # Data
-    trainloader, testloader = get_cifar10_loaders(batch_size=args.batch_size)
+    trainloader, testloader = get_cifar10_loaders(batch_size=args.batch_size, seed=args.seed)
 
     # Build **pretrained** base and split
     base_pre = load_pretrained_resnet18(
@@ -1248,6 +1026,9 @@ def main():
         os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
         torch.save({"phi": phi.state_dict(), "head": head.state_dict(), "args": vars(args)}, args.save)
         print(f"Saved checkpoint to {args.save}")
+
+
+
 
 
 if __name__ == "__main__":
