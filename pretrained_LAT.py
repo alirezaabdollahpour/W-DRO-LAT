@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Tuple, Optional
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,6 +58,7 @@ from utils import (
     get_cifar10_loaders,
     per_sample_l2_normalize,
     project_onto_lp_ball,
+    parameterized_filename,
     set_deterministic,
     unwrap_state_dict,
 )
@@ -823,6 +826,21 @@ def main():
     # Data
     trainloader, testloader = get_cifar10_loaders(batch_size=args.batch_size, seed=args.seed)
 
+    log_csv_path = parameterized_filename(
+        args.log_csv,
+        {
+            "pre": Path(args.pretrained_path).stem if args.pretrained_path else "none",
+            "adv": args.adv_method if use_split_schedule else args.method,
+            "seed": args.seed,
+            "cut": args.cut_layer,
+            "p": args.p,
+            "eps": args.eps,
+            "inpP": args.inp_p,
+            "inpEps": args.inp_eps,
+        },
+    )
+    print(f"Logging CSV to: {log_csv_path}")
+
     # Build **pretrained** base and split
     base_pre = load_pretrained_resnet18(
         pretrained_path=args.pretrained_path,
@@ -972,7 +990,7 @@ def main():
             msg += f" | L_hat {L_hat_used:.4f} → eps_latent {base_inner_cfg.eps:.5f}"
         print(msg)
 
-        append_row(args.log_csv, {
+        append_row(log_csv_path, {
             "run_id": run_id,
             "time_iso": datetime.now().isoformat(timespec="seconds"),
             "epoch": epoch,

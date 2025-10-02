@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import random
+from pathlib import Path
+import re
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -383,4 +385,36 @@ __all__ = [
     "dataloader_seed",
     "get_cifar10_loader",
     "get_cifar10_loaders",
+    "parameterized_filename",
 ]
+
+
+def _sanitize_token(value: Any) -> str:
+    if isinstance(value, bool):
+        token = "1" if value else "0"
+    elif isinstance(value, (int, np.integer)):
+        token = str(int(value))
+    elif isinstance(value, (float, np.floating)):
+        token = f"{float(value):.6g}"
+    else:
+        token = str(value)
+    token = token.replace(os.sep, "-")
+    token = token.replace(".", "p")
+    token = token.replace("-", "m") if token.startswith("-") else token
+    token = re.sub(r"[^A-Za-z0-9]+", "-", token)
+    return token.strip("-") or "val"
+
+
+def parameterized_filename(base_path: Union[str, Path], params: Dict[str, Any]) -> Path:
+    base = Path(base_path)
+    parts = []
+    for key, value in params.items():
+        if value is None or value == "":
+            continue
+        token = _sanitize_token(value)
+        if token:
+            parts.append(f"{key}-{token}")
+    if not parts:
+        return base
+    new_stem = f"{base.stem}_{'_'.join(parts)}"
+    return base.with_name(new_stem + base.suffix)

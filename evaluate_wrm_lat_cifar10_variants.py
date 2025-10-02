@@ -30,6 +30,7 @@ import os
 import json
 import argparse
 from datetime import datetime
+from pathlib import Path
 from urllib.request import urlretrieve
 
 import numpy as np
@@ -47,6 +48,7 @@ from utils import (
     dataloader_seed,
     get_cifar10_loader,
     get_device,
+    parameterized_filename,
     set_deterministic,
     to_normalized,
     unwrap_state_dict,
@@ -475,9 +477,23 @@ def main():
         print("\nInput-space PGD: disabled (use --inp-steps > 0 to enable)")
 
     # 5) Save JSON
-    with open(args.save_json, "w") as f:
+    save_path = parameterized_filename(
+        args.save_json,
+        {
+            "ckpt": Path(args.ckpt).stem,
+            "seed": args.seed,
+            "inpP": args.inp_p,
+            "eps": args.inp_eps,
+            "steps": args.inp_steps,
+            "restarts": args.inp_restarts,
+            "natural": int(bool(args.natural_model)),
+        },
+    )
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    results["output_file"] = str(save_path)
+    with open(save_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nSaved results to: {args.save_json}")
+    print(f"\nSaved results to: {save_path}")
 
 
 if __name__ == "__main__":
