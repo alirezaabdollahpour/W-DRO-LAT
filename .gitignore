@@ -17,3 +17,12 @@ models/
 models/*
 checkpoints/
 checkpoints/*
+*json
+*.tar
+*.gz
+*.zip
+*.pth
+cifar10_variants/
+cifar10_variants/*
+*.npy
+*.npz
