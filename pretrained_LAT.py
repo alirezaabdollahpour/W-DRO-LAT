@@ -742,7 +742,7 @@ def parse_args():
     parser.add_argument("--pgd-step-size", type=float, default=0.0, help="If <=0, auto = 2*eps/steps.")
 
     parser.add_argument("--gamma", type=float, default=10.0, help="(Fallback) WRM γ; may be auto-initialized when adv phase starts.")
-    parser.add_argument("--inner-steps", type=int, default=7, help="Ascent steps for WRM inner maximization.")
+    parser.add_argument("--inner-steps", type=int, default=10, help="Ascent steps for WRM inner maximization.")
     parser.add_argument("--inner-step-size", type=float, default=0.8, help="Used if --wrm-step-rule=fixed")
 
     # WRM adaptive α flags

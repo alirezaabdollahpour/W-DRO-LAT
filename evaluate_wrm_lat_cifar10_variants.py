@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 from model import ResNet18 as ResNet18Plain  # alias kept consistent with your code
 from model import PreActResNet18
+from pretrained_LAT import build_split_resnet18
 
 from utils import (
     auto_pgd_step_size,
@@ -50,6 +51,16 @@ from utils import (
     to_normalized,
     unwrap_state_dict,
 )
+
+
+class PhiHeadWrapper(nn.Module):
+    def __init__(self, phi: nn.Module, head: nn.Module):
+        super().__init__()
+        self.phi = phi
+        self.head = head
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.phi(x))
 
 # -----------------------------
 # Globals & utilities
@@ -74,6 +85,38 @@ def _infer_arch_from_state_dict(sd: dict) -> str:
 # -----------------------------
 def load_backbone_from_ckpt(path: str, device: torch.device):
     ckpt = torch.load(path, map_location="cpu")
+
+    # Handle phi/head checkpoints saved by pretrained_LAT.py
+    if "phi" in ckpt and "head" in ckpt:
+        args_ckpt = ckpt.get("args", {})
+        num_classes = int(args_ckpt.get("num_classes", 10))
+        cut_layer = args_ckpt.get("cut_layer", "layer4")
+        phi, head = build_split_resnet18(num_classes=num_classes, cut_layer=cut_layer)
+
+        phi_keys = phi.load_state_dict(ckpt["phi"], strict=False)
+        head_keys = head.load_state_dict(ckpt["head"], strict=False)
+
+        if phi_keys.missing_keys or phi_keys.unexpected_keys:
+            print(f"[phi] load => missing={phi_keys.missing_keys}, unexpected={phi_keys.unexpected_keys}")
+        if head_keys.missing_keys or head_keys.unexpected_keys:
+            print(f"[head] load => missing={head_keys.missing_keys}, unexpected={head_keys.unexpected_keys}")
+
+        model = PhiHeadWrapper(phi, head)
+        model.to(device).eval()
+
+        meta = {
+            "arch": args_ckpt.get("arch", "PhiHeadWrapper"),
+            "arch_init": {
+                "num_classes": num_classes,
+                "cut_layer": cut_layer,
+            },
+            "cut_layer": cut_layer,
+            "args": args_ckpt,
+            "epoch": ckpt.get("epoch", None),
+            "date": ckpt.get("date", None),
+            "format": "phi_head",
+        }
+        return model, meta
 
     arch = ckpt.get("arch", "PreActResNet18")
     arch_init = ckpt.get(
@@ -249,7 +292,7 @@ def parse_args():
                    help="Norm for input-space PGD evaluation")
     p.add_argument("--inp-eps", type=float, default=8/255,
                    help="Epsilon (pixel units) for input-space PGD")
-    p.add_argument("--inp-steps", type=int, default=0,
+    p.add_argument("--inp-steps", type=int, default=20,
                    help="Steps for input-space PGD (0 disables PGD evaluation)")
     p.add_argument("--inp-step-size", type=float, default=0.0,
                    help="Step size for input-space PGD (pixel units). If <=0, auto = 2*eps/steps")
@@ -397,18 +440,20 @@ def main():
             )
 
         acc_pgd_c10, info_c10 = run_input_pgd(c10_loader)
-        print(f"  CIFAR-10   PGD: {acc_pgd_c10:.2f}% (avg L2 {info_c10['avg_l2']:.3f}, Linf {info_c10['avg_linf']:.3f})")
+        acc_pgd_c10_pct = acc_pgd_c10 * 100.0
+        print(f"  CIFAR-10   PGD: {acc_pgd_c10_pct:.2f}% (avg L2 {info_c10['avg_l2']:.3f}, Linf {info_c10['avg_linf']:.3f})")
         results["scores"]["cifar10_pgd"] = {
-            "acc": round(acc_pgd_c10, 2),
+            "acc": round(acc_pgd_c10_pct, 2),
             "avg_l2": round(info_c10["avg_l2"], 4),
             "avg_linf": round(info_c10["avg_linf"], 4),
         }
 
         if c101_loader is not None:
             acc_pgd_c101, info_c101 = run_input_pgd(c101_loader)
-            print(f"  CIFAR-10.1 PGD: {acc_pgd_c101:.2f}% (avg L2 {info_c101['avg_l2']:.3f}, Linf {info_c101['avg_linf']:.3f})")
+            acc_pgd_c101_pct = acc_pgd_c101 * 100.0
+            print(f"  CIFAR-10.1 PGD: {acc_pgd_c101_pct:.2f}% (avg L2 {info_c101['avg_l2']:.3f}, Linf {info_c101['avg_linf']:.3f})")
             results["scores"]["cifar10.1_v6_pgd"] = {
-                "acc": round(acc_pgd_c101, 2),
+                "acc": round(acc_pgd_c101_pct, 2),
                 "avg_l2": round(info_c101["avg_l2"], 4),
                 "avg_linf": round(info_c101["avg_linf"], 4),
             }
@@ -417,9 +462,10 @@ def main():
 
         if c102_loader is not None:
             acc_pgd_c102, info_c102 = run_input_pgd(c102_loader)
-            print(f"  CIFAR-10.2 PGD: {acc_pgd_c102:.2f}% (avg L2 {info_c102['avg_l2']:.3f}, Linf {info_c102['avg_linf']:.3f})")
+            acc_pgd_c102_pct = acc_pgd_c102 * 100.0
+            print(f"  CIFAR-10.2 PGD: {acc_pgd_c102_pct:.2f}% (avg L2 {info_c102['avg_l2']:.3f}, Linf {info_c102['avg_linf']:.3f})")
             results["scores"]["cifar10.2_test_pgd"] = {
-                "acc": round(acc_pgd_c102, 2),
+                "acc": round(acc_pgd_c102_pct, 2),
                 "avg_l2": round(info_c102["avg_l2"], 4),
                 "avg_linf": round(info_c102["avg_linf"], 4),
             }
