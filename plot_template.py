@@ -21,7 +21,7 @@ PALETTE: Dict[str, str] = {
 }
 
 def set_paper_style(
-    base_fontsize: int = 14,
+    base_fontsize: int = 12,
     figure_dpi: int = 300,
     use_tex: bool = True,
 ) -> None:
@@ -137,12 +137,15 @@ def add_bottom_secondary_ticks(
     return ax2
 
 
-def add_legend(ax: plt.Axes, loc: str = "best") -> None:
+def add_legend(ax: plt.Axes, loc: str = "best", *, ncol: int = 1,
+               bbox_to_anchor=None, **kwargs) -> None:
     """
     Legend styling to match the look in the figure.
     """
     leg = ax.legend(loc=loc, frameon=True, facecolor=PALETTE["bg_frame"],
-                    edgecolor=PALETTE["legend_edge"], handlelength=2.6, labelspacing=0.6)
+                    edgecolor=PALETTE["legend_edge"], handlelength=2.6,
+                    labelspacing=0.6, ncol=ncol, bbox_to_anchor=bbox_to_anchor,
+                    **kwargs)
     leg.get_frame().set_linewidth(1.0)
 
 
@@ -153,6 +156,5 @@ def plot_series(ax: plt.Axes, x, y, label: str, color_key: str, **kwargs) -> Non
     kwargs.setdefault("lw", mpl.rcParams["lines.linewidth"])
     kwargs.setdefault("alpha", 0.98)
     ax.plot(x, y, label=label, color=PALETTE[color_key], **kwargs)
-
 
 
