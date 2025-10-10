@@ -25,7 +25,8 @@ python evaluate_wrm_lat_cifar10_variants.py \
   --ckpt /path/to/your_saved_wrm_lat.ckpt \
   --batch-size 256 --num-workers 4 \
   --inp-eps 0.031372549 --inp-steps 20 --inp-restarts 5 \
-  --autoattack --autoattack-bs 128
+  --autoattack --autoattack-bs 128 \
+  --autoattack-version custom --autoattack-attacks apgd-ce apgd-dlr
 """
 
 import os
@@ -488,6 +489,8 @@ def parse_args():
                    help="Batch size used inside AutoAttack (bs argument).")
     p.add_argument("--autoattack-version", type=str, default="standard",
                    help="AutoAttack version (e.g., 'standard', 'plus', 'rand').")
+    p.add_argument("--autoattack-attacks", type=str, nargs="+", default=None,
+                   help="Specific attacks_to_run for AutoAttack (requires --autoattack-version custom).")
     p.add_argument("--autoattack-max-examples", type=int, default=-1,
                    help="Limit AutoAttack to the first N samples (<=0 means all).")
     p.add_argument("--autoattack-seed", type=int, default=None,
@@ -525,6 +528,16 @@ def main():
     autoattack_max_examples = None
     if autoattack_requested and args.autoattack_max_examples > 0:
         autoattack_max_examples = int(args.autoattack_max_examples)
+    autoattack_attacks = None
+    if autoattack_requested:
+        if args.autoattack_attacks is not None:
+            autoattack_attacks = list(dict.fromkeys(args.autoattack_attacks))
+        if args.autoattack_version.lower() == "custom":
+            if autoattack_attacks is None or len(autoattack_attacks) == 0:
+                autoattack_attacks = ["apgd-ce", "apgd-dlr"]
+        elif args.autoattack_attacks is not None:
+            print("[autoattack] Ignoring --autoattack-attacks because version is not 'custom'.")
+            autoattack_attacks = None
 
     # 1) Load backbone from your WRM-LAT checkpoint
     base, meta = load_backbone_from_ckpt(args.ckpt, device)
@@ -839,12 +852,17 @@ def main():
                 x_c10_pix = x_c10_pix.to(torch.float32)
                 y_c10_cpu = y_c10.clone()
                 y_c10_device = y_c10_cpu.to(device)
-                adversary = AutoAttack(
-                    pixel_model,
-                    norm=args.autoattack_norm,
-                    eps=args.autoattack_eps,
-                    version=args.autoattack_version,
-                )
+                if autoattack_attacks is not None:
+                    print(f"  AutoAttack attacks_to_run={autoattack_attacks}")
+                aa_kwargs = {
+                    "model": pixel_model,
+                    "norm": args.autoattack_norm,
+                    "eps": args.autoattack_eps,
+                    "version": args.autoattack_version,
+                }
+                if autoattack_attacks is not None:
+                    aa_kwargs["attacks_to_run"] = autoattack_attacks
+                adversary = AutoAttack(**aa_kwargs)
                 if args.autoattack_seed is not None:
                     adversary.seed = args.autoattack_seed
                 adversary.device = device
@@ -869,6 +887,7 @@ def main():
                     "num_examples": num_samples,
                     "max_examples": autoattack_max_examples,
                     "seed": args.autoattack_seed,
+                    "attacks": autoattack_attacks,
                 }
 
     # 5) Save JSON
