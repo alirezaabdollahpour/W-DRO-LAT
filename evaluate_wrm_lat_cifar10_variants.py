@@ -10,10 +10,11 @@ What this script does
    from a **future-proof checkpoint** you saved (with keys: arch, arch_init, state_dict, cut_layer, args, ...).
 3) Applies the **same CIFAR-10 normalization** used in your WRM-LAT code and evaluates clean accuracy.
 4) Optionally evaluates **input-space PGD** (pixel units) on CIFAR-10/10.1/10.2.
+5) Optionally evaluates **AutoAttack** robustness (CIFAR-10) using the robustbench reference settings.
 
 Notes
 -----
-* We evaluate using the **backbone forward** directly (no phi/head split needed for clean or PGD eval).
+* We evaluate using the **backbone forward** directly (no phi/head split needed for clean, PGD, or AutoAttack eval).
 * Datasets are normalized with CIFAR10 mean/std. For PGD, we perturb in pixel space [0,1]
   and then re-normalize before feeding into the model (matching your training-eval style).
 * The checkpoint loader matches the format you used in your saving block (arch/arch_init/state_dict/... on CPU).
@@ -23,10 +24,12 @@ Usage
 python evaluate_wrm_lat_cifar10_variants.py \
   --ckpt /path/to/your_saved_wrm_lat.ckpt \
   --batch-size 256 --num-workers 4 \
-  --inp-eps 0.031372549 --inp-steps 20 --inp-restarts 5
+  --inp-eps 0.031372549 --inp-steps 20 --inp-restarts 5 \
+  --autoattack --autoattack-bs 128
 """
 
 import os
+import tarfile
 import json
 import argparse
 from datetime import datetime
@@ -38,6 +41,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
+from typing import List, Optional, Tuple
 from model import ResNet18 as ResNet18Plain  # alias kept consistent with your code
 from model import PreActResNet18
 from pretrained_LAT import build_split_resnet18
@@ -50,9 +54,32 @@ from utils import (
     get_device,
     parameterized_filename,
     set_deterministic,
+    to_pixel,
     to_normalized,
     unwrap_state_dict,
 )
+
+DEFAULT_CIFAR10C_CORRUPTIONS = [
+    "gaussian_noise",
+    "shot_noise",
+    "impulse_noise",
+    "defocus_blur",
+    "glass_blur",
+    "motion_blur",
+    "zoom_blur",
+    "snow",
+    "frost",
+    "fog",
+    "brightness",
+    "contrast",
+    "elastic_transform",
+    "pixelate",
+    "jpeg_compression",
+    "speckle_noise",
+    "gaussian_blur",
+    "spatter",
+    "saturate",
+]
 
 
 class PhiHeadWrapper(nn.Module):
@@ -63,6 +90,17 @@ class PhiHeadWrapper(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.phi(x))
+
+
+class PixelModelWrapper(nn.Module):
+    """Adapter so AutoAttack operates in pixel space while the backbone expects normalized inputs."""
+
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.base = base_model
+
+    def forward(self, x_pix: torch.Tensor) -> torch.Tensor:
+        return self.base(to_normalized(x_pix))
 
 # -----------------------------
 # Globals & utilities
@@ -246,6 +284,144 @@ def load_cifar10_2_test_as_dataset(file_path: str) -> TensorDataset:
     y = torch.from_numpy(np.array(labels, dtype=np.int64)).long()
     x = to_normalized(x)
     return TensorDataset(x, y)
+
+# === Download CIFAR-10-C dataset ===
+def download_cifar10c():
+    """Download CIFAR-10-C dataset."""
+    data_dir = "./cifar10c_data"
+    os.makedirs(data_dir, exist_ok=True)
+
+    # CIFAR-10-C URL (from the official source)
+    cifar10c_url = "https://zenodo.org/record/2535967/files/CIFAR-10-C.tar"
+    cifar10c_path = os.path.join(data_dir, "CIFAR-10-C.tar")
+
+    print("Downloading CIFAR-10-C dataset...")
+
+    # Check if already downloaded and extracted
+    extracted_dir = os.path.join(data_dir, "CIFAR-10-C")
+    if os.path.exists(extracted_dir) and len(os.listdir(extracted_dir)) > 0:
+        print(f"✓ CIFAR-10-C already exists at {extracted_dir}")
+        return extracted_dir
+
+    # Download if not exists
+    if not os.path.exists(cifar10c_path):
+        print(f"Downloading CIFAR-10-C from {cifar10c_url}...")
+        try:
+            urlretrieve(cifar10c_url, cifar10c_path)
+            print(f"✓ Downloaded CIFAR-10-C.tar")
+        except Exception as e:
+            print(f"✗ Failed to download CIFAR-10-C: {e}")
+            return None
+    else:
+        print(f"✓ CIFAR-10-C.tar already exists")
+
+    # Extract the tar file
+    print("Extracting CIFAR-10-C.tar...")
+    try:
+        with tarfile.open(cifar10c_path, 'r') as tar:
+            tar.extractall(data_dir)
+        print(f"✓ Extracted to {extracted_dir}")
+
+        # Clean up tar file to save space
+        os.remove(cifar10c_path)
+        print("✓ Cleaned up tar file")
+
+        return extracted_dir
+    except Exception as e:
+        print(f"✗ Failed to extract CIFAR-10-C: {e}")
+        return None
+
+def load_cifar10c(corruption, severity, n_examples=10000, data_dir=None, download=True):
+    """
+    Load CIFAR-10-C data for a specific corruption and severity.
+
+    Args:
+        corruption (str): Name of the corruption (e.g., 'gaussian_noise')
+        severity (int): Severity level (1-5)
+        n_examples (int): Number of examples to load (default: 10000, full test set)
+        data_dir (str): Directory containing CIFAR-10-C data
+        download (bool): Whether to download if not found
+
+    Returns:
+        tuple: (images, labels) as numpy arrays
+    """
+    if data_dir is None:
+        if download:
+            data_dir = download_cifar10c()
+            if data_dir is None:
+                raise ValueError("Failed to download CIFAR-10-C")
+        else:
+            raise ValueError("data_dir must be provided if download=False")
+
+    # Path to corruption file
+    corruption_file = os.path.join(data_dir, f"{corruption}.npy")
+    labels_file = os.path.join(data_dir, "labels.npy")
+
+    if not os.path.exists(corruption_file):
+        raise FileNotFoundError(f"Corruption file not found: {corruption_file}")
+    if not os.path.exists(labels_file):
+        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+
+    # Load data
+    print(f"Loading {corruption} (severity {severity})...")
+
+    # Load corruption data - shape is (50000, 32, 32, 3)
+    # Each severity has 10k images: severity 1 = [0:10k], severity 2 = [10k:20k], etc.
+    corruption_data = np.load(corruption_file)
+    labels_data = np.load(labels_file)
+
+    # Calculate start and end indices for the specific severity
+    start_idx = (severity - 1) * 10000
+    end_idx = start_idx + min(n_examples, 10000)
+
+    # Extract the relevant slice
+    images = corruption_data[start_idx:end_idx]
+    labels = labels_data[start_idx:end_idx]
+
+    print(f"✓ Loaded {len(images)} images for {corruption} (severity {severity})")
+    print(f"  Images shape: {images.shape}, dtype: {images.dtype}")
+    print(f"  Labels shape: {labels.shape}, dtype: {labels.dtype}")
+    print(f"  Image range: [{images.min()}, {images.max()}]")
+
+    return images, labels
+
+
+def cifar10c_numpy_to_dataset(images: np.ndarray, labels: np.ndarray) -> TensorDataset:
+    """Convert CIFAR-10-C arrays to a normalized TensorDataset."""
+    x = torch.from_numpy(_to_nchw_float01(images)).float()
+    y = torch.from_numpy(np.array(labels, dtype=np.int64)).long()
+    x = to_normalized(x)
+    return TensorDataset(x, y)
+
+
+@torch.no_grad()
+def collect_pixels_and_labels(
+    loader: DataLoader,
+    *,
+    max_examples: Optional[int] = None,
+    desc: str = "Collect AutoAttack data",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Materialize a dataloader into pixel-space tensors for AutoAttack."""
+    xs: List[torch.Tensor] = []
+    ys: List[torch.Tensor] = []
+    remaining = None if max_examples is None or max_examples < 0 else int(max_examples)
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    progress = tqdm(loader, desc=desc, leave=False, total=total_batches)
+    for x_norm, y in progress:
+        if remaining is not None and remaining <= 0:
+            break
+        if remaining is not None and x_norm.size(0) > remaining:
+            x_norm = x_norm[:remaining]
+            y = y[:remaining]
+        xs.append(to_pixel(x_norm).cpu())
+        ys.append(y.cpu())
+        if remaining is not None:
+            remaining -= x_norm.size(0)
+    progress.close()
+    x_pix = torch.cat(xs, dim=0) if xs else torch.empty(0, device="cpu")
+    y_lab = torch.cat(ys, dim=0) if ys else torch.empty(0, dtype=torch.long, device="cpu")
+    return x_pix.contiguous(), y_lab.contiguous()
+
 # -----------------------------
 # Evaluation
 # -----------------------------
@@ -289,6 +465,34 @@ def parse_args():
     p.add_argument("--natural-model-path", type=str, default=".",
                    help="Path to the natural model .pt/.pth file (e.g., /mnt/.../R2.pt)")
 
+    # CIFAR-10-C evaluation
+    p.add_argument("--skip-cifar10c", action="store_true", help="Skip CIFAR-10-C evaluation.")
+    p.add_argument("--cifar10c-data-dir", type=str, default="",
+                   help="Directory containing CIFAR-10-C .npy files (default: auto download to ./cifar10c_data).")
+    p.add_argument("--cifar10c-corruptions", type=str, nargs="+", default=None,
+                   help="Which CIFAR-10-C corruptions to evaluate (default: all).")
+    p.add_argument("--cifar10c-severities", type=int, nargs="+", default=[5],
+                   help="Severities (1-5) to evaluate for each corruption (default: 5).")
+    p.add_argument("--cifar10c-max-examples", type=int, default=10000,
+                   help="Max examples per corruption/severity (<=10000 from CIFAR-10-C).")
+
+    # AutoAttack evaluation
+    p.add_argument("--autoattack", action="store_true", help="Enable AutoAttack evaluation.")
+    p.add_argument("--autoattack-only", action="store_true",
+                   help="Run only AutoAttack (skip clean/PGD/CIFAR-10 variants).")
+    p.add_argument("--autoattack-norm", type=str, default="Linf", choices=["Linf", "L2", "L1"],
+                   help="Norm ball for AutoAttack.")
+    p.add_argument("--autoattack-eps", type=float, default=8/255,
+                   help="Epsilon radius for AutoAttack (pixel units).")
+    p.add_argument("--autoattack-bs", type=int, default=128,
+                   help="Batch size used inside AutoAttack (bs argument).")
+    p.add_argument("--autoattack-version", type=str, default="standard",
+                   help="AutoAttack version (e.g., 'standard', 'plus', 'rand').")
+    p.add_argument("--autoattack-max-examples", type=int, default=-1,
+                   help="Limit AutoAttack to the first N samples (<=0 means all).")
+    p.add_argument("--autoattack-seed", type=int, default=None,
+                   help="Optional seed for AutoAttack's internal RNG.")
+
     # Input-space PGD config (pixel units)
     p.add_argument("--inp-p", type=str, default="inf", choices=["2", "inf"],
                    help="Norm for input-space PGD evaluation")
@@ -308,6 +512,19 @@ def main():
     set_deterministic(args.seed)
     device = get_device()
     print("Using device:", device)
+
+    if args.autoattack_only:
+        args.autoattack = True
+    autoattack_requested = bool(args.autoattack)
+    perform_standard_eval = not args.autoattack_only
+
+    if autoattack_requested and args.autoattack_bs <= 0:
+        raise ValueError("--autoattack-bs must be positive.")
+    if autoattack_requested and args.autoattack_eps <= 0:
+        raise ValueError("--autoattack-eps must be positive.")
+    autoattack_max_examples = None
+    if autoattack_requested and args.autoattack_max_examples > 0:
+        autoattack_max_examples = int(args.autoattack_max_examples)
 
     # 1) Load backbone from your WRM-LAT checkpoint
     base, meta = load_backbone_from_ckpt(args.ckpt, device)
@@ -350,36 +567,37 @@ def main():
     )
     print(f"✓ CIFAR-10 test set: {c10_len} samples")
 
-    # 3) Download + set up CIFAR-10.1 & 10.2
-    paths = download_cifar10_variants()
-
-    c101_ds = load_cifar10_1_as_dataset(paths["c10_1_data"], paths["c10_1_labels"]) if os.path.exists(paths["c10_1_data"]) else None
-    c102_ds = load_cifar10_2_test_as_dataset(paths["c10_2_test"]) if os.path.exists(paths["c10_2_test"]) else None
-
     c101_loader = None
-    if c101_ds is not None:
-        gen_c101, worker_c101 = dataloader_seed(args.seed, offset=2)
-        c101_loader = DataLoader(
-            c101_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_c101,
-            generator=gen_c101,
-        )
     c102_loader = None
-    if c102_ds is not None:
-        gen_c102, worker_c102 = dataloader_seed(args.seed, offset=3)
-        c102_loader = DataLoader(
-            c102_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_c102,
-            generator=gen_c102,
-        )
+    if perform_standard_eval:
+        # 3) Download + set up CIFAR-10.1 & 10.2
+        paths = download_cifar10_variants()
+
+        c101_ds = load_cifar10_1_as_dataset(paths["c10_1_data"], paths["c10_1_labels"]) if os.path.exists(paths["c10_1_data"]) else None
+        c102_ds = load_cifar10_2_test_as_dataset(paths["c10_2_test"]) if os.path.exists(paths["c10_2_test"]) else None
+
+        if c101_ds is not None:
+            gen_c101, worker_c101 = dataloader_seed(args.seed, offset=2)
+            c101_loader = DataLoader(
+                c101_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                worker_init_fn=worker_c101,
+                generator=gen_c101,
+            )
+        if c102_ds is not None:
+            gen_c102, worker_c102 = dataloader_seed(args.seed, offset=3)
+            c102_loader = DataLoader(
+                c102_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                worker_init_fn=worker_c102,
+                generator=gen_c102,
+            )
 
     # 4) Evaluate
     results = {
@@ -394,87 +612,264 @@ def main():
         "scores": {},
     }
 
-    print("\nEvaluating clean accuracy...")
-    acc_c10 = eval_clean(base, c10_loader, device)
-    print(f"  CIFAR-10   : {acc_c10:.2f}%")
-    results["scores"]["cifar10"] = round(acc_c10, 2)
-
-    if c101_loader is not None:
-        acc_c101 = eval_clean(base, c101_loader, device)
-        print(f"  CIFAR-10.1 : {acc_c101:.2f}%")
-        results["scores"]["cifar10.1_v6"] = round(acc_c101, 2)
-    else:
-        print("  CIFAR-10.1 : (not available)")
-
-    if c102_loader is not None:
-        acc_c102 = eval_clean(base, c102_loader, device)
-        print(f"  CIFAR-10.2 : {acc_c102:.2f}%")
-        results["scores"]["cifar10.2_test"] = round(acc_c102, 2)
-    else:
-        print("  CIFAR-10.2 : (not available)")
-
-    # 4.b) Optional: Input-space PGD evaluation (pixel units)
-    if args.inp_steps > 0 and args.inp_eps > 0:
-        print("\nEvaluating input-space PGD (pixel units)...")
-        p_value = 2 if args.inp_p == "2" else float("inf")
-        step_size_used = auto_pgd_step_size(p_value, args.inp_eps, args.inp_steps, args.inp_step_size)
-        results["scores"]["pgd_params"] = {
-            "p": args.inp_p,
-            "eps": args.inp_eps,
-            "steps": args.inp_steps,
-            "step_size": step_size_used,
-            "restarts": args.inp_restarts,
-        }
-
-        phi_identity = nn.Identity().to(device)
-
-        def run_input_pgd(loader):
-            return evaluate_under_input_pgd(
-                phi_identity,
-                base,
-                loader,
-                device,
-                p=p_value,
-                eps=args.inp_eps,
-                steps=args.inp_steps,
-                step_size=step_size_used,
-                restarts=args.inp_restarts,
-            )
-
-        acc_pgd_c10, info_c10 = run_input_pgd(c10_loader)
-        acc_pgd_c10_pct = acc_pgd_c10 * 100.0
-        print(f"  CIFAR-10   PGD: {acc_pgd_c10_pct:.2f}% (avg L2 {info_c10['avg_l2']:.3f}, Linf {info_c10['avg_linf']:.3f})")
-        results["scores"]["cifar10_pgd"] = {
-            "acc": round(acc_pgd_c10_pct, 2),
-            "avg_l2": round(info_c10["avg_l2"], 4),
-            "avg_linf": round(info_c10["avg_linf"], 4),
-        }
+    if perform_standard_eval:
+        print("\nEvaluating clean accuracy...")
+        acc_c10 = eval_clean(base, c10_loader, device)
+        print(f"  CIFAR-10   : {acc_c10:.2f}%")
+        results["scores"]["cifar10"] = round(acc_c10, 2)
 
         if c101_loader is not None:
-            acc_pgd_c101, info_c101 = run_input_pgd(c101_loader)
-            acc_pgd_c101_pct = acc_pgd_c101 * 100.0
-            print(f"  CIFAR-10.1 PGD: {acc_pgd_c101_pct:.2f}% (avg L2 {info_c101['avg_l2']:.3f}, Linf {info_c101['avg_linf']:.3f})")
-            results["scores"]["cifar10.1_v6_pgd"] = {
-                "acc": round(acc_pgd_c101_pct, 2),
-                "avg_l2": round(info_c101["avg_l2"], 4),
-                "avg_linf": round(info_c101["avg_linf"], 4),
-            }
+            acc_c101 = eval_clean(base, c101_loader, device)
+            print(f"  CIFAR-10.1 : {acc_c101:.2f}%")
+            results["scores"]["cifar10.1_v6"] = round(acc_c101, 2)
         else:
-            print("  CIFAR-10.1 PGD: (not available)")
+            print("  CIFAR-10.1 : (not available)")
 
         if c102_loader is not None:
-            acc_pgd_c102, info_c102 = run_input_pgd(c102_loader)
-            acc_pgd_c102_pct = acc_pgd_c102 * 100.0
-            print(f"  CIFAR-10.2 PGD: {acc_pgd_c102_pct:.2f}% (avg L2 {info_c102['avg_l2']:.3f}, Linf {info_c102['avg_linf']:.3f})")
-            results["scores"]["cifar10.2_test_pgd"] = {
-                "acc": round(acc_pgd_c102_pct, 2),
-                "avg_l2": round(info_c102["avg_l2"], 4),
-                "avg_linf": round(info_c102["avg_linf"], 4),
-            }
+            acc_c102 = eval_clean(base, c102_loader, device)
+            print(f"  CIFAR-10.2 : {acc_c102:.2f}%")
+            results["scores"]["cifar10.2_test"] = round(acc_c102, 2)
         else:
-            print("  CIFAR-10.2 PGD: (not available)")
+            print("  CIFAR-10.2 : (not available)")
+
+        cifar10c_eval_summary = None
+        if args.skip_cifar10c:
+            print("  CIFAR-10-C : skipped (--skip-cifar10c)")
+            results["scores"]["cifar10c"] = {"status": "skipped"}
+        else:
+            print("\nEvaluating CIFAR-10-C (clean only)...")
+            data_dir = args.cifar10c_data_dir.strip()
+            if data_dir:
+                if not os.path.isdir(data_dir):
+                    candidate = os.path.join(data_dir, "CIFAR-10-C")
+                    if os.path.isdir(candidate):
+                        data_dir = candidate
+                    else:
+                        raise FileNotFoundError(
+                            f"CIFAR-10-C directory not found: '{data_dir}'. "
+                            "Provide the directory containing the corruption .npy files."
+                        )
+            else:
+                data_dir = download_cifar10c()
+
+            if data_dir is None:
+                print("  CIFAR-10-C : unavailable (download/extraction failed).")
+                results["scores"]["cifar10c"] = {"status": "unavailable"}
+            else:
+                cifar10c_corruptions = (
+                    list(DEFAULT_CIFAR10C_CORRUPTIONS)
+                    if args.cifar10c_corruptions is None
+                    else list(dict.fromkeys(args.cifar10c_corruptions))
+                )
+                cifar10c_severities = list(dict.fromkeys(args.cifar10c_severities))
+                for sev in cifar10c_severities:
+                    if sev < 1 or sev > 5:
+                        raise ValueError(f"CIFAR-10-C severities must be between 1 and 5 (got {sev}).")
+                if args.cifar10c_max_examples <= 0:
+                    raise ValueError("--cifar10c-max-examples must be positive.")
+                if args.cifar10c_max_examples > 10000:
+                    print("[cifar10c] --cifar10c-max-examples truncated to 10000 (dataset size per severity).")
+                cifar10c_max_examples = min(args.cifar10c_max_examples, 10000)
+
+                print(f"[cifar10c] data dir: {data_dir}")
+                corruption_summaries = {}
+                all_acc = []
+                for corr_idx, corruption in enumerate(cifar10c_corruptions):
+                    severity_scores = {}
+                    severity_vals = []
+                    load_error = None
+                    for severity in cifar10c_severities:
+                        try:
+                            images, labels = load_cifar10c(
+                                corruption,
+                                severity,
+                                n_examples=cifar10c_max_examples,
+                                data_dir=data_dir,
+                                download=False,
+                            )
+                        except (FileNotFoundError, ValueError) as err:
+                            load_error = str(err)
+                            break
+                        dataset = cifar10c_numpy_to_dataset(images, labels)
+                        gen_c, worker_c = dataloader_seed(args.seed, offset=10 + corr_idx * 8 + severity)
+                        loader = DataLoader(
+                            dataset,
+                            batch_size=args.batch_size,
+                            shuffle=False,
+                            num_workers=args.num_workers,
+                            pin_memory=True,
+                            worker_init_fn=worker_c,
+                            generator=gen_c,
+                        )
+                        acc = eval_clean(base, loader, device)
+                        severity_scores[str(severity)] = round(acc, 2)
+                        severity_vals.append(acc)
+
+                    if load_error is not None:
+                        print(f"  {corruption:<18} error: {load_error}")
+                        corruption_summaries[corruption] = {"error": load_error}
+                        continue
+
+                    all_acc.extend(severity_vals)
+                    if severity_vals:
+                        corr_mean = float(np.mean(severity_vals))
+                        severity_scores["mean"] = round(corr_mean, 2)
+                    else:
+                        corr_mean = None
+                        severity_scores["mean"] = None
+                    corruption_summaries[corruption] = severity_scores
+
+                    sev_line = ", ".join(
+                        f"s{sev}:{severity_scores[str(sev)]:.2f}%"
+                        for sev in cifar10c_severities
+                    )
+                    if corr_mean is not None:
+                        sev_line = f"{sev_line} | mean={corr_mean:.2f}%"
+                    print(f"  {corruption:<18} {sev_line}")
+
+                overall_mean = float(np.mean(all_acc)) if all_acc else None
+                if overall_mean is not None:
+                    print(f"  CIFAR-10-C mean : {overall_mean:.2f}%")
+                else:
+                    print("  CIFAR-10-C mean : (no corruptions evaluated)")
+                has_error = any(
+                    isinstance(summary, dict) and "error" in summary
+                    for summary in corruption_summaries.values()
+                )
+                status = "ok"
+                if overall_mean is None:
+                    status = "no-data"
+                elif has_error:
+                    status = "partial"
+                cifar10c_eval_summary = {
+                    "corruptions": corruption_summaries,
+                    "severities": cifar10c_severities,
+                    "max_examples": cifar10c_max_examples,
+                    "mean": round(overall_mean, 2) if overall_mean is not None else None,
+                    "data_dir": os.path.abspath(data_dir),
+                    "status": status,
+                }
+                results["scores"]["cifar10c"] = cifar10c_eval_summary
+
+        # 4.b) Optional: Input-space PGD evaluation (pixel units)
+        if args.inp_steps > 0 and args.inp_eps > 0:
+            print("\nEvaluating input-space PGD (pixel units)...")
+            p_value = 2 if args.inp_p == "2" else float("inf")
+            step_size_used = auto_pgd_step_size(p_value, args.inp_eps, args.inp_steps, args.inp_step_size)
+            results["scores"]["pgd_params"] = {
+                "p": args.inp_p,
+                "eps": args.inp_eps,
+                "steps": args.inp_steps,
+                "step_size": step_size_used,
+                "restarts": args.inp_restarts,
+            }
+
+            phi_identity = nn.Identity().to(device)
+
+            def run_input_pgd(loader):
+                return evaluate_under_input_pgd(
+                    phi_identity,
+                    base,
+                    loader,
+                    device,
+                    p=p_value,
+                    eps=args.inp_eps,
+                    steps=args.inp_steps,
+                    step_size=step_size_used,
+                    restarts=args.inp_restarts,
+                )
+
+            acc_pgd_c10, info_c10 = run_input_pgd(c10_loader)
+            acc_pgd_c10_pct = acc_pgd_c10 * 100.0
+            print(f"  CIFAR-10   PGD: {acc_pgd_c10_pct:.2f}% (avg L2 {info_c10['avg_l2']:.3f}, Linf {info_c10['avg_linf']:.3f})")
+            results["scores"]["cifar10_pgd"] = {
+                "acc": round(acc_pgd_c10_pct, 2),
+                "avg_l2": round(info_c10["avg_l2"], 4),
+                "avg_linf": round(info_c10["avg_linf"], 4),
+            }
+
+            if c101_loader is not None:
+                acc_pgd_c101, info_c101 = run_input_pgd(c101_loader)
+                acc_pgd_c101_pct = acc_pgd_c101 * 100.0
+                print(f"  CIFAR-10.1 PGD: {acc_pgd_c101_pct:.2f}% (avg L2 {info_c101['avg_l2']:.3f}, Linf {info_c101['avg_linf']:.3f})")
+                results["scores"]["cifar10.1_v6_pgd"] = {
+                    "acc": round(acc_pgd_c101_pct, 2),
+                    "avg_l2": round(info_c101["avg_l2"], 4),
+                    "avg_linf": round(info_c101["avg_linf"], 4),
+                }
+            else:
+                print("  CIFAR-10.1 PGD: (not available)")
+
+            if c102_loader is not None:
+                acc_pgd_c102, info_c102 = run_input_pgd(c102_loader)
+                acc_pgd_c102_pct = acc_pgd_c102 * 100.0
+                print(f"  CIFAR-10.2 PGD: {acc_pgd_c102_pct:.2f}% (avg L2 {info_c102['avg_l2']:.3f}, Linf {info_c102['avg_linf']:.3f})")
+                results["scores"]["cifar10.2_test_pgd"] = {
+                    "acc": round(acc_pgd_c102_pct, 2),
+                    "avg_l2": round(info_c102["avg_l2"], 4),
+                    "avg_linf": round(info_c102["avg_linf"], 4),
+                }
+            else:
+                print("  CIFAR-10.2 PGD: (not available)")
+        else:
+            print("\nInput-space PGD: disabled (use --inp-steps > 0 to enable)")
     else:
-        print("\nInput-space PGD: disabled (use --inp-steps > 0 to enable)")
+        print("\nSkipping clean/PGD evaluations (--autoattack-only).")
+
+    if autoattack_requested:
+        print("\nEvaluating AutoAttack robustness...")
+        try:
+            from autoattack import AutoAttack
+        except ImportError as err:
+            print(f"  AutoAttack unavailable: {err}")
+            results["scores"]["autoattack"] = {"status": "unavailable", "error": str(err)}
+        else:
+            pixel_model = PixelModelWrapper(base)
+            pixel_model.eval()
+            x_c10_pix, y_c10 = collect_pixels_and_labels(
+                c10_loader,
+                max_examples=autoattack_max_examples,
+                desc="AutoAttack CIFAR-10",
+            )
+            num_samples = int(y_c10.numel())
+            if num_samples == 0:
+                print("  CIFAR-10 AutoAttack : no samples collected.")
+                results["scores"]["autoattack"] = {"status": "empty"}
+            else:
+                x_c10_pix = x_c10_pix.to(torch.float32)
+                y_c10_cpu = y_c10.clone()
+                y_c10_device = y_c10_cpu.to(device)
+                adversary = AutoAttack(
+                    pixel_model,
+                    norm=args.autoattack_norm,
+                    eps=args.autoattack_eps,
+                    version=args.autoattack_version,
+                )
+                if args.autoattack_seed is not None:
+                    adversary.seed = args.autoattack_seed
+                adversary.device = device
+                x_adv = adversary.run_standard_evaluation(
+                    x_c10_pix,
+                    y_c10_cpu,
+                    bs=args.autoattack_bs,
+                )
+                with torch.no_grad():
+                    logits_adv = pixel_model(x_adv.to(device))
+                    preds_adv = logits_adv.argmax(dim=1)
+                    acc_adv = (preds_adv == y_c10_device).float().mean().item() * 100.0
+                print(f"  CIFAR-10 AutoAttack: {acc_adv:.2f}% robust accuracy ({num_samples} samples)")
+                results["scores"]["autoattack"] = {
+                    "status": "ok",
+                    "dataset": "cifar10",
+                    "acc": round(acc_adv, 2),
+                    "norm": args.autoattack_norm,
+                    "eps": args.autoattack_eps,
+                    "bs": args.autoattack_bs,
+                    "version": args.autoattack_version,
+                    "num_examples": num_samples,
+                    "max_examples": autoattack_max_examples,
+                    "seed": args.autoattack_seed,
+                }
 
     # 5) Save JSON
     save_path = parameterized_filename(
