@@ -495,6 +495,10 @@ def parse_args():
                    help="Limit AutoAttack to the first N samples (<=0 means all).")
     p.add_argument("--autoattack-seed", type=int, default=None,
                    help="Optional seed for AutoAttack's internal RNG.")
+    p.add_argument("--autoattack-iters", type=int, default=None,
+                   help="Override total iterations for APGD-based AutoAttack components.")
+    p.add_argument("--autoattack-restarts", type=int, default=None,
+                   help="Override number of random restarts for APGD-based AutoAttack components.")
 
     # Input-space PGD config (pixel units)
     p.add_argument("--inp-p", type=str, default="inf", choices=["2", "inf"],
@@ -866,6 +870,16 @@ def main():
                 if args.autoattack_seed is not None:
                     adversary.seed = args.autoattack_seed
                 adversary.device = device
+                if args.autoattack_iters is not None:
+                    if hasattr(adversary, "apgd"):
+                        adversary.apgd.n_iter = args.autoattack_iters
+                    if hasattr(adversary, "apgd_targeted"):
+                        adversary.apgd_targeted.n_iter = args.autoattack_iters
+                if args.autoattack_restarts is not None:
+                    if hasattr(adversary, "apgd"):
+                        adversary.apgd.n_restarts = args.autoattack_restarts
+                    if hasattr(adversary, "apgd_targeted"):
+                        adversary.apgd_targeted.n_restarts = args.autoattack_restarts
                 x_adv = adversary.run_standard_evaluation(
                     x_c10_pix,
                     y_c10_cpu,
@@ -888,6 +902,8 @@ def main():
                     "max_examples": autoattack_max_examples,
                     "seed": args.autoattack_seed,
                     "attacks": autoattack_attacks,
+                    "iters": args.autoattack_iters,
+                    "restarts": args.autoattack_restarts,
                 }
 
     # 5) Save JSON
