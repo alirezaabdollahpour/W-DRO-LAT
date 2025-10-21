@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-from datetime import datetime
 import math
+import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -53,6 +54,11 @@ from pretrained_LAT import (  # type: ignore
     jacobian_aware_latent_eps,
     load_pretrained_resnet18,
 )
+
+PENALTY_LAMBDA_MIN = 1e-4
+PENALTY_LAMBDA_MAX = 1e4
+CALIBRATION_SCALE_MIN = 0.1
+CALIBRATION_SCALE_MAX = 10.0
 
 
 class NonNegativeLinear(nn.Module):
@@ -103,7 +109,7 @@ class NonNegativeConv2d(nn.Module):
 
     @torch.no_grad()
     def project_non_negative(self) -> None:
-        self.weight_raw.data.clamp_(min=0.0)
+        return
 
 
 class InputConvexPotential(nn.Module):
@@ -313,16 +319,29 @@ def _parse_hidden_units(token: str) -> int:
         raise argparse.ArgumentTypeError(f"Invalid integer value: {token!r}") from exc
 
 
+def _clamp_penalty_lambda(value: float) -> float:
+    if not math.isfinite(value):
+        return PENALTY_LAMBDA_MIN
+    return float(min(max(value, PENALTY_LAMBDA_MIN), PENALTY_LAMBDA_MAX))
+
+
 def _reduce_latents_for_plot(
     z: torch.Tensor, z_adv: torch.Tensor, method: str, seed: int
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Project latent pairs into 2D using PCA or t-SNE."""
     z_flat = z.view(z.size(0), -1).cpu().float()
     z_adv_flat = z_adv.view(z_adv.size(0), -1).cpu().float()
+    if z_flat.size(0) < 2:
+        raise ValueError("Need at least two samples for visualization.")
 
     if method == "pca":
         z_np = z_flat.numpy()
         z_adv_np = z_adv_flat.numpy()
+        if (
+            not np.isfinite(z_np).all()
+            or not np.isfinite(z_adv_np).all()
+        ):
+            raise ValueError("Non-finite values encountered when reducing latents.")
 
         mean = z_np.mean(axis=0, keepdims=True)
         centered = z_np - mean
@@ -345,6 +364,8 @@ def _reduce_latents_for_plot(
         return _reduce_latents_for_plot(z, z_adv, "pca", seed)
 
     stacked = torch.cat([z_flat, z_adv_flat], dim=0).numpy()
+    if not np.isfinite(stacked).all():
+        raise ValueError("Non-finite values encountered when preparing t-SNE input.")
     tsne = TSNE(n_components=2, init="pca", learning_rate="auto", random_state=seed)
     embedding = tsne.fit_transform(stacked)
     coords_z = embedding[: z_flat.size(0)]
@@ -400,9 +421,35 @@ def visualize_transport_map(
     z_adv_tensor = torch.cat(z_adv_list, dim=0)[:max_samples]
     label_tensor = torch.cat(labels, dim=0)[:max_samples]
 
-    coords_z, coords_adv = _reduce_latents_for_plot(
-        z_tensor, z_adv_tensor, args.transport_viz_method, seed=args.seed
-    )
+    flat_z = z_tensor.reshape(z_tensor.size(0), -1)
+    flat_adv = z_adv_tensor.reshape(z_adv_tensor.size(0), -1)
+    finite_mask = torch.isfinite(flat_z).all(dim=1) & torch.isfinite(flat_adv).all(dim=1)
+    if finite_mask.sum().item() == 0:
+        print("Transport visualization skipped: no finite latent samples available.")
+        return
+    if finite_mask.sum().item() < z_tensor.size(0):
+        dropped = z_tensor.size(0) - finite_mask.sum().item()
+        print(f"Transport visualization: dropped {dropped} samples with non-finite values.")
+    z_tensor = z_tensor[finite_mask]
+    z_adv_tensor = z_adv_tensor[finite_mask]
+    label_tensor = label_tensor[finite_mask]
+
+    if z_tensor.size(0) < 2:
+        print("Transport visualization skipped: fewer than two valid samples.")
+        return
+
+    try:
+        coords_z, coords_adv = _reduce_latents_for_plot(
+            z_tensor, z_adv_tensor, args.transport_viz_method, seed=args.seed
+        )
+    except ValueError as err:
+        warnings.warn(
+            f"Transport visualization encountered an issue ({err}); falling back to PCA.",
+            RuntimeWarning,
+        )
+        coords_z, coords_adv = _reduce_latents_for_plot(
+            z_tensor, z_adv_tensor, "pca", seed=args.seed
+        )
 
     class_colors = plt.cm.tab10(label_tensor.numpy() % 10)
     dx = coords_adv[:, 0] - coords_z[:, 0]
@@ -483,6 +530,8 @@ def estimate_mean_grad_norm(
             logits = head(z)
             loss = F.cross_entropy(logits, y, reduction="mean")
             grad = torch.autograd.grad(loss, z, create_graph=False, retain_graph=False)[0]
+            if not torch.isfinite(grad).all():
+                continue
             norms.append(grad.reshape(grad.size(0), -1).norm(dim=1).mean().item())
 
     phi.train(phi_mode)
@@ -515,6 +564,8 @@ def compute_avg_delta_norm(
             z_adv = icnn.gradient(z_detached, create_graph=False)
         z_adv = z_adv.detach()
         delta = (z_adv - z_detached).reshape(z_adv.size(0), -1)
+        if not torch.isfinite(delta).all():
+            continue
         norms.append(delta.norm(dim=1).mean().item())
 
     phi.train(phi_mode)
@@ -603,6 +654,8 @@ def train_one_epoch(
     phi.train(not head_only)
     head.train()
     icnn.train()
+    penalty_lambda = _clamp_penalty_lambda(float(penalty_lambda))
+    model_params = [p for p in list(phi.parameters()) + list(head.parameters()) if p.requires_grad]
 
     total_loss = 0.0
     total_correct = 0
@@ -632,30 +685,74 @@ def train_one_epoch(
         opt_theta.zero_grad(set_to_none=True)
         z = phi(x)
         z_detached = z.detach()
+        adv_objective_last: Optional[torch.Tensor] = None
         for _ in range(max(1, icnn_ascent_steps)):
             opt_icnn.zero_grad(set_to_none=True)
             z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
+            if not torch.isfinite(z_adv_ascent).all():
+                warnings.warn(
+                    "Encountered non-finite values in adversarial latents during ascent; "
+                    "skipping this ascent step.",
+                    RuntimeWarning,
+                )
+                continue
             logits_adv = head(z_adv_ascent)
             ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
             z_flat = z_detached.reshape(batch_size, -1)
             z_adv_flat = z_adv_ascent.reshape(batch_size, -1)
             penalty = (z_flat - z_adv_flat).pow(2).sum(dim=1).mean()
+            if not torch.isfinite(ce_adv) or not torch.isfinite(penalty):
+                warnings.warn(
+                    "Non-finite adversarial loss components detected; skipping ascent step.",
+                    RuntimeWarning,
+                )
+                continue
             adv_objective = ce_adv - penalty_lambda * penalty
             (-adv_objective).backward()
+            grad_finite = all(
+                (p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters()
+            )
+            if not grad_finite:
+                warnings.warn(
+                    "Non-finite gradients in ICNN adversary; skipping optimizer step.",
+                    RuntimeWarning,
+                )
+                opt_icnn.zero_grad(set_to_none=True)
+                continue
 
             # Remove stray gradients on the classifier, which acts as a frozen critic.
             for p in head.parameters():
                 if p.grad is not None:
                     p.grad.zero_()
+            torch.nn.utils.clip_grad_norm_(icnn.parameters(), max_norm=10.0)
             opt_icnn.step()
+            for param in icnn.parameters():
+                if not torch.isfinite(param).all():
+                    warnings.warn(
+                        "Detected non-finite ICNN parameters after update; sanitizing values.",
+                        RuntimeWarning,
+                    )
+                    param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
             icnn.project_convexity()
+            adv_objective_last = adv_objective.detach()
 
         # --- Model update (Danskin-style outer gradient) ---
         opt_theta.zero_grad(set_to_none=True)
         z_adv_fixed, delta = adversarial_pushforward(icnn, z, detach_for_model=True)
+        if not torch.isfinite(z_adv_fixed).all():
+            warnings.warn(
+                "Skipping batch update due to non-finite adversarial latents.",
+                RuntimeWarning,
+            )
+            continue
         logits = head(z_adv_fixed)
         loss = F.cross_entropy(logits, y, reduction="mean")
+        if not torch.isfinite(loss):
+            warnings.warn("Skipping batch with non-finite loss value.", RuntimeWarning)
+            continue
         loss.backward()
+        if model_params:
+            torch.nn.utils.clip_grad_norm_(model_params, max_norm=10.0)
         opt_theta.step()
 
         with torch.no_grad():
@@ -663,7 +760,21 @@ def train_one_epoch(
             total_correct += (logits.argmax(dim=1) == y).sum().item()
             total_samples += batch_size
             total_penalty += delta.reshape(batch_size, -1).pow(2).sum(dim=1).mean().item()
-            total_adv_obj += adv_objective.item()
+            if adv_objective_last is not None and torch.isfinite(adv_objective_last).all():
+                total_adv_obj += adv_objective_last.item()
+
+        if total_samples > 0:
+            mean_loss = total_loss / total_samples
+            mean_acc = total_correct / total_samples
+            mean_penalty = total_penalty / max(1, len(loader))
+            mean_adv_obj = total_adv_obj / max(1, len(loader))
+            progress.set_postfix(
+                loss=f"{mean_loss:.4f}",
+                acc=f"{mean_acc*100:.2f}%",
+                penalty=f"{mean_penalty:.4f}",
+                adv_obj=f"{mean_adv_obj:.4f}",
+                refresh=True,
+            )
 
     progress.close()
     mean_loss = total_loss / max(1, total_samples)
@@ -695,13 +806,33 @@ def evaluate_under_icnn(
         z = phi(x)
         z_det = z.detach().requires_grad_(True)
         z_adv = icnn.gradient(z_det, create_graph=False).detach()
+        if not torch.isfinite(z_adv).all():
+            warnings.warn(
+                "Skipping batch during ICNN evaluation due to non-finite adversarial latents.",
+                RuntimeWarning,
+            )
+            continue
         logits = head(z_adv)
         ce = F.cross_entropy(logits, y, reduction="sum")
+        if not torch.isfinite(ce):
+            warnings.warn("Non-finite ICNN evaluation loss encountered; skipping batch.", RuntimeWarning)
+            continue
         total_loss += ce.item()
         total_correct += (logits.argmax(dim=1) == y).sum().item()
         total_samples += x.size(0)
         delta = z_det - z_adv
         total_penalty += delta.reshape(delta.size(0), -1).pow(2).sum(dim=1).mean().item()
+        if total_samples > 0:
+            mean_loss = total_loss / total_samples
+            mean_acc = total_correct / total_samples
+            mean_penalty = total_penalty / max(1, len(loader))
+            progress.set_postfix(
+                loss=f"{mean_loss:.4f}",
+                acc=f"{mean_acc*100:.2f}%",
+                penalty=f"{mean_penalty:.4f}",
+                refresh=True,
+            )
+
     progress.close()
 
     mean_loss = total_loss / max(1, total_samples)
@@ -880,7 +1011,7 @@ def parse_args():
     parser.add_argument(
         "--latent-eps-target",
         type=float,
-        default=2.0,
+        default=None,
         help="Desired average L2 norm of T(z)-z; used to calibrate penalty_lambda.",
     )
     parser.add_argument(
@@ -997,19 +1128,22 @@ def main():
             device,
             num_batches=args.gamma_calibration_batches,
         )
-        if mean_grad_norm > 0:
-            args.penalty_lambda = mean_grad_norm / args.latent_eps_target
+        if math.isfinite(mean_grad_norm) and mean_grad_norm > 0:
+            initialized_lambda = mean_grad_norm / args.latent_eps_target
+            args.penalty_lambda = _clamp_penalty_lambda(initialized_lambda)
             print(
                 f"Initialized penalty_lambda to {args.penalty_lambda:.6f} "
                 f"from mean grad norm {mean_grad_norm:.6f} targeting ε_u={args.latent_eps_target:.6f}"
             )
         else:
             print(
-                "Calibration requested but gradient norm estimate was zero; "
+                "Calibration requested but gradient norm estimate was non-finite; "
                 "keeping existing penalty_lambda."
             )
     elif args.calibrate_penalty:
         print("Calibration requested but latent_eps_target not set or non-positive; skipping.")
+
+    args.penalty_lambda = _clamp_penalty_lambda(float(args.penalty_lambda))
 
     p_input = 2 if args.inp_p == "2" else float("inf")
     jacobian_ready = False
@@ -1128,15 +1262,19 @@ def main():
                 device,
                 num_batches=args.gamma_calibration_batches,
             )
-            if avg_delta > 0:
-                scale = avg_delta / args.latent_eps_target
-                args.penalty_lambda *= scale
-                print(
-                    f"[Calibration] Average delta {avg_delta:.4f}, scaling penalty_lambda by {scale:.4f} "
-                    f"to {args.penalty_lambda:.6f}"
-                )
+            if not math.isfinite(avg_delta) or avg_delta <= 0:
+                print("[Calibration] Average delta was non-finite; penalty_lambda unchanged.")
             else:
-                print("[Calibration] Average delta was zero; penalty_lambda unchanged.")
+                scale = float(avg_delta / args.latent_eps_target)
+                scale = float(
+                    min(max(scale, CALIBRATION_SCALE_MIN), CALIBRATION_SCALE_MAX)
+                )
+                new_lambda = _clamp_penalty_lambda(args.penalty_lambda * scale)
+                print(
+                    f"[Calibration] Average delta {avg_delta:.4f}, scaling factor {scale:.4f}, "
+                    f"penalty_lambda {args.penalty_lambda:.6f} → {new_lambda:.6f}"
+                )
+                args.penalty_lambda = new_lambda
 
     if args.estimate_transport_jacobian:
         jac_loader = trainloader if args.jacobian_sv_split == "train" else testloader
