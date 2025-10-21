@@ -76,6 +76,37 @@ class NonNegativeLinear(nn.Module):
         return
 
 
+class NonNegativeConv2d(nn.Module):
+    """Conv2d module with weights constrained to be element-wise non-negative."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        padding: int = 0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.padding = int(padding)
+        weight_shape = (out_channels, in_channels, self.kernel_size, self.kernel_size)
+        self.weight_raw = nn.Parameter(torch.empty(weight_shape))
+        self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
+        nn.init.xavier_uniform_(self.weight_raw)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = F.softplus(self.weight_raw)
+        return F.conv2d(x, weight, bias=self.bias, padding=self.padding)
+
+    @torch.no_grad()
+    def project_non_negative(self) -> None:
+        # Projection unnecessary due to softplus parameterization.
+        return
+
+
 class InputConvexPotential(nn.Module):
     """Fully input-convex neural network (FICNN) for latent potentials."""
 
@@ -85,12 +116,28 @@ class InputConvexPotential(nn.Module):
         hidden_sizes: Sequence[int],
         activation: str = "relu",
         strong_convexity: float = 1.0,
+        input_shape: Optional[Sequence[int]] = None,
+        use_convs: bool = False,
+        conv_kernel_size: int = 3,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.hidden_sizes: List[int] = list(hidden_sizes)
         if len(self.hidden_sizes) == 0:
             raise ValueError("ICNN requires at least one hidden layer.")
+
+        self.use_convs = bool(use_convs)
+        self.input_shape: Optional[Tuple[int, ...]] = (
+            tuple(int(v) for v in input_shape) if input_shape is not None else None
+        )
+        self.conv_kernel_size = int(conv_kernel_size)
+        if self.use_convs:
+            if self.input_shape is None or len(self.input_shape) != 3:
+                raise ValueError(
+                    "Convolutional ICNN requires spatial latent shape (C, H, W)."
+                )
+            if self.conv_kernel_size <= 0:
+                raise ValueError("conv_kernel_size must be positive.")
 
         if activation == "relu":
             self.nonlin: nn.Module = nn.ReLU()
@@ -104,37 +151,102 @@ class InputConvexPotential(nn.Module):
         self.z_linears = nn.ModuleList()
         self.h_linears = nn.ModuleList()
         prev_hidden = None
-        for width in self.hidden_sizes:
-            self.z_linears.append(nn.Linear(self.input_dim, width, bias=True))
-            if prev_hidden is None:
-                self.h_linears.append(None)  # type: ignore
-            else:
-                self.h_linears.append(NonNegativeLinear(prev_hidden, width, bias=True))
-            prev_hidden = width
 
-        self.hidden_output = NonNegativeLinear(self.hidden_sizes[-1], 1, bias=True)
-        self.input_skip = nn.Linear(self.input_dim, 1, bias=True)
+        if self.use_convs:
+            in_channels = int(self.input_shape[0])
+            padding = self.conv_kernel_size // 2
+            for width in self.hidden_sizes:
+                self.z_linears.append(
+                    nn.Conv2d(
+                        in_channels,
+                        width,
+                        kernel_size=self.conv_kernel_size,
+                        padding=padding,
+                        bias=True,
+                    )
+                )
+                if prev_hidden is None:
+                    self.h_linears.append(None)  # type: ignore
+                else:
+                    self.h_linears.append(
+                        NonNegativeConv2d(
+                            prev_hidden,
+                            width,
+                            kernel_size=self.conv_kernel_size,
+                            padding=padding,
+                            bias=True,
+                        )
+                    )
+                prev_hidden = width
+            self.hidden_output = NonNegativeConv2d(
+                self.hidden_sizes[-1], 1, kernel_size=1, padding=0, bias=True
+            )
+            self.input_skip = nn.Conv2d(in_channels, 1, kernel_size=1, padding=0, bias=True)
+        else:
+            for width in self.hidden_sizes:
+                self.z_linears.append(nn.Linear(self.input_dim, width, bias=True))
+                if prev_hidden is None:
+                    self.h_linears.append(None)  # type: ignore
+                else:
+                    self.h_linears.append(NonNegativeLinear(prev_hidden, width, bias=True))
+                prev_hidden = width
+            self.hidden_output = NonNegativeLinear(self.hidden_sizes[-1], 1, bias=True)
+            self.input_skip = nn.Linear(self.input_dim, 1, bias=True)
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         for layer in self.z_linears:
-            nn.init.xavier_normal_(layer.weight)
-            nn.init.zeros_(layer.bias)
-        for layer in self.h_linears:
-            if layer is not None:
-                nn.init.xavier_uniform_(layer.weight_raw)
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_normal_(layer.weight)
+                nn.init.zeros_(layer.bias)
+            elif isinstance(layer, nn.Conv2d):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="linear")
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
-        nn.init.xavier_uniform_(self.hidden_output.weight_raw)
-        nn.init.zeros_(self.hidden_output.bias)
-        nn.init.xavier_uniform_(self.input_skip.weight)
-        nn.init.zeros_(self.input_skip.bias)
+        for layer in self.h_linears:
+            if layer is not None:
+                if isinstance(layer, NonNegativeLinear):
+                    nn.init.xavier_uniform_(layer.weight_raw)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+                elif isinstance(layer, NonNegativeConv2d):
+                    nn.init.xavier_uniform_(layer.weight_raw)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+        if isinstance(self.hidden_output, NonNegativeLinear):
+            nn.init.xavier_uniform_(self.hidden_output.weight_raw)
+            nn.init.zeros_(self.hidden_output.bias)
+        elif isinstance(self.hidden_output, NonNegativeConv2d):
+            nn.init.xavier_uniform_(self.hidden_output.weight_raw)
+            if self.hidden_output.bias is not None:
+                nn.init.zeros_(self.hidden_output.bias)
+        if isinstance(self.input_skip, nn.Linear):
+            nn.init.xavier_uniform_(self.input_skip.weight)
+            nn.init.zeros_(self.input_skip.bias)
+        elif isinstance(self.input_skip, nn.Conv2d):
+            nn.init.kaiming_normal_(self.input_skip.weight, nonlinearity="linear")
+            if self.input_skip.bias is not None:
+                nn.init.zeros_(self.input_skip.bias)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         batch = z.size(0)
-        z_flat = z.view(batch, -1)
+        if self.use_convs:
+            z_spatial = z
+            h = None
+            for z_linear, h_linear in zip(self.z_linears, self.h_linears):
+                z_term = z_linear(z_spatial)
+                if h is None:
+                    h = self.nonlin(z_term)
+                else:
+                    h = self.nonlin(z_term + h_linear(h))
 
+            assert h is not None
+            quadratic = 0.5 * self.strong_convexity * (z_spatial.pow(2).sum(dim=1, keepdim=True))
+            output = quadratic + self.input_skip(z_spatial) + self.hidden_output(h)
+            return output.view(batch, -1).sum(dim=1)
+
+        z_flat = z.view(batch, -1)
         h = None
         for z_linear, h_linear in zip(self.z_linears, self.h_linears):
             z_term = z_linear(z_flat)
@@ -706,7 +818,7 @@ def parse_args():
         "--transport-viz-method",
         type=str,
         choices=["pca", "tsne"],
-        default="pca",
+        default="tsne",
         help="Dimensionality reduction to apply before plotting arrows.",
     )
     parser.add_argument(
@@ -753,9 +865,20 @@ def parse_args():
         help="Dataset split to sample latents from when estimating transport Jacobian singular values.",
     )
     parser.add_argument(
+        "--icnn-conv",
+        action="store_true",
+        help="Use convolutional ICNN layers when latent features are spatial.",
+    )
+    parser.add_argument(
+        "--icnn-kernel-size",
+        type=int,
+        default=3,
+        help="Kernel size for convolutional ICNN layers (requires --icnn-conv).",
+    )
+    parser.add_argument(
         "--latent-eps-target",
         type=float,
-        default=None,
+        default=2.0,
         help="Desired average L2 norm of T(z)-z; used to calibrate penalty_lambda.",
     )
     parser.add_argument(
@@ -835,6 +958,9 @@ def main():
         hidden_sizes=args.icnn_hidden,
         activation=args.icnn_activation,
         strong_convexity=args.icnn_strong_convexity,
+        input_shape=latent_shape,
+        use_convs=args.icnn_conv,
+        conv_kernel_size=args.icnn_kernel_size,
     ).to(device)
 
     theta_params = [p for p in list(phi.parameters()) + list(head.parameters()) if p.requires_grad]
