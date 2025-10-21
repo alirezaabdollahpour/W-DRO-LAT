@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -336,6 +337,134 @@ def visualize_transport_map(
     print(f"Saved transport map visualization to {plot_path}")
 
 
+def estimate_mean_grad_norm(
+    phi: nn.Module,
+    head: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_batches: int = 2,
+) -> float:
+    """Estimate E[||∇_u ℓ||] over a small number of batches."""
+    phi_mode = phi.training
+    head_mode = head.training
+    phi.eval()
+    head.eval()
+
+    norms: List[float] = []
+    with torch.enable_grad():
+        for i, (x, y) in enumerate(loader):
+            if i >= num_batches:
+                break
+            x = x.to(device)
+            y = y.to(device)
+            z = phi(x).detach().requires_grad_(True)
+            logits = head(z)
+            loss = F.cross_entropy(logits, y, reduction="mean")
+            grad = torch.autograd.grad(loss, z, create_graph=False, retain_graph=False)[0]
+            norms.append(grad.view(grad.size(0), -1).norm(dim=1).mean().item())
+
+    phi.train(phi_mode)
+    head.train(head_mode)
+    return float(np.mean(norms)) if norms else 0.0
+
+
+def compute_avg_delta_norm(
+    phi: nn.Module,
+    icnn: InputConvexPotential,
+    loader: DataLoader,
+    device: torch.device,
+    num_batches: int = 2,
+) -> float:
+    """Compute the mean L2 norm of T(z)-z over a few minibatches."""
+    phi_mode = phi.training
+    icnn_mode = icnn.training
+    phi.eval()
+    icnn.eval()
+
+    norms: List[float] = []
+    for i, (x, _) in enumerate(loader):
+        if i >= num_batches:
+            break
+        x = x.to(device)
+        with torch.no_grad():
+            z = phi(x)
+        z_detached = z.detach()
+        with torch.enable_grad():
+            z_adv = icnn.gradient(z_detached, create_graph=False)
+        z_adv = z_adv.detach()
+        delta = z_adv - z_detached
+        norms.append(delta.view(delta.size(0), -1).norm(dim=1).mean().item())
+
+    phi.train(phi_mode)
+    icnn.train(icnn_mode)
+    return float(np.mean(norms)) if norms else 0.0
+
+
+def estimate_transport_jacobian_sv(
+    phi: nn.Module,
+    icnn: InputConvexPotential,
+    loader: DataLoader,
+    device: torch.device,
+    args,
+) -> Tuple[float, float]:
+    """Estimate max/mean largest singular value of the Jacobian of T(z)."""
+    phi_mode = phi.training
+    icnn_mode = icnn.training
+    phi.eval()
+    icnn.eval()
+
+    sv_values: List[float] = []
+    batches_considered = 0
+    max_batches = max(1, args.jacobian_sv_batches)
+    max_samples = max(1, args.jacobian_sv_samples)
+    power_iters = max(1, args.jacobian_iters)
+
+    for x, _ in loader:
+        x = x.to(device)
+        with torch.no_grad():
+            z = phi(x)
+        batch = min(z.size(0), max_samples)
+        if batch == 0:
+            continue
+        indices = torch.randperm(z.size(0), device=z.device)[:batch]
+        for idx in indices:
+            base = z[idx.item() : idx.item() + 1].detach()
+            vec = torch.randn_like(base)
+            vec_norm = vec.view(-1).norm().item()
+            if vec_norm < 1e-12:
+                continue
+            vec = vec / vec_norm
+            sigma_val = float("nan")
+            for _ in range(power_iters):
+                z_leaf = base.clone().detach().requires_grad_(True)
+                transport = icnn.gradient(z_leaf, create_graph=True)
+                hvp = torch.autograd.grad(
+                    transport,
+                    z_leaf,
+                    grad_outputs=vec,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0]
+                hvp_norm = hvp.view(-1).norm().item()
+                if not math.isfinite(hvp_norm) or hvp_norm < 1e-12:
+                    sigma_val = float("nan")
+                    break
+                sigma_val = hvp_norm
+                vec = hvp.detach() / hvp_norm
+            if math.isfinite(sigma_val):
+                sv_values.append(sigma_val)
+        batches_considered += 1
+        if batches_considered >= max_batches:
+            break
+    phi.train(phi_mode)
+    icnn.train(icnn_mode)
+
+    if not sv_values:
+        return float("nan"), float("nan")
+    sv_tensor = torch.tensor(sv_values)
+    return float(sv_tensor.max().item()), float(sv_tensor.mean().item())
+
+
 def train_one_epoch(
     phi: nn.Module,
     head: nn.Module,
@@ -588,6 +717,47 @@ def parse_args():
         default="test",
         help="Dataset split to draw samples from for the transport visualization.",
     )
+    parser.add_argument(
+        "--estimate-transport-jacobian",
+        action="store_true",
+        help="Estimate the largest singular value of the transport Jacobian after training.",
+    )
+    parser.add_argument(
+        "--jacobian-sv-batches",
+        type=int,
+        default=4,
+        help="Number of minibatches to sample when estimating transport Jacobian singular values.",
+    )
+    parser.add_argument(
+        "--jacobian-sv-samples",
+        type=int,
+        default=128,
+        help="Maximum number of latent samples used per batch for Jacobian SV estimation.",
+    )
+    parser.add_argument(
+        "--jacobian-sv-split",
+        type=str,
+        choices=["train", "test"],
+        default="test",
+        help="Dataset split to sample latents from when estimating transport Jacobian singular values.",
+    )
+    parser.add_argument(
+        "--latent-eps-target",
+        type=float,
+        default=None,
+        help="Desired average L2 norm of T(z)-z; used to calibrate penalty_lambda.",
+    )
+    parser.add_argument(
+        "--calibrate-penalty",
+        action="store_true",
+        help="Enable automatic calibration of penalty_lambda to match latent-eps-target.",
+    )
+    parser.add_argument(
+        "--gamma-calibration-batches",
+        type=int,
+        default=2,
+        help="Number of minibatches used to estimate gradient norms or delta norms.",
+    )
 
     return parser.parse_args()
 
@@ -679,6 +849,28 @@ def main():
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if args.calibrate_penalty and args.latent_eps_target and args.latent_eps_target > 0:
+        mean_grad_norm = estimate_mean_grad_norm(
+            phi,
+            head,
+            trainloader,
+            device,
+            num_batches=args.gamma_calibration_batches,
+        )
+        if mean_grad_norm > 0:
+            args.penalty_lambda = mean_grad_norm / args.latent_eps_target
+            print(
+                f"Initialized penalty_lambda to {args.penalty_lambda:.6f} "
+                f"from mean grad norm {mean_grad_norm:.6f} targeting ε_u={args.latent_eps_target:.6f}"
+            )
+        else:
+            print(
+                "Calibration requested but gradient norm estimate was zero; "
+                "keeping existing penalty_lambda."
+            )
+    elif args.calibrate_penalty:
+        print("Calibration requested but latent_eps_target not set or non-positive; skipping.")
 
     p_input = 2 if args.inp_p == "2" else float("inf")
     jacobian_ready = False
@@ -783,6 +975,41 @@ def main():
         )
 
         lr_scheduler.step()
+
+        if (
+            args.calibrate_penalty
+            and args.latent_eps_target
+            and args.latent_eps_target > 0
+            and phase == "icnn"
+        ):
+            avg_delta = compute_avg_delta_norm(
+                phi,
+                icnn,
+                trainloader,
+                device,
+                num_batches=args.gamma_calibration_batches,
+            )
+            if avg_delta > 0:
+                scale = avg_delta / args.latent_eps_target
+                args.penalty_lambda *= scale
+                print(
+                    f"[Calibration] Average delta {avg_delta:.4f}, scaling penalty_lambda by {scale:.4f} "
+                    f"to {args.penalty_lambda:.6f}"
+                )
+            else:
+                print("[Calibration] Average delta was zero; penalty_lambda unchanged.")
+
+    if args.estimate_transport_jacobian:
+        jac_loader = trainloader if args.jacobian_sv_split == "train" else testloader
+        max_sv, mean_sv = estimate_transport_jacobian_sv(
+            phi, icnn, jac_loader, device, args
+        )
+        if math.isnan(max_sv) or math.isnan(mean_sv):
+            print("Transport Jacobian estimation returned NaN; consider adjusting parameters.")
+        else:
+            print(
+                f"Estimated transport Jacobian σ_max ≈ {max_sv:.4f}, σ_mean ≈ {mean_sv:.4f}"
+            )
 
     if args.visualize_transport:
         viz_loader = trainloader if args.transport_viz_split == "train" else testloader
