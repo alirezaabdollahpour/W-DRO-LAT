@@ -191,6 +191,17 @@ def adversarial_pushforward(
     return z_adv, delta
 
 
+def _parse_hidden_units(token: str) -> int:
+    """Parse hidden layer width tokens while tolerating bracket/comma syntax."""
+    cleaned = token.strip().strip("[],")
+    if cleaned == "":
+        raise argparse.ArgumentTypeError(f"Invalid hidden size token: {token!r}")
+    try:
+        return int(cleaned)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid integer value: {token!r}") from exc
+
+
 def _reduce_latents_for_plot(
     z: torch.Tensor, z_adv: torch.Tensor, method: str, seed: int
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -658,7 +669,7 @@ def parse_args():
         default=5.0,
         help="Fixed λ multiplying the quadratic transport penalty.",
     )
-    parser.add_argument("--icnn-hidden", type=int, nargs="+", default=[256, 256])
+    parser.add_argument("--icnn-hidden", type=_parse_hidden_units, nargs="+", default=[256, 256])
     parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="relu")
     parser.add_argument("--icnn-strong-convexity", type=float, default=1.0)
     parser.add_argument(
