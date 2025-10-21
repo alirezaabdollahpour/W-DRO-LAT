@@ -381,7 +381,7 @@ def parse_args():
         default=5.0,
         help="Fixed λ multiplying the quadratic transport penalty.",
     )
-    parser.add_argument("--icnn-hidden", type=int, nargs="+", default=[512, 512])
+    parser.add_argument("--icnn-hidden", type=int, nargs="+", default=[256, 256])
     parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="relu")
     parser.add_argument("--icnn-strong-convexity", type=float, default=1.0)
     parser.add_argument(
@@ -488,6 +488,8 @@ def main():
         icnn.parameters(),
         lr=args.lr_omega,
         betas=(args.icnn_beta1, args.icnn_beta2),
+        # weight_decay=1e-4,
+
     )
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
 
