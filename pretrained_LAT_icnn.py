@@ -26,8 +26,10 @@ import argparse
 import csv
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -186,6 +188,152 @@ def adversarial_pushforward(
         z_adv = icnn.gradient(z_leaf, create_graph=True)
     delta = z_adv - z_leaf
     return z_adv, delta
+
+
+def _reduce_latents_for_plot(
+    z: torch.Tensor, z_adv: torch.Tensor, method: str, seed: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Project latent pairs into 2D using PCA or t-SNE."""
+    z_flat = z.view(z.size(0), -1).cpu().float()
+    z_adv_flat = z_adv.view(z_adv.size(0), -1).cpu().float()
+
+    if method == "pca":
+        z_np = z_flat.numpy()
+        z_adv_np = z_adv_flat.numpy()
+
+        mean = z_np.mean(axis=0, keepdims=True)
+        centered = z_np - mean
+        try:
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            vt = np.eye(centered.shape[1], dtype=np.float64)
+        basis = vt[:2].T
+        if basis.shape[1] < 2:
+            pad = np.zeros((basis.shape[0], 2 - basis.shape[1]), dtype=basis.dtype)
+            basis = np.concatenate([basis, pad], axis=1)
+        coords_z = centered @ basis
+        coords_adv = (z_adv_np - mean) @ basis
+        return coords_z.astype(np.float32), coords_adv.astype(np.float32)
+
+    try:
+        from sklearn.manifold import TSNE
+    except ImportError:
+        print("t-SNE requested but scikit-learn is unavailable; falling back to PCA.")
+        return _reduce_latents_for_plot(z, z_adv, "pca", seed)
+
+    stacked = torch.cat([z_flat, z_adv_flat], dim=0).numpy()
+    tsne = TSNE(n_components=2, init="pca", learning_rate="auto", random_state=seed)
+    embedding = tsne.fit_transform(stacked)
+    coords_z = embedding[: z_flat.size(0)]
+    coords_adv = embedding[z_flat.size(0) :]
+    return coords_z.astype(np.float32), coords_adv.astype(np.float32)
+
+
+def visualize_transport_map(
+    phi: nn.Module,
+    icnn: InputConvexPotential,
+    loader: DataLoader,
+    device: torch.device,
+    args,
+    run_id: str,
+    split_name: str,
+) -> None:
+    """Generate and save a 2D visualization of the transport map."""
+    max_samples = max(1, int(args.transport_viz_samples))
+    phi_mode = phi.training
+    icnn_mode = icnn.training
+    phi.eval()
+    icnn.eval()
+
+    z_list: List[torch.Tensor] = []
+    z_adv_list: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
+    collected = 0
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        with torch.no_grad():
+            z = phi(x)
+        z_detached = z.detach()
+        with torch.enable_grad():
+            z_leaf = z_detached.clone().requires_grad_(True)
+            z_push = icnn.gradient(z_leaf, create_graph=False).detach()
+        z_list.append(z_detached.cpu())
+        z_adv_list.append(z_push.cpu())
+        labels.append(y.cpu())
+        collected += x.size(0)
+        if collected >= max_samples:
+            break
+
+    phi.train(phi_mode)
+    icnn.train(icnn_mode)
+
+    if not z_list:
+        print("Transport visualization skipped: no samples collected.")
+        return
+
+    z_tensor = torch.cat(z_list, dim=0)[:max_samples]
+    z_adv_tensor = torch.cat(z_adv_list, dim=0)[:max_samples]
+    label_tensor = torch.cat(labels, dim=0)[:max_samples]
+
+    coords_z, coords_adv = _reduce_latents_for_plot(
+        z_tensor, z_adv_tensor, args.transport_viz_method, seed=args.seed
+    )
+
+    class_colors = plt.cm.tab10(label_tensor.numpy() % 10)
+    dx = coords_adv[:, 0] - coords_z[:, 0]
+    dy = coords_adv[:, 1] - coords_z[:, 1]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    scatter = ax.scatter(
+        coords_z[:, 0],
+        coords_z[:, 1],
+        c=label_tensor.numpy(),
+        cmap="tab10",
+        s=20,
+        alpha=0.9,
+        edgecolors="none",
+    )
+    ax.quiver(
+        coords_z[:, 0],
+        coords_z[:, 1],
+        dx,
+        dy,
+        angles="xy",
+        scale_units="xy",
+        scale=1,
+        color=class_colors,
+        alpha=0.4,
+        linewidths=0.5,
+    )
+    ax.set_title(
+        f"Transport map ({args.transport_viz_method.upper()}) on {split_name} split"
+    )
+    ax.set_xlabel("Component 1")
+    ax.set_ylabel("Component 2")
+    ax.set_aspect("equal", "box")
+    ax.grid(True, alpha=0.2)
+    cbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Class label")
+    fig.tight_layout()
+
+    viz_dir = Path(args.transport_viz_dir) / run_id
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    plot_params: Dict[str, object] = {
+        "split": split_name,
+        "method": args.transport_viz_method,
+        "samples": args.transport_viz_samples,
+        "seed": args.seed,
+        "cut": args.cut_layer,
+        "icnn": "-".join(map(str, args.icnn_hidden)),
+        "lambda": args.penalty_lambda,
+    }
+    base_path = viz_dir / "transport_map.png"
+    plot_path = parameterized_filename(base_path, plot_params)
+    fig.savefig(plot_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved transport map visualization to {plot_path}")
 
 
 def train_one_epoch(
@@ -409,6 +557,38 @@ def parse_args():
     parser.add_argument("--inp-step-size", type=float, default=0.0)
     parser.add_argument("--inp-restarts", type=int, default=5)
 
+    parser.add_argument(
+        "--visualize-transport",
+        action="store_true",
+        help="Generate a 2D visualization of the transport map after training.",
+    )
+    parser.add_argument(
+        "--transport-viz-method",
+        type=str,
+        choices=["pca", "tsne"],
+        default="pca",
+        help="Dimensionality reduction to apply before plotting arrows.",
+    )
+    parser.add_argument(
+        "--transport-viz-samples",
+        type=int,
+        default=512,
+        help="Number of latent samples to include in the transport visualization.",
+    )
+    parser.add_argument(
+        "--transport-viz-dir",
+        type=str,
+        default="fig/transport_maps",
+        help="Directory where transport visualization figures are stored.",
+    )
+    parser.add_argument(
+        "--transport-viz-split",
+        type=str,
+        choices=["train", "test"],
+        default="test",
+        help="Dataset split to draw samples from for the transport visualization.",
+    )
+
     return parser.parse_args()
 
 
@@ -603,6 +783,18 @@ def main():
         )
 
         lr_scheduler.step()
+
+    if args.visualize_transport:
+        viz_loader = trainloader if args.transport_viz_split == "train" else testloader
+        visualize_transport_map(
+            phi,
+            icnn,
+            viz_loader,
+            device,
+            args,
+            run_id=run_id,
+            split_name=args.transport_viz_split,
+        )
 
     if args.save:
         Path(args.save).parent.mkdir(parents=True, exist_ok=True)
