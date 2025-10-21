@@ -103,8 +103,7 @@ class NonNegativeConv2d(nn.Module):
 
     @torch.no_grad()
     def project_non_negative(self) -> None:
-        # Projection unnecessary due to softplus parameterization.
-        return
+        self.weight_raw.data.clamp_(min=0.0)
 
 
 class InputConvexPotential(nn.Module):
@@ -484,7 +483,7 @@ def estimate_mean_grad_norm(
             logits = head(z)
             loss = F.cross_entropy(logits, y, reduction="mean")
             grad = torch.autograd.grad(loss, z, create_graph=False, retain_graph=False)[0]
-            norms.append(grad.view(grad.size(0), -1).norm(dim=1).mean().item())
+            norms.append(grad.reshape(grad.size(0), -1).norm(dim=1).mean().item())
 
     phi.train(phi_mode)
     head.train(head_mode)
@@ -515,8 +514,8 @@ def compute_avg_delta_norm(
         with torch.enable_grad():
             z_adv = icnn.gradient(z_detached, create_graph=False)
         z_adv = z_adv.detach()
-        delta = z_adv - z_detached
-        norms.append(delta.view(delta.size(0), -1).norm(dim=1).mean().item())
+        delta = (z_adv - z_detached).reshape(z_adv.size(0), -1)
+        norms.append(delta.norm(dim=1).mean().item())
 
     phi.train(phi_mode)
     icnn.train(icnn_mode)
@@ -638,7 +637,9 @@ def train_one_epoch(
             z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
             logits_adv = head(z_adv_ascent)
             ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
-            penalty = (z_detached - z_adv_ascent).view(batch_size, -1).pow(2).sum(dim=1).mean()
+            z_flat = z_detached.reshape(batch_size, -1)
+            z_adv_flat = z_adv_ascent.reshape(batch_size, -1)
+            penalty = (z_flat - z_adv_flat).pow(2).sum(dim=1).mean()
             adv_objective = ce_adv - penalty_lambda * penalty
             (-adv_objective).backward()
 
@@ -661,7 +662,7 @@ def train_one_epoch(
             total_loss += loss.item() * batch_size
             total_correct += (logits.argmax(dim=1) == y).sum().item()
             total_samples += batch_size
-            total_penalty += delta.view(batch_size, -1).pow(2).sum(dim=1).mean().item()
+            total_penalty += delta.reshape(batch_size, -1).pow(2).sum(dim=1).mean().item()
             total_adv_obj += adv_objective.item()
 
     progress.close()
@@ -699,7 +700,8 @@ def evaluate_under_icnn(
         total_loss += ce.item()
         total_correct += (logits.argmax(dim=1) == y).sum().item()
         total_samples += x.size(0)
-        total_penalty += (z_det - z_adv).view(z.size(0), -1).pow(2).sum(dim=1).mean().item()
+        delta = z_det - z_adv
+        total_penalty += delta.reshape(delta.size(0), -1).pow(2).sum(dim=1).mean().item()
     progress.close()
 
     mean_loss = total_loss / max(1, total_samples)
