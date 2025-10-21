@@ -69,7 +69,8 @@ class NonNegativeLinear(nn.Module):
 
     @torch.no_grad()
     def project_non_negative(self) -> None:
-        self.weight_raw.data.clamp_(min=0.0)
+        # Forward pass already enforces non-negativity via softplus; no projection needed.
+        return
 
 
 class InputConvexPotential(nn.Module):
@@ -230,15 +231,14 @@ def train_one_epoch(
 
         # --- ICNN adversary update ---
         opt_theta.zero_grad(set_to_none=True)
-        opt_icnn.zero_grad(set_to_none=True)
         z = phi(x)
         z_detached = z.detach()
         for _ in range(max(1, icnn_ascent_steps)):
-            z_req = z_detached.clone().detach().requires_grad_(True)
-            z_adv_ascent, _ = adversarial_pushforward(icnn, z_req, detach_for_model=False)
+            opt_icnn.zero_grad(set_to_none=True)
+            z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
             logits_adv = head(z_adv_ascent)
             ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
-            penalty = (z_req - z_adv_ascent).view(batch_size, -1).pow(2).sum(dim=1).mean()
+            penalty = (z_detached - z_adv_ascent).view(batch_size, -1).pow(2).sum(dim=1).mean()
             adv_objective = ce_adv - penalty_lambda * penalty
             (-adv_objective).backward()
 
@@ -246,8 +246,8 @@ def train_one_epoch(
             for p in head.parameters():
                 if p.grad is not None:
                     p.grad.zero_()
-        opt_icnn.step()
-        icnn.project_convexity()
+            opt_icnn.step()
+            icnn.project_convexity()
 
         # --- Model update (Danskin-style outer gradient) ---
         opt_theta.zero_grad(set_to_none=True)
@@ -484,12 +484,17 @@ def main():
         weight_decay=args.weight_decay,
         nesterov=True,
     )
+    icnn_param_groups = []
+    # Apply decay selectively: only unconstrained input-to-hidden weights get L2 penalty.
+    for name, param in icnn.named_parameters():
+        if not param.requires_grad:
+            continue
+        decay = 0.0 if ("weight_raw" in name or "bias" in name) else 1e-4
+        icnn_param_groups.append({"params": [param], "weight_decay": decay})
     opt_icnn = optim.Adam(
-        icnn.parameters(),
+        icnn_param_groups,
         lr=args.lr_omega,
         betas=(args.icnn_beta1, args.icnn_beta2),
-        # weight_decay=1e-4,
-
     )
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
 
