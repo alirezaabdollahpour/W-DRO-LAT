@@ -195,6 +195,7 @@ def evaluate_under_input_pgd(
     steps: int,
     step_size: Optional[float],
     restarts: int = 1,
+    max_batches: Optional[int] = None,
 ):
     """Run input-space PGD in pixel units and report accuracy and perturbation stats."""
     phi.eval()
@@ -209,8 +210,12 @@ def evaluate_under_input_pgd(
     restarts = max(1, int(restarts))
 
     total_batches = len(loader) if hasattr(loader, "__len__") else None
+    if max_batches is not None and total_batches is not None:
+        total_batches = min(total_batches, max_batches)
     progress = tqdm(loader, desc="Input-PGD", leave=False, total=total_batches)
-    for x_norm, y in progress:
+    for batch_idx, (x_norm, y) in enumerate(progress):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
         x_norm = x_norm.to(device)
         y = y.to(device)
         x0_pix = to_pixel(x_norm).detach()
@@ -251,17 +256,11 @@ def evaluate_under_input_pgd(
             avg_linf += delta.abs().view(delta.size(0), -1).max(dim=1)[0].mean().item()
             n_batches += 1
 
-    dataset_size = len(loader.dataset) if hasattr(loader, "dataset") else total
-    if hasattr(loader, "dataset") and total != dataset_size:
-        raise RuntimeError(
-            f"evaluate_under_input_pgd consumed {total} samples but dataset has {dataset_size}."
-            " Ensure DataLoader is not dropping samples."
-        )
-    accuracy = total_correct / max(1, dataset_size)
+    accuracy = total_correct / max(1, total)
     avg_l2 /= max(1, n_batches)
     avg_linf /= max(1, n_batches)
     progress.close()
-    return accuracy, {"avg_l2": avg_l2, "avg_linf": avg_linf}
+    return accuracy, {"avg_l2": avg_l2, "avg_linf": avg_linf, "samples": total}
 
 
 def dataloader_seed(base_seed: int, offset: int = 0) -> Tuple[torch.Generator, Callable[[int], None]]:

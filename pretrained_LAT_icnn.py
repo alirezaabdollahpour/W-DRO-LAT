@@ -775,7 +775,7 @@ def estimate_transport_jacobian_sv(
         for idx in indices:
             base = z[idx.item() : idx.item() + 1].detach()
             if rng is not None:
-                vec = torch.randn_like(base, generator=rng)
+                vec = torch.randn(base.shape, generator=rng, device=base.device, dtype=base.dtype)
             else:
                 vec = torch.randn_like(base)
             vec_norm = vec.view(-1).norm().item()
@@ -1152,6 +1152,24 @@ def parse_args():
     parser.add_argument("--inp-steps", type=int, default=20)
     parser.add_argument("--inp-step-size", type=float, default=0.0)
     parser.add_argument("--inp-restarts", type=int, default=5)
+    parser.add_argument(
+        "--eval-input-pgd",
+        dest="eval_input_pgd",
+        action="store_true",
+        help="Evaluate robustness with input-space PGD each epoch (uses subset if samples specified).",
+    )
+    parser.add_argument(
+        "--no-eval-input-pgd",
+        dest="eval_input_pgd",
+        action="store_false",
+        help="Disable input-space PGD evaluation at epoch end.",
+    )
+    parser.add_argument(
+        "--eval-input-pgd-samples",
+        type=int,
+        default=1000,
+        help="Number of test samples to use for input-space PGD evaluation (<=0 uses full set).",
+    )
 
     parser.add_argument(
         "--visualize-transport",
@@ -1254,6 +1272,7 @@ def parse_args():
         help="Number of minibatches used to estimate gradient norms or delta norms.",
     )
 
+    parser.set_defaults(eval_input_pgd=True)
     return parser.parse_args()
 
 
@@ -1438,7 +1457,20 @@ def main():
         test_loss, test_acc = evaluate(phi, head, testloader, device)
         icnn_loss, icnn_acc, icnn_penalty = evaluate_under_icnn(phi, head, icnn, testloader, device)
 
-        if args.inp_steps > 0 and args.inp_eps > 0:
+        if (
+            args.eval_input_pgd
+            and args.inp_steps > 0
+            and args.inp_eps > 0
+        ):
+            sample_limit = args.eval_input_pgd_samples
+            max_batches = None
+            if sample_limit is not None and sample_limit > 0 and hasattr(testloader, "dataset"):
+                samples_available = len(testloader.dataset)
+                sample_limit = min(sample_limit, samples_available)
+                batch_size = getattr(testloader, "batch_size", sample_limit)
+                if batch_size <= 0:
+                    batch_size = sample_limit
+                max_batches = max(1, math.ceil(sample_limit / batch_size))
             input_pgd_acc, pgd_info = evaluate_under_input_pgd(
                 phi,
                 head,
@@ -1449,11 +1481,13 @@ def main():
                 steps=args.inp_steps,
                 step_size=args.inp_step_size,
                 restarts=args.inp_restarts,
+                max_batches=max_batches,
             )
             ipgd_l2 = pgd_info["avg_l2"]
             ipgd_linf = pgd_info["avg_linf"]
+            ipgd_samples = pgd_info.get("samples")
         else:
-            input_pgd_acc, ipgd_l2, ipgd_linf = None, None, None
+            input_pgd_acc, ipgd_l2, ipgd_linf, ipgd_samples = None, None, None, None
 
         msg = (
             f"[Epoch {epoch:02d} | {phase}] train {train_loss:.4f}/{train_acc*100:.2f}% | "
@@ -1462,7 +1496,8 @@ def main():
             f"icnn {icnn_loss:.4f}/{icnn_acc*100:.2f}% (pen {icnn_penalty:.4f})"
         )
         if input_pgd_acc is not None:
-            msg += f" | input-PGD {input_pgd_acc*100:.2f}% (L2 {ipgd_l2:.4f}, Linf {ipgd_linf:.4f})"
+            sample_note = f", n={ipgd_samples}" if ipgd_samples is not None else ""
+            msg += f" | input-PGD {input_pgd_acc*100:.2f}% (L2 {ipgd_l2:.4f}, Linf {ipgd_linf:.4f}{sample_note})"
         if jacobian_ready and L_hat_used is not None:
             msg += f" | L_hat {L_hat_used:.4f}"
         print(msg)
