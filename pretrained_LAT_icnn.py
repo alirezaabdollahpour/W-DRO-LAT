@@ -26,6 +26,7 @@ import argparse
 import csv
 import math
 import warnings
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -60,6 +61,163 @@ PENALTY_LAMBDA_MAX = 1e4
 CALIBRATION_SCALE_MIN = 0.1
 CALIBRATION_SCALE_MAX = 10.0
 CALIBRATION_SMOOTHING = 0.1
+
+
+class TransportDeltaTracker:
+    """Utility for recording |T(z)-z|^2 statistics during training."""
+
+    def __init__(self, enabled: bool, max_batches: int, plot_dir: str):
+        self.enabled = bool(enabled)
+        self.max_batches = max(0, int(max_batches))
+        self.plot_dir = Path(plot_dir)
+        self.per_ascent: Dict[int, List[float]] = defaultdict(list)
+        self.epoch_records: List[Dict[str, object]] = []
+        self._current_epoch_values: List[float] = []
+        self._current_epoch_meta: Optional[Tuple[int, str]] = None
+
+    def start_epoch(self, epoch_idx: int, phase: str) -> None:
+        if not self.enabled:
+            return
+        self._current_epoch_values = []
+        self._current_epoch_meta = (int(epoch_idx), str(phase))
+
+    def should_track(self, batch_idx: int) -> bool:
+        return self.enabled and batch_idx < self.max_batches
+
+    def record_ascent(self, step_idx: int, delta_sq: torch.Tensor, batch_idx: int) -> None:
+        if not self.should_track(batch_idx):
+            return
+        values = delta_sq.detach().cpu().view(-1).tolist()
+        if values:
+            self.per_ascent[int(step_idx)].extend(float(v) for v in values)
+
+    def record_epoch_batch(self, delta_sq: torch.Tensor, batch_idx: int) -> None:
+        if not self.should_track(batch_idx):
+            return
+        if self._current_epoch_meta is None:
+            return
+        values = delta_sq.detach().cpu().view(-1).tolist()
+        if values:
+            self._current_epoch_values.extend(float(v) for v in values)
+
+    def finish_epoch(self) -> None:
+        if not self.enabled or self._current_epoch_meta is None:
+            return
+        epoch_idx, phase = self._current_epoch_meta
+        if self._current_epoch_values:
+            mean_val = float(np.mean(self._current_epoch_values))
+        else:
+            mean_val = float("nan")
+        self.epoch_records.append(
+            {"epoch": epoch_idx, "phase": phase, "mean_delta_sq": mean_val}
+        )
+        self._current_epoch_values = []
+        self._current_epoch_meta = None
+
+    def has_data(self) -> bool:
+        ascent_has = any(len(v) > 0 for v in self.per_ascent.values())
+        epoch_has = any(not math.isnan(rec["mean_delta_sq"]) for rec in self.epoch_records)
+        return ascent_has or epoch_has
+
+    def ascent_summary(self) -> List[Tuple[int, float]]:
+        summary: List[Tuple[int, float]] = []
+        for step_idx in sorted(self.per_ascent.keys()):
+            values = self.per_ascent[step_idx]
+            if not values:
+                continue
+            arr = np.array(values, dtype=np.float64)
+            summary.append((step_idx, float(arr.mean())))
+        return summary
+
+    def epoch_summary(self) -> List[Tuple[int, str, float]]:
+        summary: List[Tuple[int, str, float]] = []
+        for record in self.epoch_records:
+            mean_val = float(record["mean_delta_sq"])
+            if math.isnan(mean_val):
+                continue
+            summary.append((int(record["epoch"]), str(record["phase"]), mean_val))
+        return summary
+
+
+def save_transport_delta_plot(
+    tracker: TransportDeltaTracker,
+    args,
+    run_id: str,
+) -> None:
+    """Generate summary plots for tracked transport delta norms."""
+    if not tracker.enabled or not tracker.has_data():
+        return
+
+    ascent_summary = tracker.ascent_summary()
+    epoch_summary = tracker.epoch_summary()
+    if not ascent_summary and not epoch_summary:
+        print("Transport delta tracking enabled but no finite statistics collected; skipping plot.")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes = np.atleast_1d(axes).ravel()
+
+    # Left plot: mean delta squared versus ascent iteration.
+    ax_iter = axes[0]
+    if ascent_summary:
+        steps, means = zip(*ascent_summary)
+        ax_iter.plot(steps, means, marker="o")
+        ax_iter.set_xlabel("Ascent iteration")
+        ax_iter.set_ylabel("Mean |T(z) - z|^2")
+        ax_iter.set_title("Delta norms per ascent step")
+        ax_iter.grid(True, alpha=0.2)
+    else:
+        ax_iter.axis("off")
+        ax_iter.text(
+            0.5,
+            0.5,
+            "No ascent data recorded",
+            ha="center",
+            va="center",
+            transform=ax_iter.transAxes,
+        )
+
+    # Right plot: mean delta squared versus epoch index.
+    ax_epoch = axes[1]
+    if epoch_summary:
+        epochs = [item[0] for item in epoch_summary]
+        phases = [item[1] for item in epoch_summary]
+        values = [item[2] for item in epoch_summary]
+        ax_epoch.plot(epochs, values, marker="o")
+        ax_epoch.set_xlabel("Epoch")
+        ax_epoch.set_ylabel("Mean |T(z) - z|^2")
+        ax_epoch.set_title("Delta norms across epochs")
+        ax_epoch.grid(True, alpha=0.2)
+        ax_epoch.set_xticks(epochs)
+        if len(set(phases)) > 1:
+            labels = [f"{epoch}\n{phase}" for epoch, phase in zip(epochs, phases)]
+            ax_epoch.set_xticklabels(labels)
+    else:
+        ax_epoch.axis("off")
+        ax_epoch.text(
+            0.5,
+            0.5,
+            "No epoch data recorded",
+            ha="center",
+            va="center",
+            transform=ax_epoch.transAxes,
+        )
+
+    fig.suptitle("|T(z) - z|^2 tracking", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+    plot_dir = tracker.plot_dir / run_id
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    base_path = plot_dir / "transport_delta_tracking.png"
+    plot_params = {
+        "icnn": "-".join(map(str, args.icnn_hidden)),
+        "steps": args.icnn_ascent_steps,
+        "tracked_batches": args.track_transport_batches,
+    }
+    plot_path = parameterized_filename(base_path, plot_params)
+    fig.savefig(plot_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved transport delta tracking plot to {plot_path}")
 
 
 class NonNegativeLinear(nn.Module):
@@ -651,6 +809,7 @@ def train_one_epoch(
     penalty_lambda: float,
     head_only: bool,
     icnn_ascent_steps: int,
+    tracker: Optional[TransportDeltaTracker] = None,
 ) -> Tuple[float, float, float, float]:
     phi.train(not head_only)
     head.train()
@@ -664,8 +823,8 @@ def train_one_epoch(
     total_penalty = 0.0
     total_adv_obj = 0.0
 
-    progress = tqdm(loader, desc="Train", leave=False)
-    for batch in progress:
+    progress = tqdm(enumerate(loader), desc="Train", leave=False, total=len(loader))
+    for batch_idx, batch in progress:
         x, y = _to_device(batch, device)
         batch_size = x.size(0)
 
@@ -687,7 +846,7 @@ def train_one_epoch(
         z = phi(x)
         z_detached = z.detach()
         adv_objective_last: Optional[torch.Tensor] = None
-        for _ in range(max(1, icnn_ascent_steps)):
+        for ascent_step in range(max(1, icnn_ascent_steps)):
             opt_icnn.zero_grad(set_to_none=True)
             z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
             if not torch.isfinite(z_adv_ascent).all():
@@ -710,6 +869,9 @@ def train_one_epoch(
                 continue
             adv_objective = ce_adv - penalty_lambda * penalty
             (-adv_objective).backward()
+            if tracker is not None:
+                delta_sq_ascent = (z_adv_ascent.detach() - z_detached).reshape(batch_size, -1).pow(2).sum(dim=1)
+                tracker.record_ascent(ascent_step, delta_sq_ascent, batch_idx)
             grad_finite = all(
                 (p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters()
             )
@@ -755,12 +917,15 @@ def train_one_epoch(
         if model_params:
             torch.nn.utils.clip_grad_norm_(model_params, max_norm=10.0)
         opt_theta.step()
+        delta_sq = delta.reshape(batch_size, -1).pow(2).sum(dim=1)
+        if tracker is not None:
+            tracker.record_epoch_batch(delta_sq, batch_idx)
 
         with torch.no_grad():
             total_loss += loss.item() * batch_size
             total_correct += (logits.argmax(dim=1) == y).sum().item()
             total_samples += batch_size
-            total_penalty += delta.reshape(batch_size, -1).pow(2).sum(dim=1).mean().item()
+            total_penalty += delta_sq.mean().item()
             if adv_objective_last is not None and torch.isfinite(adv_objective_last).all():
                 total_adv_obj += adv_objective_last.item()
 
@@ -975,6 +1140,23 @@ def parse_args():
         help="Dataset split to draw samples from for the transport visualization.",
     )
     parser.add_argument(
+        "--track-transport-deltas",
+        action="store_true",
+        help="Record |T(z)-z|^2 statistics during adversary updates and generate summary plots.",
+    )
+    parser.add_argument(
+        "--track-transport-batches",
+        type=int,
+        default=4,
+        help="Number of minibatches per epoch to monitor when tracking transport deltas.",
+    )
+    parser.add_argument(
+        "--transport-delta-plot-dir",
+        type=str,
+        default="fig/transport_deltas",
+        help="Directory where transport delta tracking plots are stored.",
+    )
+    parser.add_argument(
         "--estimate-transport-jacobian",
         action="store_true",
         help="Estimate the largest singular value of the transport Jacobian after training.",
@@ -1120,6 +1302,11 @@ def main():
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tracker = TransportDeltaTracker(
+        enabled=args.track_transport_deltas,
+        max_batches=max(0, args.track_transport_batches),
+        plot_dir=args.transport_delta_plot_dir,
+    )
 
     if args.calibrate_penalty and args.latent_eps_target and args.latent_eps_target > 0:
         mean_grad_norm = estimate_mean_grad_norm(
@@ -1152,6 +1339,7 @@ def main():
 
     for epoch, phase in enumerate(schedule, start=1):
         print(f"\n=== Epoch {epoch:02d}/{total_epochs} | Phase: {phase.upper()} ===")
+        tracker.start_epoch(epoch, phase)
 
         if phase == "icnn" and args.jacobian_aware and not jacobian_ready:
             L_hat, eps_latent = jacobian_aware_latent_eps(
@@ -1179,6 +1367,7 @@ def main():
             penalty_lambda=args.penalty_lambda,
             head_only=args.head_only,
             icnn_ascent_steps=args.icnn_ascent_steps,
+            tracker=tracker,
         )
 
         test_loss, test_acc = evaluate(phi, head, testloader, device)
@@ -1277,6 +1466,9 @@ def main():
                     f"smoothing {smoothing:.4f}, penalty_lambda {args.penalty_lambda:.6f} → {new_lambda:.6f}"
                 )
                 args.penalty_lambda = new_lambda
+        tracker.finish_epoch()
+
+    save_transport_delta_plot(tracker, args, run_id)
 
     if args.estimate_transport_jacobian:
         jac_loader = trainloader if args.jacobian_sv_split == "train" else testloader
