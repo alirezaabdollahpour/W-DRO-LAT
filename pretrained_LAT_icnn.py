@@ -59,6 +59,7 @@ PENALTY_LAMBDA_MIN = 1e-4
 PENALTY_LAMBDA_MAX = 1e4
 CALIBRATION_SCALE_MIN = 0.1
 CALIBRATION_SCALE_MAX = 10.0
+CALIBRATION_SMOOTHING = 0.1
 
 
 class NonNegativeLinear(nn.Module):
@@ -920,7 +921,7 @@ def parse_args():
     parser.add_argument(
         "--lr-omega",
         type=float,
-        default=1e-3,
+        default=0.001,
         help="Step size γ_ω for ICNN adversary parameters.",
     )
     parser.add_argument("--icnn-beta1", type=float, default=0.9)
@@ -987,7 +988,7 @@ def parse_args():
     parser.add_argument(
         "--jacobian-sv-samples",
         type=int,
-        default=128,
+        default=512,
         help="Maximum number of latent samples used per batch for Jacobian SV estimation.",
     )
     parser.add_argument(
@@ -1022,7 +1023,7 @@ def parse_args():
     parser.add_argument(
         "--gamma-calibration-batches",
         type=int,
-        default=2,
+        default=4,
         help="Number of minibatches used to estimate gradient norms or delta norms.",
     )
 
@@ -1265,14 +1266,15 @@ def main():
             if not math.isfinite(avg_delta) or avg_delta <= 0:
                 print("[Calibration] Average delta was non-finite; penalty_lambda unchanged.")
             else:
-                scale = float(avg_delta / args.latent_eps_target)
-                scale = float(
-                    min(max(scale, CALIBRATION_SCALE_MIN), CALIBRATION_SCALE_MAX)
+                ratio = float(avg_delta / args.latent_eps_target)
+                ratio = float(
+                    min(max(ratio, CALIBRATION_SCALE_MIN), CALIBRATION_SCALE_MAX)
                 )
-                new_lambda = _clamp_penalty_lambda(args.penalty_lambda * scale)
+                smoothing = 1.0 + CALIBRATION_SMOOTHING * (ratio - 1.0)
+                new_lambda = _clamp_penalty_lambda(args.penalty_lambda * smoothing)
                 print(
-                    f"[Calibration] Average delta {avg_delta:.4f}, scaling factor {scale:.4f}, "
-                    f"penalty_lambda {args.penalty_lambda:.6f} → {new_lambda:.6f}"
+                    f"[Calibration] Average delta {avg_delta:.4f}, ratio {ratio:.4f}, "
+                    f"smoothing {smoothing:.4f}, penalty_lambda {args.penalty_lambda:.6f} → {new_lambda:.6f}"
                 )
                 args.penalty_lambda = new_lambda
 
