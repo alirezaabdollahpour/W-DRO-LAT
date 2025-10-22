@@ -1192,7 +1192,7 @@ def parse_args():
     parser.add_argument(
         "--lr-omega",
         type=float,
-        default=0.001,
+        default=0.0005,
         help="Step size γ_ω for ICNN adversary parameters.",
     )
     parser.add_argument(
