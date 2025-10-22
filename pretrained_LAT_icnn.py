@@ -29,7 +29,7 @@ import warnings
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -293,24 +293,80 @@ def compute_transport_penalty(
     return penalty, monitor, logits_adv
 
 
+def _icnn_principled_moments(fan_in: int) -> Tuple[float, float, float, float, float]:
+    if fan_in <= 0:
+        raise ValueError(f"ICNN fan-in must be positive; got {fan_in}.")
+    denom_offset = 6.0 * (math.pi - 1.0)
+    denom_slope = 3.0 * math.sqrt(3.0) + 2.0 * math.pi - 6.0
+    denom = denom_offset + (fan_in - 1.0) * denom_slope
+    mu_w = math.sqrt((6.0 * math.pi) / (fan_in * denom))
+    sigma_w2 = 1.0 / float(fan_in)
+    mu_b = math.sqrt((3.0 * fan_in) / denom)
+    mu_w_sq = mu_w * mu_w
+    log_var_plus_mean_sq = math.log(sigma_w2 + mu_w_sq)
+    log_mean_sq = math.log(mu_w_sq)
+    tilde_mu = log_mean_sq - 0.5 * log_var_plus_mean_sq
+    tilde_sigma2 = max(log_var_plus_mean_sq - log_mean_sq, 1e-12)
+    tilde_sigma = math.sqrt(tilde_sigma2)
+    return mu_w, sigma_w2, mu_b, tilde_mu, tilde_sigma
+
+
+def _principled_nonnegative_init(
+    weight_param: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    fan_in: int,
+) -> None:
+    _, _, mu_b, tilde_mu, tilde_sigma = _icnn_principled_moments(fan_in)
+    with torch.no_grad():
+        mu_tensor = torch.as_tensor(tilde_mu, dtype=weight_param.dtype, device=weight_param.device)
+        if tilde_sigma == 0.0:
+            weight_param.fill_(mu_tensor)
+        else:
+            sigma_tensor = torch.as_tensor(tilde_sigma, dtype=weight_param.dtype, device=weight_param.device)
+            noise = torch.randn_like(weight_param)
+            weight_param.copy_(noise * sigma_tensor + mu_tensor)
+        if bias is not None:
+            bias.fill_(torch.as_tensor(mu_b, dtype=bias.dtype, device=bias.device))
+
+
 class NonNegativeLinear(nn.Module):
     """Linear map with weights constrained to be element-wise non-negative."""
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        init: str = "principled",
+    ):
         super().__init__()
-        self.weight_raw = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-        nn.init.xavier_uniform_(self.weight_raw)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.init_mode = init.lower()
+        if self.init_mode not in {"principled", "xavier"}:
+            raise ValueError(f"Unsupported initialisation mode '{init}' for NonNegativeLinear.")
+        self.parametrisation = "exp" if self.init_mode == "principled" else "softplus"
+        self.weight_param = nn.Parameter(torch.empty(self.out_features, self.in_features))
+        self.bias = nn.Parameter(torch.empty(self.out_features)) if bias else None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.init_mode == "principled":
+            _principled_nonnegative_init(self.weight_param, self.bias, self.in_features)
+        else:
+            nn.init.xavier_uniform_(self.weight_param)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = F.softplus(self.weight_raw)
+        if self.parametrisation == "exp":
+            weight = torch.exp(self.weight_param)
+        else:
+            weight = F.softplus(self.weight_param)
         return F.linear(x, weight, self.bias)
 
     @torch.no_grad()
     def project_non_negative(self) -> None:
-        # Forward pass already enforces non-negativity via softplus; no projection needed.
         return
 
 
@@ -321,22 +377,54 @@ class NonNegativeConv2d(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: int,
-        padding: int = 0,
+        kernel_size: Union[int, Sequence[int]],
+        padding: Union[int, Sequence[int]] = 0,
         bias: bool = True,
+        init: str = "principled",
     ):
         super().__init__()
-        self.kernel_size = int(kernel_size)
-        self.padding = int(padding)
-        weight_shape = (out_channels, in_channels, self.kernel_size, self.kernel_size)
-        self.weight_raw = nn.Parameter(torch.empty(weight_shape))
-        self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
-        nn.init.xavier_uniform_(self.weight_raw)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        self.init_mode = init.lower()
+        if self.init_mode not in {"principled", "xavier"}:
+            raise ValueError(f"Unsupported initialisation mode '{init}' for NonNegativeConv2d.")
+        if isinstance(kernel_size, int):
+            kernel_tuple = (int(kernel_size), int(kernel_size))
+        elif isinstance(kernel_size, (tuple, list)):
+            kernel_tuple = tuple(int(k) for k in kernel_size)
+            if len(kernel_tuple) != 2:
+                raise ValueError("kernel_size must have 2 elements for NonNegativeConv2d.")
+        else:
+            raise TypeError("kernel_size must be an int or a length-2 sequence of ints.")
+        self.kernel_size = kernel_tuple
+        if isinstance(padding, int):
+            self.padding = int(padding)
+        elif isinstance(padding, (tuple, list)):
+            padding_tuple = tuple(int(p) for p in padding)
+            if len(padding_tuple) != 2:
+                raise ValueError("padding must have 2 elements when provided as a sequence.")
+            self.padding = padding_tuple
+        else:
+            raise TypeError("padding must be an int or a length-2 sequence of ints.")
+        kernel_area = self.kernel_size[0] * self.kernel_size[1]
+        weight_shape = (out_channels, in_channels, *self.kernel_size)
+        self.weight_param = nn.Parameter(torch.empty(weight_shape))
+        self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
+        self.parametrisation = "exp" if self.init_mode == "principled" else "softplus"
+        self._fan_in = int(in_channels * kernel_area)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.init_mode == "principled":
+            _principled_nonnegative_init(self.weight_param, self.bias, self._fan_in)
+        else:
+            nn.init.xavier_uniform_(self.weight_param)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = F.softplus(self.weight_raw)
+        if self.parametrisation == "exp":
+            weight = torch.exp(self.weight_param)
+        else:
+            weight = F.softplus(self.weight_param)
         return F.conv2d(x, weight, bias=self.bias, padding=self.padding)
 
     @torch.no_grad()
@@ -353,6 +441,7 @@ class InputConvexPotential(nn.Module):
         hidden_sizes: Sequence[int],
         activation: str = "relu",
         strong_convexity: float = 1.0,
+        nonneg_init: str = "principled",
         input_shape: Optional[Sequence[int]] = None,
         use_convs: bool = False,
         conv_kernel_size: int = 3,
@@ -384,6 +473,9 @@ class InputConvexPotential(nn.Module):
             raise ValueError(f"Unsupported ICNN activation: {activation}")
 
         self.strong_convexity = float(strong_convexity)
+        self.nonneg_init = str(nonneg_init).lower()
+        if self.nonneg_init not in {"principled", "xavier"}:
+            raise ValueError(f"Unsupported ICNN non-negative initialiser: {nonneg_init}")
 
         self.z_linears = nn.ModuleList()
         self.h_linears = nn.ModuleList()
@@ -412,11 +504,12 @@ class InputConvexPotential(nn.Module):
                             kernel_size=self.conv_kernel_size,
                             padding=padding,
                             bias=True,
+                            init=self.nonneg_init,
                         )
                     )
                 prev_hidden = width
             self.hidden_output = NonNegativeConv2d(
-                self.hidden_sizes[-1], 1, kernel_size=1, padding=0, bias=True
+                self.hidden_sizes[-1], 1, kernel_size=1, padding=0, bias=True, init=self.nonneg_init
             )
             self.input_skip = nn.Conv2d(in_channels, 1, kernel_size=1, padding=0, bias=True)
         else:
@@ -425,9 +518,13 @@ class InputConvexPotential(nn.Module):
                 if prev_hidden is None:
                     self.h_linears.append(None)  # type: ignore
                 else:
-                    self.h_linears.append(NonNegativeLinear(prev_hidden, width, bias=True))
+                    self.h_linears.append(
+                        NonNegativeLinear(prev_hidden, width, bias=True, init=self.nonneg_init)
+                    )
                 prev_hidden = width
-            self.hidden_output = NonNegativeLinear(self.hidden_sizes[-1], 1, bias=True)
+            self.hidden_output = NonNegativeLinear(
+                self.hidden_sizes[-1], 1, bias=True, init=self.nonneg_init
+            )
             self.input_skip = nn.Linear(self.input_dim, 1, bias=True)
 
         self.reset_parameters()
@@ -443,21 +540,8 @@ class InputConvexPotential(nn.Module):
                     nn.init.zeros_(layer.bias)
         for layer in self.h_linears:
             if layer is not None:
-                if isinstance(layer, NonNegativeLinear):
-                    nn.init.xavier_uniform_(layer.weight_raw)
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
-                elif isinstance(layer, NonNegativeConv2d):
-                    nn.init.xavier_uniform_(layer.weight_raw)
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
-        if isinstance(self.hidden_output, NonNegativeLinear):
-            nn.init.xavier_uniform_(self.hidden_output.weight_raw)
-            nn.init.zeros_(self.hidden_output.bias)
-        elif isinstance(self.hidden_output, NonNegativeConv2d):
-            nn.init.xavier_uniform_(self.hidden_output.weight_raw)
-            if self.hidden_output.bias is not None:
-                nn.init.zeros_(self.hidden_output.bias)
+                layer.reset_parameters()
+        self.hidden_output.reset_parameters()
         if isinstance(self.input_skip, nn.Linear):
             nn.init.xavier_uniform_(self.input_skip.weight)
             nn.init.zeros_(self.input_skip.bias)
@@ -1187,8 +1271,15 @@ def parse_args():
         help="Fixed λ multiplying the quadratic transport penalty.",
     )
     parser.add_argument("--icnn-hidden", type=_parse_hidden_units, nargs="+", default=[256, 256])
-    parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="relu")
+    parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="softplus")
     parser.add_argument("--icnn-strong-convexity", type=float, default=1.0)
+    parser.add_argument(
+        "--icnn-init",
+        type=str,
+        choices=["principled", "xavier"],
+        default="principled",
+        help="Initialisation scheme for non-negative ICNN weights.",
+    )
     parser.add_argument(
         "--lr-omega",
         type=float,
@@ -1481,6 +1572,7 @@ def main():
         hidden_sizes=args.icnn_hidden,
         activation=args.icnn_activation,
         strong_convexity=args.icnn_strong_convexity,
+        nonneg_init=args.icnn_init,
         input_shape=latent_shape,
         use_convs=args.icnn_conv,
         conv_kernel_size=args.icnn_kernel_size,
@@ -1499,7 +1591,7 @@ def main():
     for name, param in icnn.named_parameters():
         if not param.requires_grad:
             continue
-        decay = 0.0 if ("weight_raw" in name or "bias" in name) else 1e-4
+        decay = 0.0 if ("weight_param" in name or "bias" in name) else 1e-4
         icnn_param_groups.append({"params": [param], "weight_decay": decay})
     if args.icnn_optimizer == "adam":
         opt_icnn = optim.Adam(
