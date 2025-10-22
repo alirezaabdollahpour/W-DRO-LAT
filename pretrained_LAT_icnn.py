@@ -40,6 +40,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from ademamix import AdEMAMix
 from utils import (
     evaluate_under_input_pgd,
     get_cifar10_loaders,
@@ -218,32 +219,6 @@ def save_transport_delta_plot(
     fig.savefig(plot_path, dpi=200)
     plt.close(fig)
     print(f"Saved transport delta tracking plot to {plot_path}")
-
-
-class LatentFeatureNormalizer(nn.Module):
-    """LayerNorm-based normalizer for latent features."""
-
-    def __init__(self, normalized_shape: Sequence[int]):
-        super().__init__()
-        if isinstance(normalized_shape, torch.Size):
-            normalized_shape = tuple(normalized_shape)
-        self.normalizer = nn.LayerNorm(normalized_shape, elementwise_affine=False)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.normalizer(z)
-
-
-class PhiWithNormalizer(nn.Module):
-    """Wrap an existing φ with a normalizer applied to its outputs."""
-
-    def __init__(self, phi: nn.Module, normalizer: nn.Module):
-        super().__init__()
-        self.phi = phi
-        self.normalizer = normalizer
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.phi(x)
-        return self.normalizer(z)
 
 
 def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -1121,9 +1096,40 @@ def parse_args():
         default=0.001,
         help="Step size γ_ω for ICNN adversary parameters.",
     )
+    parser.add_argument(
+        "--icnn-optimizer",
+        type=str,
+        choices=["adam", "ademamix"],
+        default="adam",
+        help="Optimizer used for ICNN weights (adam or ademamix).",
+    )
     parser.add_argument("--icnn-beta1", type=float, default=0.9)
     parser.add_argument("--icnn-beta2", type=float, default=0.999)
-    parser.add_argument("--icnn-ascent-steps", type=int, default=10)
+    parser.add_argument(
+        "--ademamix-beta3",
+        type=float,
+        default=0.9999,
+        help="Third beta coefficient for AdEMAMix (ignored for Adam).",
+    )
+    parser.add_argument(
+        "--ademamix-alpha",
+        type=float,
+        default=2.0,
+        help="Mixing factor α for AdEMAMix (ignored for Adam).",
+    )
+    parser.add_argument(
+        "--ademamix-beta3-warmup",
+        type=int,
+        default=None,
+        help="Number of warmup steps for β3 in AdEMAMix (ignored for Adam).",
+    )
+    parser.add_argument(
+        "--ademamix-alpha-warmup",
+        type=int,
+        default=None,
+        help="Number of warmup steps for α in AdEMAMix (ignored for Adam).",
+    )
+    parser.add_argument("--icnn-ascent-steps", type=int, default=7)
 
     parser.add_argument("--cut-layer", type=str, default="layer4",
                         choices=["conv1", "layer1", "layer2", "layer3", "layer4", "avgpool"])
@@ -1298,11 +1304,6 @@ def main():
     phi.train(was_training)
     print(f"Latent shape at cut-layer '{args.cut_layer}': {latent_shape} (dim={latent_dim})")
 
-    latent_normalizer = LatentFeatureNormalizer(latent_shape).to(device)
-    phi = PhiWithNormalizer(phi, latent_normalizer)
-    phi.to(device)
-    phi.train(was_training)
-
     if args.head_only:
         for p in phi.parameters():
             p.requires_grad = False
@@ -1332,11 +1333,22 @@ def main():
             continue
         decay = 0.0 if ("weight_raw" in name or "bias" in name) else 1e-4
         icnn_param_groups.append({"params": [param], "weight_decay": decay})
-    opt_icnn = optim.Adam(
-        icnn_param_groups,
-        lr=args.lr_omega,
-        betas=(args.icnn_beta1, args.icnn_beta2),
-    )
+    if args.icnn_optimizer == "adam":
+        opt_icnn = optim.Adam(
+            icnn_param_groups,
+            lr=args.lr_omega,
+            betas=(args.icnn_beta1, args.icnn_beta2),
+        )
+    else:
+        ademamix_kwargs = {
+            "lr": args.lr_omega,
+            "betas": (args.icnn_beta1, args.icnn_beta2, args.ademamix_beta3),
+            "alpha": args.ademamix_alpha,
+            "beta3_warmup": args.ademamix_beta3_warmup,
+            "alpha_warmup": args.ademamix_alpha_warmup,
+        }
+        opt_icnn = AdEMAMix(icnn_param_groups, **ademamix_kwargs)
+    print(f"ICNN optimizer: {args.icnn_optimizer}")
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
