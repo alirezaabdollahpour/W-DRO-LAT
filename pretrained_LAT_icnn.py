@@ -163,7 +163,7 @@ def save_transport_delta_plot(
         steps, means = zip(*ascent_summary)
         ax_iter.plot(steps, means, marker="o")
         ax_iter.set_xlabel("Ascent iteration")
-        ax_iter.set_ylabel("Mean |T(z) - z|^2")
+        ax_iter.set_ylabel("Mean per-feature |T(z) - z|^2")
         ax_iter.set_title("Delta norms per ascent step")
         ax_iter.grid(True, alpha=0.2)
     else:
@@ -185,7 +185,7 @@ def save_transport_delta_plot(
         values = [item[2] for item in epoch_summary]
         ax_epoch.plot(epochs, values, marker="o")
         ax_epoch.set_xlabel("Epoch")
-        ax_epoch.set_ylabel("Mean |T(z) - z|^2")
+        ax_epoch.set_ylabel("Mean per-feature |T(z) - z|^2")
         ax_epoch.set_title("Delta norms across epochs")
         ax_epoch.grid(True, alpha=0.2)
         ax_epoch.set_xticks(epochs)
@@ -218,6 +218,40 @@ def save_transport_delta_plot(
     fig.savefig(plot_path, dpi=200)
     plt.close(fig)
     print(f"Saved transport delta tracking plot to {plot_path}")
+
+
+class LatentFeatureNormalizer(nn.Module):
+    """LayerNorm-based normalizer for latent features."""
+
+    def __init__(self, normalized_shape: Sequence[int]):
+        super().__init__()
+        if isinstance(normalized_shape, torch.Size):
+            normalized_shape = tuple(normalized_shape)
+        self.normalizer = nn.LayerNorm(normalized_shape, elementwise_affine=False)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.normalizer(z)
+
+
+class PhiWithNormalizer(nn.Module):
+    """Wrap an existing φ with a normalizer applied to its outputs."""
+
+    def __init__(self, phi: nn.Module, normalizer: nn.Module):
+        super().__init__()
+        self.phi = phi
+        self.normalizer = normalizer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.phi(x)
+        return self.normalizer(z)
+
+
+def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Return mean squared difference per sample between tensors a and b."""
+    if a.shape != b.shape:
+        raise ValueError("Tensors must have identical shapes to compute mean square difference.")
+    diff = (a - b).reshape(a.size(0), -1)
+    return diff.pow(2).mean(dim=1)
 
 
 class NonNegativeLinear(nn.Module):
@@ -858,9 +892,8 @@ def train_one_epoch(
                 continue
             logits_adv = head(z_adv_ascent)
             ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
-            z_flat = z_detached.reshape(batch_size, -1)
-            z_adv_flat = z_adv_ascent.reshape(batch_size, -1)
-            penalty = (z_flat - z_adv_flat).pow(2).sum(dim=1).mean()
+            per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
+            penalty = per_sample_mse.mean()
             if not torch.isfinite(ce_adv) or not torch.isfinite(penalty):
                 warnings.warn(
                     "Non-finite adversarial loss components detected; skipping ascent step.",
@@ -870,8 +903,7 @@ def train_one_epoch(
             adv_objective = ce_adv - penalty_lambda * penalty
             (-adv_objective).backward()
             if tracker is not None:
-                delta_sq_ascent = (z_adv_ascent.detach() - z_detached).reshape(batch_size, -1).pow(2).sum(dim=1)
-                tracker.record_ascent(ascent_step, delta_sq_ascent, batch_idx)
+                tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
             grad_finite = all(
                 (p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters()
             )
@@ -917,7 +949,7 @@ def train_one_epoch(
         if model_params:
             torch.nn.utils.clip_grad_norm_(model_params, max_norm=10.0)
         opt_theta.step()
-        delta_sq = delta.reshape(batch_size, -1).pow(2).sum(dim=1)
+        delta_sq = delta.reshape(batch_size, -1).pow(2).mean(dim=1)
         if tracker is not None:
             tracker.record_epoch_batch(delta_sq, batch_idx)
 
@@ -987,7 +1019,7 @@ def evaluate_under_icnn(
         total_correct += (logits.argmax(dim=1) == y).sum().item()
         total_samples += x.size(0)
         delta = z_det - z_adv
-        total_penalty += delta.reshape(delta.size(0), -1).pow(2).sum(dim=1).mean().item()
+        total_penalty += delta.reshape(delta.size(0), -1).pow(2).mean(dim=1).mean().item()
         if total_samples > 0:
             mean_loss = total_loss / total_samples
             mean_acc = total_correct / total_samples
@@ -1255,9 +1287,6 @@ def main():
     phi, head = build_split_resnet18(num_classes=10, cut_layer=args.cut_layer, base=base_pretrained)
     phi.to(device)
     head.to(device)
-    if args.head_only:
-        for p in phi.parameters():
-            p.requires_grad = False
 
     was_training = phi.training
     phi.eval()
@@ -1268,6 +1297,15 @@ def main():
         latent_shape = latent_example.shape[1:]
     phi.train(was_training)
     print(f"Latent shape at cut-layer '{args.cut_layer}': {latent_shape} (dim={latent_dim})")
+
+    latent_normalizer = LatentFeatureNormalizer(latent_shape).to(device)
+    phi = PhiWithNormalizer(phi, latent_normalizer)
+    phi.to(device)
+    phi.train(was_training)
+
+    if args.head_only:
+        for p in phi.parameters():
+            p.requires_grad = False
 
     icnn = InputConvexPotential(
         input_dim=latent_dim,
