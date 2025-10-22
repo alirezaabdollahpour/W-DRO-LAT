@@ -29,7 +29,7 @@ import warnings
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -227,6 +227,70 @@ def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tenso
         raise ValueError("Tensors must have identical shapes to compute mean square difference.")
     diff = (a - b).reshape(a.size(0), -1)
     return diff.pow(2).mean(dim=1)
+
+
+def _extract_penalty_features(
+    z_src: torch.Tensor,
+    z_adv: torch.Tensor,
+    head: nn.Module,
+    feature_type: str,
+    logits_adv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    if feature_type == "latent":
+        feat_src = z_src.view(z_src.size(0), -1)
+        feat_adv = z_adv.view(z_adv.size(0), -1)
+        return feat_src, feat_adv, logits_adv
+    if feature_type == "head_logits":
+        with torch.no_grad():
+            feat_src = head(z_src)
+        if logits_adv is None:
+            logits_adv = head(z_adv)
+        feat_adv = logits_adv
+        return feat_src, feat_adv, logits_adv
+    raise ValueError(f"Unsupported cosine feature extractor: {feature_type}")
+
+
+def _cosine_distance(feat_src: torch.Tensor, feat_adv: torch.Tensor, eps: float) -> torch.Tensor:
+    src_flat = feat_src.reshape(feat_src.size(0), -1)
+    adv_flat = feat_adv.reshape(feat_adv.size(0), -1)
+    denom = (
+        src_flat.norm(dim=1).clamp_min(eps)
+        * adv_flat.norm(dim=1).clamp_min(eps)
+    )
+    cos_sim = (src_flat * adv_flat).sum(dim=1) / denom
+    cos_sim = cos_sim.clamp(-1.0, 1.0)
+    return 1.0 - cos_sim
+
+
+def compute_transport_penalty(
+    z_src: torch.Tensor,
+    z_adv: torch.Tensor,
+    head: nn.Module,
+    penalty_lambda: float,
+    mse_per_sample: torch.Tensor,
+    cosine_cfg: Optional[Dict[str, Any]],
+    logits_adv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    quad_scale = float(cosine_cfg.get("quadratic_scale", 1.0)) if cosine_cfg else 1.0
+    mse_mean = mse_per_sample.mean()
+    mse_sum = quad_scale * mse_mean
+    if cosine_cfg and cosine_cfg.get("enabled", False):
+        feature_type = str(cosine_cfg.get("feature", "latent"))
+        eps = float(cosine_cfg.get("eps", 1e-8))
+        feat_src, feat_adv, logits_adv = _extract_penalty_features(
+            z_src, z_adv, head, feature_type, logits_adv=logits_adv
+        )
+        cos_dist = _cosine_distance(feat_src, feat_adv, eps)
+        cos_mean = cos_dist.mean()
+        cos_weight = penalty_lambda * float(cosine_cfg.get("lambda", 1.0))
+        quad_weight = penalty_lambda * float(cosine_cfg.get("quadratic_weight", 0.0))
+        penalty = cos_weight * cos_mean + quad_weight * mse_sum
+        monitor = mse_mean
+        return penalty, monitor, logits_adv
+
+    penalty = penalty_lambda * mse_sum
+    monitor = mse_mean
+    return penalty, monitor, logits_adv
 
 
 class NonNegativeLinear(nn.Module):
@@ -826,6 +890,7 @@ def train_one_epoch(
     head_only: bool,
     icnn_ascent_steps: int,
     tracker: Optional[TransportDeltaTracker] = None,
+    cosine_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, float, float, float]:
     phi.train(not head_only)
     head.train()
@@ -838,6 +903,7 @@ def train_one_epoch(
     total_samples = 0
     total_penalty = 0.0
     total_adv_obj = 0.0
+    cosine_cfg = cosine_cfg or {"enabled": False}
 
     progress = tqdm(enumerate(loader), desc="Train", leave=False, total=len(loader))
     for batch_idx, batch in progress:
@@ -862,6 +928,7 @@ def train_one_epoch(
         z = phi(x)
         z_detached = z.detach()
         adv_objective_last: Optional[torch.Tensor] = None
+        penalty_monitor = torch.zeros((), device=z_detached.device, dtype=z_detached.dtype)
         for ascent_step in range(max(1, icnn_ascent_steps)):
             opt_icnn.zero_grad(set_to_none=True)
             z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
@@ -875,14 +942,26 @@ def train_one_epoch(
             logits_adv = head(z_adv_ascent)
             ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
             per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
-            penalty = per_sample_mse.mean()
-            if not torch.isfinite(ce_adv) or not torch.isfinite(penalty):
+            penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
+                z_detached,
+                z_adv_ascent,
+                head,
+                penalty_lambda,
+                per_sample_mse,
+                cosine_cfg,
+                logits_adv=logits_adv,
+            )
+            if (
+                not torch.isfinite(ce_adv)
+                or not torch.isfinite(penalty_term)
+                or not torch.isfinite(penalty_monitor)
+            ):
                 warnings.warn(
                     "Non-finite adversarial loss components detected; skipping ascent step.",
                     RuntimeWarning,
                 )
                 continue
-            adv_objective = ce_adv - penalty_lambda * penalty
+            adv_objective = ce_adv - penalty_term
             (-adv_objective).backward()
             if tracker is not None:
                 tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
@@ -931,7 +1010,7 @@ def train_one_epoch(
         if model_params:
             torch.nn.utils.clip_grad_norm_(model_params, max_norm=10.0)
         opt_theta.step()
-        delta_sq = delta.reshape(batch_size, -1).pow(2).mean(dim=1)
+        delta_sq = per_sample_mean_square_diff(z_adv_fixed, z)
         if tracker is not None:
             tracker.record_epoch_batch(delta_sq, batch_idx)
 
@@ -939,7 +1018,7 @@ def train_one_epoch(
             total_loss += loss.item() * batch_size
             total_correct += (logits.argmax(dim=1) == y).sum().item()
             total_samples += batch_size
-            total_penalty += delta_sq.mean().item()
+            total_penalty += float(penalty_monitor.detach().item())
             if adv_objective_last is not None and torch.isfinite(adv_objective_last).all():
                 total_adv_obj += adv_objective_last.item()
 
@@ -970,10 +1049,13 @@ def evaluate_under_icnn(
     icnn: InputConvexPotential,
     loader: DataLoader,
     device: torch.device,
+    penalty_lambda: float,
+    cosine_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, float, float]:
     phi.eval()
     head.eval()
     icnn.eval()
+    cosine_cfg = cosine_cfg or {"enabled": False}
 
     total_loss = 0.0
     total_correct = 0
@@ -1000,8 +1082,17 @@ def evaluate_under_icnn(
         total_loss += ce.item()
         total_correct += (logits.argmax(dim=1) == y).sum().item()
         total_samples += x.size(0)
-        delta = z_det - z_adv
-        total_penalty += delta.reshape(delta.size(0), -1).pow(2).mean(dim=1).mean().item()
+        per_sample_mse = per_sample_mean_square_diff(z_adv, z_det)
+        _, penalty_monitor, _ = compute_transport_penalty(
+            z_det,
+            z_adv,
+            head,
+            penalty_lambda,
+            per_sample_mse,
+            cosine_cfg,
+            logits_adv=logits,
+        )
+        total_penalty += float(penalty_monitor.detach().item())
         if total_samples > 0:
             mean_loss = total_loss / total_samples
             mean_acc = total_correct / total_samples
@@ -1038,6 +1129,7 @@ CSV_HEADER = [
     "input_pgd_acc",
     "input_pgd_avg_l2",
     "input_pgd_avg_linf",
+    "input_pgd_samples",
     "penalty_lambda",
     "lr_theta",
     "lr_omega",
@@ -1107,7 +1199,7 @@ def parse_args():
         "--icnn-optimizer",
         type=str,
         choices=["adam", "ademamix"],
-        default="adam",
+        default="ademamix",
         help="Optimizer used for ICNN weights (adam or ademamix).",
     )
     parser.add_argument("--icnn-beta1", type=float, default=0.9)
@@ -1136,7 +1228,37 @@ def parse_args():
         default=None,
         help="Number of warmup steps for α in AdEMAMix (ignored for Adam).",
     )
-    parser.add_argument("--icnn-ascent-steps", type=int, default=3)
+    parser.add_argument("--icnn-ascent-steps", type=int, default=10)
+    parser.add_argument(
+        "--cosine-penalty",
+        action="store_true",
+        help="Enable cosine-similarity transport penalty instead of the default quadratic penalty.",
+    )
+    parser.add_argument(
+        "--cosine-feature",
+        type=str,
+        choices=["latent", "head_logits"],
+        default="latent",
+        help="Feature space used for cosine penalty (latent vectors or classifier logits).",
+    )
+    parser.add_argument(
+        "--cosine-lambda",
+        type=float,
+        default=1.0,
+        help="Scale applied to the cosine distance component of the penalty.",
+    )
+    parser.add_argument(
+        "--cosine-quadratic-weight",
+        type=float,
+        default=1.0,
+        help="Additional quadratic weight α ensuring strong convexity in the cosine penalty.",
+    )
+    parser.add_argument(
+        "--cosine-eps",
+        type=float,
+        default=1e-6,
+        help="Numerical epsilon to stabilise cosine similarity denominator.",
+    )
 
     parser.add_argument("--cut-layer", type=str, default="layer4",
                         choices=["conv1", "layer1", "layer2", "layer3", "layer4", "avgpool"])
@@ -1336,6 +1458,20 @@ def main():
     phi.train(was_training)
     print(f"Latent shape at cut-layer '{args.cut_layer}': {latent_shape} (dim={latent_dim})")
 
+    cosine_cfg = {
+        "enabled": bool(args.cosine_penalty),
+        "feature": args.cosine_feature,
+        "lambda": float(args.cosine_lambda),
+        "quadratic_weight": float(args.cosine_quadratic_weight),
+        "eps": float(args.cosine_eps),
+        "quadratic_scale": float(latent_dim),
+    }
+    if cosine_cfg["enabled"]:
+        print(
+            f"Cosine penalty enabled: feature={cosine_cfg['feature']}, "
+            f"λ={cosine_cfg['lambda']}, α={cosine_cfg['quadratic_weight']}"
+        )
+
     if args.head_only:
         for p in phi.parameters():
             p.requires_grad = False
@@ -1390,7 +1526,9 @@ def main():
         plot_dir=args.transport_delta_plot_dir,
     )
 
-    if args.calibrate_penalty and args.latent_eps_target and args.latent_eps_target > 0:
+    if cosine_cfg["enabled"] and args.calibrate_penalty:
+        print("Cosine penalty active; skipping penalty_lambda calibration.")
+    elif args.calibrate_penalty and args.latent_eps_target and args.latent_eps_target > 0:
         mean_grad_norm = estimate_mean_grad_norm(
             phi,
             head,
@@ -1399,13 +1537,11 @@ def main():
             num_batches=args.gamma_calibration_batches,
         )
         if math.isfinite(mean_grad_norm) and mean_grad_norm > 0:
-            latent_dim = int(np.prod(latent_shape))
-            initialized_lambda = (mean_grad_norm / args.latent_eps_target) * latent_dim
+            initialized_lambda = mean_grad_norm / args.latent_eps_target
             args.penalty_lambda = _clamp_penalty_lambda(initialized_lambda)
             print(
                 f"Initialized penalty_lambda to {args.penalty_lambda:.6f} "
-                f"from mean grad norm {mean_grad_norm:.6f} targeting ε_u={args.latent_eps_target:.6f} "
-                f"(latent dim={latent_dim})"
+                f"from mean grad norm {mean_grad_norm:.6f} targeting ε_u={args.latent_eps_target:.6f}"
             )
         else:
             print(
@@ -1452,10 +1588,19 @@ def main():
             head_only=args.head_only,
             icnn_ascent_steps=args.icnn_ascent_steps,
             tracker=tracker,
+            cosine_cfg=cosine_cfg,
         )
 
         test_loss, test_acc = evaluate(phi, head, testloader, device)
-        icnn_loss, icnn_acc, icnn_penalty = evaluate_under_icnn(phi, head, icnn, testloader, device)
+        icnn_loss, icnn_acc, icnn_penalty = evaluate_under_icnn(
+            phi,
+            head,
+            icnn,
+            testloader,
+            device,
+            penalty_lambda=args.penalty_lambda,
+            cosine_cfg=cosine_cfg,
+        )
 
         if (
             args.eval_input_pgd
@@ -1521,6 +1666,7 @@ def main():
                 "input_pgd_acc": None if input_pgd_acc is None else round(float(input_pgd_acc), 6),
                 "input_pgd_avg_l2": None if ipgd_l2 is None else round(float(ipgd_l2), 6),
                 "input_pgd_avg_linf": None if ipgd_linf is None else round(float(ipgd_linf), 6),
+                "input_pgd_samples": None if ipgd_samples is None else int(ipgd_samples),
                 "penalty_lambda": args.penalty_lambda,
                 "lr_theta": args.lr_theta,
                 "lr_omega": args.lr_omega,
@@ -1541,6 +1687,7 @@ def main():
 
         if (
             args.calibrate_penalty
+            and not cosine_cfg["enabled"]
             and args.latent_eps_target
             and args.latent_eps_target > 0
             and phase == "icnn"
