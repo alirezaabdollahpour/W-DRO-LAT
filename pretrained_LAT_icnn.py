@@ -747,6 +747,7 @@ def estimate_transport_jacobian_sv(
     loader: DataLoader,
     device: torch.device,
     args,
+    rng: Optional[torch.Generator] = None,
 ) -> Tuple[float, float]:
     """Estimate max/mean largest singular value of the Jacobian of T(z)."""
     phi_mode = phi.training
@@ -767,10 +768,16 @@ def estimate_transport_jacobian_sv(
         batch = min(z.size(0), max_samples)
         if batch == 0:
             continue
-        indices = torch.randperm(z.size(0), device=z.device)[:batch]
+        if rng is not None:
+            indices = torch.randperm(z.size(0), generator=rng, device=z.device)[:batch]
+        else:
+            indices = torch.randperm(z.size(0), device=z.device)[:batch]
         for idx in indices:
             base = z[idx.item() : idx.item() + 1].detach()
-            vec = torch.randn_like(base)
+            if rng is not None:
+                vec = torch.randn_like(base, generator=rng)
+            else:
+                vec = torch.randn_like(base)
             vec_norm = vec.view(-1).norm().item()
             if vec_norm < 1e-12:
                 continue
@@ -1129,7 +1136,7 @@ def parse_args():
         default=None,
         help="Number of warmup steps for α in AdEMAMix (ignored for Adam).",
     )
-    parser.add_argument("--icnn-ascent-steps", type=int, default=7)
+    parser.add_argument("--icnn-ascent-steps", type=int, default=3)
 
     parser.add_argument("--cut-layer", type=str, default="layer4",
                         choices=["conv1", "layer1", "layer2", "layer3", "layer4", "avgpool"])
@@ -1267,6 +1274,12 @@ def main():
     set_deterministic(args.seed)
     device = get_device()
     print(f"Using device: {device}")
+    print(f"Global seed: {args.seed}")
+    if device.type == "cuda":
+        global_rng = torch.Generator(device=device)
+    else:
+        global_rng = torch.Generator()
+    global_rng.manual_seed(int(args.seed))
 
     total_epochs, schedule = determine_schedule(args)
     print(f"Training schedule: {' → '.join(schedule)}")
@@ -1367,11 +1380,13 @@ def main():
             num_batches=args.gamma_calibration_batches,
         )
         if math.isfinite(mean_grad_norm) and mean_grad_norm > 0:
-            initialized_lambda = mean_grad_norm / args.latent_eps_target
+            latent_dim = int(np.prod(latent_shape))
+            initialized_lambda = (mean_grad_norm / args.latent_eps_target) * latent_dim
             args.penalty_lambda = _clamp_penalty_lambda(initialized_lambda)
             print(
                 f"Initialized penalty_lambda to {args.penalty_lambda:.6f} "
-                f"from mean grad norm {mean_grad_norm:.6f} targeting ε_u={args.latent_eps_target:.6f}"
+                f"from mean grad norm {mean_grad_norm:.6f} targeting ε_u={args.latent_eps_target:.6f} "
+                f"(latent dim={latent_dim})"
             )
         else:
             print(
@@ -1523,7 +1538,7 @@ def main():
     if args.estimate_transport_jacobian:
         jac_loader = trainloader if args.jacobian_sv_split == "train" else testloader
         max_sv, mean_sv = estimate_transport_jacobian_sv(
-            phi, icnn, jac_loader, device, args
+            phi, icnn, jac_loader, device, args, rng=global_rng
         )
         if math.isnan(max_sv) or math.isnan(mean_sv):
             print("Transport Jacobian estimation returned NaN; consider adjusting parameters.")
