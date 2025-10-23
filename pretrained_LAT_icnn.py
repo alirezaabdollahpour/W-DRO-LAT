@@ -1283,7 +1283,7 @@ def parse_args():
     parser.add_argument(
         "--lr-omega",
         type=float,
-        default=0.0005,
+        default=0.05,
         help="Step size γ_ω for ICNN adversary parameters.",
     )
     parser.add_argument(
@@ -1304,19 +1304,19 @@ def parse_args():
     parser.add_argument(
         "--ademamix-alpha",
         type=float,
-        default=2.0,
+        default=4.0,
         help="Mixing factor α for AdEMAMix (ignored for Adam).",
     )
     parser.add_argument(
         "--ademamix-beta3-warmup",
         type=int,
-        default=None,
+        default=5,
         help="Number of warmup steps for β3 in AdEMAMix (ignored for Adam).",
     )
     parser.add_argument(
         "--ademamix-alpha-warmup",
         type=int,
-        default=None,
+        default=3,
         help="Number of warmup steps for α in AdEMAMix (ignored for Adam).",
     )
     parser.add_argument("--icnn-ascent-steps", type=int, default=10)
