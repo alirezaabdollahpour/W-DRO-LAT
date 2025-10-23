@@ -27,6 +27,7 @@ import csv
 import math
 import warnings
 from collections import defaultdict
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -922,7 +923,17 @@ def estimate_transport_jacobian_sv(
     max_samples = max(1, args.jacobian_sv_samples)
     power_iters = max(1, args.jacobian_iters)
 
-    for x, _ in loader:
+    total_batches_hint = max_batches
+    if hasattr(loader, "__len__"):
+        total_batches_hint = min(len(loader), max_batches)
+    progress_bar = tqdm(
+        loader,
+        desc="Jacobian SV Eval",
+        leave=False,
+        total=total_batches_hint,
+        dynamic_ncols=True,
+    )
+    for x, _ in progress_bar:
         x = x.to(device)
         with torch.no_grad():
             z = phi(x)
@@ -963,8 +974,15 @@ def estimate_transport_jacobian_sv(
             if math.isfinite(sigma_val):
                 sv_values.append(sigma_val)
         batches_considered += 1
+        if sv_values:
+            current_max = max(sv_values)
+            current_mean = sum(sv_values) / len(sv_values)
+            progress_bar.set_postfix(
+                max=f"{current_max:.4f}", mean=f"{current_mean:.4f}", refresh=False
+            )
         if batches_considered >= max_batches:
             break
+    progress_bar.close()
     phi.train(phi_mode)
     icnn.train(icnn_mode)
 
@@ -972,6 +990,94 @@ def estimate_transport_jacobian_sv(
         return float("nan"), float("nan")
     sv_tensor = torch.tensor(sv_values)
     return float(sv_tensor.max().item()), float(sv_tensor.mean().item())
+
+
+def _jacobian_sv_for_sample(
+    icnn: InputConvexPotential,
+    base: torch.Tensor,
+    power_iters: int,
+    rng: Optional[torch.Generator] = None,
+) -> Optional[torch.Tensor]:
+    """Return spectral norm estimate for a single latent sample (differentiable)."""
+    if base.ndim == 0:
+        return None
+    sample = base.detach().unsqueeze(0)
+    if rng is not None:
+        vec = torch.empty_like(sample).normal_(mean=0.0, std=1.0, generator=rng)
+    else:
+        vec = torch.randn_like(sample)
+    vec_flat = vec.view(vec.size(0), -1)
+    vec_norm = vec_flat.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    vec = vec / vec_norm.view(vec.size(0), *([1] * (vec.ndim - 1)))
+    sigma: Optional[torch.Tensor] = None
+    for _ in range(max(1, int(power_iters))):
+        z_leaf = sample.clone().detach().requires_grad_(True)
+        transport = icnn.gradient(z_leaf, create_graph=True)
+        hvp = torch.autograd.grad(
+            transport,
+            z_leaf,
+            grad_outputs=vec,
+            retain_graph=True,
+            create_graph=True,
+            allow_unused=False,
+        )[0]
+        if hvp is None:
+            return None
+        hvp_flat = hvp.view(hvp.size(0), -1)
+        sigma = hvp_flat.norm(dim=1)
+        if not torch.isfinite(sigma).all():
+            return None
+        sigma_clamped = sigma.detach().clamp_min(1e-12)
+        reshaped = sigma_clamped.view(hvp.size(0), *([1] * (hvp.ndim - 1)))
+        vec = hvp.detach() / reshaped
+    if sigma is None:
+        return None
+    return sigma.mean()
+
+
+def estimate_local_jacobian_sv(
+    icnn: InputConvexPotential,
+    z_batch: torch.Tensor,
+    num_samples: int,
+    power_iters: int,
+    rng: Optional[torch.Generator] = None,
+) -> Optional[torch.Tensor]:
+    """Estimate average largest singular value over a minibatch (differentiable)."""
+    if z_batch.ndim == 0 or z_batch.size(0) == 0:
+        return None
+    batch = min(z_batch.size(0), max(1, int(num_samples)))
+    if rng is not None:
+        indices = torch.randperm(z_batch.size(0), generator=rng, device=z_batch.device)[:batch]
+    else:
+        indices = torch.randperm(z_batch.size(0), device=z_batch.device)[:batch]
+    estimates: List[torch.Tensor] = []
+    indices_list = indices.tolist()
+    use_bar = len(indices_list) > 1
+    bar = None
+    iterator = indices_list
+    if use_bar:
+        bar = tqdm(
+            indices_list,
+            desc="Jacobian SV Samples",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        iterator = bar
+    for idx in iterator:
+        sample = z_batch[idx]
+        sigma = _jacobian_sv_for_sample(icnn, sample, power_iters, rng=rng)
+        if sigma is None:
+            continue
+        if not torch.isfinite(sigma):
+            continue
+        estimates.append(sigma)
+        if bar is not None and torch.isfinite(sigma).all():
+            bar.set_postfix(sigma=float(sigma.mean().item()), refresh=False)
+    if bar is not None:
+        bar.close()
+    if not estimates:
+        return None
+    return torch.stack(estimates).mean()
 
 
 def train_one_epoch(
@@ -988,7 +1094,11 @@ def train_one_epoch(
     icnn_ascent_steps: int,
     tracker: Optional[TransportDeltaTracker] = None,
     cosine_cfg: Optional[Dict[str, Any]] = None,
-) -> Tuple[float, float, float, float]:
+    jacobian_reg_weight: float = 0.0,
+    jacobian_reg_samples: int = 1,
+    jacobian_reg_iters: int = 1,
+    rng: Optional[torch.Generator] = None,
+) -> Tuple[float, float, float, float, float]:
     phi.train(not head_only)
     head.train()
     icnn.train()
@@ -1000,6 +1110,9 @@ def train_one_epoch(
     total_samples = 0
     total_penalty = 0.0
     total_adv_obj = 0.0
+    total_jacobian_penalty = 0.0
+    total_sv_sq = 0.0
+    jacobian_counts = 0
     cosine_cfg = cosine_cfg or {"enabled": False}
 
     progress = tqdm(enumerate(loader), desc="Train", leave=False, total=len(loader))
@@ -1026,6 +1139,7 @@ def train_one_epoch(
         z_detached = z.detach()
         adv_objective_last: Optional[torch.Tensor] = None
         penalty_monitor = torch.zeros((), device=z_detached.device, dtype=z_detached.dtype)
+        sv_estimate_last: Optional[torch.Tensor] = None
         for ascent_step in range(max(1, icnn_ascent_steps)):
             opt_icnn.zero_grad(set_to_none=True)
             z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
@@ -1048,17 +1162,34 @@ def train_one_epoch(
                 cosine_cfg,
                 logits_adv=logits_adv,
             )
+            sv_estimate: Optional[torch.Tensor] = None
+            sv_penalty = torch.zeros((), device=ce_adv.device, dtype=ce_adv.dtype)
+            if jacobian_reg_weight > 0.0:
+                sv_estimate = estimate_local_jacobian_sv(
+                    icnn,
+                    z_detached,
+                    num_samples=jacobian_reg_samples,
+                    power_iters=jacobian_reg_iters,
+                    rng=rng,
+                )
+                if sv_estimate is not None and torch.isfinite(sv_estimate):
+                    sv_penalty = jacobian_reg_weight * sv_estimate.pow(2)
+                else:
+                    sv_estimate = None
             if (
                 not torch.isfinite(ce_adv)
                 or not torch.isfinite(penalty_term)
                 or not torch.isfinite(penalty_monitor)
+                or not torch.isfinite(sv_penalty)
             ):
                 warnings.warn(
                     "Non-finite adversarial loss components detected; skipping ascent step.",
                     RuntimeWarning,
                 )
                 continue
-            adv_objective = ce_adv - penalty_term
+            adv_objective = ce_adv - penalty_term - sv_penalty
+            if sv_estimate is not None:
+                sv_estimate_last = sv_estimate.detach()
             (-adv_objective).backward()
             if tracker is not None:
                 tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
@@ -1106,10 +1237,10 @@ def train_one_epoch(
         loss.backward()
         if model_params:
             torch.nn.utils.clip_grad_norm_(model_params, max_norm=10.0)
-        opt_theta.step()
-        delta_sq = per_sample_mean_square_diff(z_adv_fixed, z)
-        if tracker is not None:
-            tracker.record_epoch_batch(delta_sq, batch_idx)
+            opt_theta.step()
+            delta_sq = per_sample_mean_square_diff(z_adv_fixed, z)
+            if tracker is not None:
+                tracker.record_epoch_batch(delta_sq, batch_idx)
 
         with torch.no_grad():
             total_loss += loss.item() * batch_size
@@ -1118,26 +1249,52 @@ def train_one_epoch(
             total_penalty += float(penalty_monitor.detach().item())
             if adv_objective_last is not None and torch.isfinite(adv_objective_last).all():
                 total_adv_obj += adv_objective_last.item()
+            if sv_estimate_last is not None:
+                sv_sq = float(sv_estimate_last.pow(2).item())
+                total_sv_sq += sv_sq
+                jacobian_counts += 1
+                total_jacobian_penalty += float(jacobian_reg_weight * sv_sq)
 
-        if total_samples > 0:
-            mean_loss = total_loss / total_samples
-            mean_acc = total_correct / total_samples
-            mean_penalty = total_penalty / max(1, len(loader))
-            mean_adv_obj = total_adv_obj / max(1, len(loader))
-            progress.set_postfix(
-                loss=f"{mean_loss:.4f}",
-                acc=f"{mean_acc*100:.2f}%",
-                penalty=f"{mean_penalty:.4f}",
-                adv_obj=f"{mean_adv_obj:.4f}",
-                refresh=True,
-            )
+            if total_samples > 0:
+                mean_loss = total_loss / total_samples
+                mean_acc = total_correct / total_samples
+                mean_penalty = total_penalty / max(1, len(loader))
+                mean_adv_obj = total_adv_obj / max(1, len(loader))
+                postfix: Dict[str, str] = {
+                    "loss": f"{mean_loss:.4f}",
+                    "acc": f"{mean_acc*100:.2f}%",
+                    "penalty": f"{mean_penalty:.4f}",
+                    "adv_obj": f"{mean_adv_obj:.4f}",
+                }
+                if jacobian_reg_weight > 0.0 and jacobian_counts > 0:
+                    mean_sv_sq = total_sv_sq / jacobian_counts
+                    mean_sv = math.sqrt(max(mean_sv_sq, 0.0))
+                    mean_jac_pen = total_jacobian_penalty / jacobian_counts
+                    postfix["jac_sv"] = f"{mean_sv:.4f}"
+                    postfix["jac_pen"] = f"{mean_jac_pen:.4f}"
+                progress.set_postfix(refresh=True, **postfix)
 
     progress.close()
     mean_loss = total_loss / max(1, total_samples)
     mean_acc = total_correct / max(1, total_samples)
     mean_penalty = total_penalty / max(1, len(loader))
     mean_adv_obj = total_adv_obj / max(1, len(loader))
-    return mean_loss, mean_acc, mean_penalty, mean_adv_obj
+    if jacobian_counts > 0:
+        mean_sv_sq = total_sv_sq / jacobian_counts
+        mean_sv = math.sqrt(max(mean_sv_sq, 0.0))
+        mean_jacobian_penalty = total_jacobian_penalty / jacobian_counts
+    else:
+        mean_sv = 0.0
+        mean_jacobian_penalty = 0.0
+    return (
+        mean_loss,
+        mean_acc,
+        mean_penalty,
+        mean_adv_obj,
+        mean_jacobian_penalty,
+        mean_sv,
+        jacobian_counts,
+    )
 
 
 def evaluate_under_icnn(
@@ -1217,6 +1374,8 @@ CSV_HEADER = [
     "train_loss",
     "train_acc",
     "train_penalty",
+    "train_jac_penalty",
+    "train_jac_sv",
     "adv_objective",
     "test_loss",
     "test_acc",
@@ -1228,6 +1387,10 @@ CSV_HEADER = [
     "input_pgd_avg_linf",
     "input_pgd_samples",
     "penalty_lambda",
+    "jacobian_reg_weight",
+    "jacobian_reg_samples",
+    "jacobian_reg_iters",
+    "jacobian_reg_counts",
     "lr_theta",
     "lr_omega",
     "icnn_hidden",
@@ -1372,6 +1535,30 @@ def parse_args():
     parser.add_argument("--jacobian-aware", action="store_true")
     parser.add_argument("--jacobian-batches", type=int, default=4)
     parser.add_argument("--jacobian-iters", type=int, default=10)
+    parser.add_argument(
+        "--jacobian-reg-weight",
+        type=float,
+        default=0.0,
+        help="Weight for Jacobian spectral norm regularization on the ICNN adversary.",
+    )
+    parser.add_argument(
+        "--jacobian-reg-samples",
+        type=int,
+        default=1,
+        help="Number of latent samples per batch used for the Jacobian spectral penalty.",
+    )
+    parser.add_argument(
+        "--jacobian-reg-iters",
+        type=int,
+        default=1,
+        help="Number of power iterations used to estimate the Jacobian spectral penalty.",
+    )
+    parser.add_argument(
+        "--jacobian-log-dir",
+        type=str,
+        default="results/jacobian_logs",
+        help="Directory used to store Jacobian regularization summaries for each run.",
+    )
 
     parser.add_argument("--inp-p", type=str, default="inf", choices=["2", "inf"])
     parser.add_argument("--inp-eps", type=float, default=8 / 255)
@@ -1575,6 +1762,12 @@ def main():
             f"Cosine penalty enabled: feature={cosine_cfg['feature']}, "
             f"λ={cosine_cfg['lambda']}, α={cosine_cfg['quadratic_weight']}"
         )
+    if args.jacobian_reg_weight > 0.0:
+        print(
+            "Jacobian spectral regularizer enabled: "
+            f"weight={args.jacobian_reg_weight}, samples={args.jacobian_reg_samples}, "
+            f"iters={args.jacobian_reg_iters}"
+        )
 
     if args.head_only:
         for p in phi.parameters():
@@ -1630,6 +1823,17 @@ def main():
         max_batches=max(0, args.track_transport_batches),
         plot_dir=args.transport_delta_plot_dir,
     )
+    jacobian_run_dir = Path(args.jacobian_log_dir) / run_id
+    jacobian_run_dir.mkdir(parents=True, exist_ok=True)
+    jacobian_epoch_records: List[Dict[str, object]] = []
+    jacobian_summary = {
+        "run_id": run_id,
+        "jacobian_reg_weight": args.jacobian_reg_weight,
+        "jacobian_reg_samples": args.jacobian_reg_samples,
+        "jacobian_reg_iters": args.jacobian_reg_iters,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (jacobian_run_dir / "config.json").write_text(json.dumps(jacobian_summary, indent=2))
 
     if cosine_cfg["enabled"] and args.calibrate_penalty:
         print("Cosine penalty active; skipping penalty_lambda calibration.")
@@ -1680,7 +1884,15 @@ def main():
             L_hat_used = L_hat
             jacobian_ready = True
 
-        train_loss, train_acc, penalty_avg, adv_obj = train_one_epoch(
+        (
+            train_loss,
+            train_acc,
+            penalty_avg,
+            adv_obj,
+            jac_penalty,
+            jac_sv,
+            jac_counts,
+        ) = train_one_epoch(
             phi,
             head,
             icnn,
@@ -1694,6 +1906,10 @@ def main():
             icnn_ascent_steps=args.icnn_ascent_steps,
             tracker=tracker,
             cosine_cfg=cosine_cfg,
+            jacobian_reg_weight=args.jacobian_reg_weight,
+            jacobian_reg_samples=args.jacobian_reg_samples,
+            jacobian_reg_iters=args.jacobian_reg_iters,
+            rng=global_rng,
         )
 
         test_loss, test_acc = evaluate(phi, head, testloader, device)
@@ -1741,7 +1957,7 @@ def main():
 
         msg = (
             f"[Epoch {epoch:02d} | {phase}] train {train_loss:.4f}/{train_acc*100:.2f}% | "
-            f"penalty {penalty_avg:.4f} | adv_obj {adv_obj:.4f} | "
+            f"penalty {penalty_avg:.4f} | jac_pen {jac_penalty:.4f} | jac_sv {jac_sv:.4f} | adv_obj {adv_obj:.4f} | "
             f"test {test_loss:.4f}/{test_acc*100:.2f}% | "
             f"icnn {icnn_loss:.4f}/{icnn_acc*100:.2f}% (pen {icnn_penalty:.4f})"
         )
@@ -1751,6 +1967,21 @@ def main():
         if jacobian_ready and L_hat_used is not None:
             msg += f" | L_hat {L_hat_used:.4f}"
         print(msg)
+
+        jacobian_epoch_records.append(
+            {
+                "epoch": epoch,
+                "phase": phase,
+                "mean_jac_penalty": float(jac_penalty),
+                "mean_jac_sv": float(jac_sv),
+                "jacobian_counts": int(jac_counts),
+                "reg_weight": float(args.jacobian_reg_weight),
+                "reg_samples": int(args.jacobian_reg_samples),
+                "reg_iters": int(args.jacobian_reg_iters),
+                "adv_objective": float(adv_obj),
+                "train_penalty": float(penalty_avg),
+            }
+        )
 
         append_row(
             log_csv_path,
@@ -1762,6 +1993,8 @@ def main():
                 "train_loss": round(train_loss, 6),
                 "train_acc": round(float(train_acc), 6),
                 "train_penalty": round(float(penalty_avg), 6),
+                "train_jac_penalty": round(float(jac_penalty), 6),
+                "train_jac_sv": round(float(jac_sv), 6),
                 "adv_objective": round(float(adv_obj), 6),
                 "test_loss": round(test_loss, 6),
                 "test_acc": round(float(test_acc), 6),
@@ -1773,6 +2006,10 @@ def main():
                 "input_pgd_avg_linf": None if ipgd_linf is None else round(float(ipgd_linf), 6),
                 "input_pgd_samples": None if ipgd_samples is None else int(ipgd_samples),
                 "penalty_lambda": args.penalty_lambda,
+                "jacobian_reg_weight": args.jacobian_reg_weight,
+                "jacobian_reg_samples": args.jacobian_reg_samples,
+                "jacobian_reg_iters": args.jacobian_reg_iters,
+                "jacobian_reg_counts": jac_counts,
                 "lr_theta": args.lr_theta,
                 "lr_omega": args.lr_omega,
                 "icnn_hidden": "-".join(map(str, args.icnn_hidden)),
@@ -1822,6 +2059,41 @@ def main():
 
     save_transport_delta_plot(tracker, args, run_id)
 
+    if jacobian_epoch_records:
+        epoch_fields = [
+            "epoch",
+            "phase",
+            "mean_jac_penalty",
+            "mean_jac_sv",
+            "jacobian_counts",
+            "reg_weight",
+            "reg_samples",
+            "reg_iters",
+            "adv_objective",
+            "train_penalty",
+        ]
+        jac_epoch_path = jacobian_run_dir / "jacobian_epoch_stats.csv"
+        with jac_epoch_path.open("w", newline="") as f_epoch:
+            writer = csv.DictWriter(f_epoch, fieldnames=epoch_fields)
+            writer.writeheader()
+            for record in jacobian_epoch_records:
+                writer.writerow(record)
+        overall_mean_sv = sum(rec["mean_jac_sv"] for rec in jacobian_epoch_records) / max(
+            1, len(jacobian_epoch_records)
+        )
+        overall_max_sv = max(rec["mean_jac_sv"] for rec in jacobian_epoch_records)
+        jacobian_summary.update(
+            {
+                "epochs_recorded": len(jacobian_epoch_records),
+                "mean_jac_sv_overall": overall_mean_sv,
+                "max_jac_sv_overall": overall_max_sv,
+                "epoch_stats_path": str(jac_epoch_path),
+            }
+        )
+        summary_path = jacobian_run_dir / "summary.json"
+        summary_path.write_text(json.dumps(jacobian_summary, indent=2))
+        print(f"Saved Jacobian epoch statistics to {jac_epoch_path}")
+
     if args.estimate_transport_jacobian:
         jac_loader = trainloader if args.jacobian_sv_split == "train" else testloader
         max_sv, mean_sv = estimate_transport_jacobian_sv(
@@ -1833,6 +2105,14 @@ def main():
             print(
                 f"Estimated transport Jacobian σ_max ≈ {max_sv:.4f}, σ_mean ≈ {mean_sv:.4f}"
             )
+            jacobian_summary.update(
+                {
+                    "transport_jacobian_max": max_sv,
+                    "transport_jacobian_mean": mean_sv,
+                }
+            )
+            summary_path = jacobian_run_dir / "summary.json"
+            summary_path.write_text(json.dumps(jacobian_summary, indent=2))
 
     if args.visualize_transport:
         viz_loader = trainloader if args.transport_viz_split == "train" else testloader
@@ -1862,7 +2142,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
+ 
