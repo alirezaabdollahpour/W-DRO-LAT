@@ -271,7 +271,20 @@ def compute_transport_penalty(
     cosine_cfg: Optional[Dict[str, Any]],
     logits_adv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    quad_scale = float(cosine_cfg.get("quadratic_scale", 1.0)) if cosine_cfg else 1.0
+    if z_src.ndim == 0:
+        default_quad_scale = 1.0
+    elif z_src.size(0) == 0:
+        if z_src.ndim > 1:
+            default_quad_scale = float(max(int(np.prod(z_src.shape[1:])), 1))
+        else:
+            default_quad_scale = 1.0
+    else:
+        default_quad_scale = float(max(int(z_src[0].numel()), 1))
+    quad_scale = (
+        float(cosine_cfg.get("quadratic_scale", default_quad_scale))
+        if cosine_cfg
+        else default_quad_scale
+    )
     mse_mean = mse_per_sample.mean()
     mse_sum = quad_scale * mse_mean
     if cosine_cfg and cosine_cfg.get("enabled", False):
@@ -1270,7 +1283,7 @@ def parse_args():
         default=5.0,
         help="Fixed λ multiplying the quadratic transport penalty.",
     )
-    parser.add_argument("--icnn-hidden", type=_parse_hidden_units, nargs="+", default=[256, 256])
+    parser.add_argument("--icnn-hidden", type=_parse_hidden_units, nargs="+", default=[512, 256])
     parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="softplus")
     parser.add_argument("--icnn-strong-convexity", type=float, default=1.0)
     parser.add_argument(
@@ -1319,7 +1332,7 @@ def parse_args():
         default=3,
         help="Number of warmup steps for α in AdEMAMix (ignored for Adam).",
     )
-    parser.add_argument("--icnn-ascent-steps", type=int, default=10)
+    parser.add_argument("--icnn-ascent-steps", type=int, default=5)
     parser.add_argument(
         "--cosine-penalty",
         action="store_true",
@@ -1470,7 +1483,7 @@ def parse_args():
     parser.add_argument(
         "--latent-eps-target",
         type=float,
-        default=None,
+        default=2.0,
         help="Desired average L2 norm of T(z)-z; used to calibrate penalty_lambda.",
     )
     parser.add_argument(
@@ -1849,3 +1862,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
