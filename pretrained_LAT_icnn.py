@@ -60,8 +60,8 @@ from pretrained_LAT import (  # type: ignore
 
 PENALTY_LAMBDA_MIN = 1e-4
 PENALTY_LAMBDA_MAX = 1e4
-CALIBRATION_SCALE_MIN = 0.1
-CALIBRATION_SCALE_MAX = 10.0
+DEFAULT_CALIBRATION_RATIO_MIN = 0.5
+DEFAULT_CALIBRATION_RATIO_MAX = 2.0
 CALIBRATION_SMOOTHING = 0.1
 
 
@@ -1684,6 +1684,18 @@ def parse_args():
         default=4,
         help="Number of minibatches used to estimate gradient norms or delta norms.",
     )
+    parser.add_argument(
+        "--calibration-ratio-min",
+        type=float,
+        default=DEFAULT_CALIBRATION_RATIO_MIN,
+        help="Minimum clamp applied to avg_delta / latent_eps_target during penalty calibration.",
+    )
+    parser.add_argument(
+        "--calibration-ratio-max",
+        type=float,
+        default=DEFAULT_CALIBRATION_RATIO_MAX,
+        help="Maximum clamp applied to avg_delta / latent_eps_target during penalty calibration.",
+    )
 
     parser.set_defaults(eval_input_pgd=True)
     return parser.parse_args()
@@ -1703,6 +1715,16 @@ def determine_schedule(args) -> Tuple[int, List[str]]:
 
 def main():
     args = parse_args()
+    ratio_min = max(float(args.calibration_ratio_min), 1e-6)
+    ratio_max = max(float(args.calibration_ratio_max), ratio_min)
+    if ratio_min != args.calibration_ratio_min or ratio_max != args.calibration_ratio_max:
+        warnings.warn(
+            "Adjusted calibration ratio bounds to ensure 0 < min ≤ max.",
+            RuntimeWarning,
+        )
+    args.calibration_ratio_min = ratio_min
+    args.calibration_ratio_max = ratio_max
+
     set_deterministic(args.seed)
     device = get_device()
     print(f"Using device: {device}")
@@ -1761,6 +1783,12 @@ def main():
         print(
             f"Cosine penalty enabled: feature={cosine_cfg['feature']}, "
             f"λ={cosine_cfg['lambda']}, α={cosine_cfg['quadratic_weight']}"
+        )
+    if args.calibrate_penalty:
+        print(
+            "Penalty calibration enabled: "
+            f"ε_target={args.latent_eps_target}, "
+            f"ratio clamp=[{args.calibration_ratio_min:.3f}, {args.calibration_ratio_max:.3f}]"
         )
     if args.jacobian_reg_weight > 0.0:
         print(
@@ -2044,14 +2072,17 @@ def main():
             if not math.isfinite(avg_delta) or avg_delta <= 0:
                 print("[Calibration] Average delta was non-finite; penalty_lambda unchanged.")
             else:
-                ratio = float(avg_delta / args.latent_eps_target)
-                ratio = float(
-                    min(max(ratio, CALIBRATION_SCALE_MIN), CALIBRATION_SCALE_MAX)
+                ratio_raw = float(avg_delta / args.latent_eps_target)
+                ratio_clamped = float(
+                    min(
+                        max(ratio_raw, args.calibration_ratio_min),
+                        args.calibration_ratio_max,
+                    )
                 )
-                smoothing = 1.0 + CALIBRATION_SMOOTHING * (ratio - 1.0)
+                smoothing = 1.0 + CALIBRATION_SMOOTHING * (ratio_clamped - 1.0)
                 new_lambda = _clamp_penalty_lambda(args.penalty_lambda * smoothing)
                 print(
-                    f"[Calibration] Average delta {avg_delta:.4f}, ratio {ratio:.4f}, "
+                    f"[Calibration] Average delta {avg_delta:.4f}, ratio {ratio_raw:.4f} → {ratio_clamped:.4f}, "
                     f"smoothing {smoothing:.4f}, penalty_lambda {args.penalty_lambda:.6f} → {new_lambda:.6f}"
                 )
                 args.penalty_lambda = new_lambda
