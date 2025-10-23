@@ -1265,7 +1265,7 @@ def parse_args():
     parser.add_argument("--epochs-clean", type=int, default=0)
     parser.add_argument("--epochs-adv", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=0)  # legacy fallback
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--lr-theta",
         type=float,
@@ -1370,8 +1370,8 @@ def parse_args():
     parser.add_argument("--save", type=str, default="")
 
     parser.add_argument("--jacobian-aware", action="store_true")
-    parser.add_argument("--jacobian-batches", type=int, default=2)
-    parser.add_argument("--jacobian-iters", type=int, default=2)
+    parser.add_argument("--jacobian-batches", type=int, default=4)
+    parser.add_argument("--jacobian-iters", type=int, default=10)
 
     parser.add_argument("--inp-p", type=str, default="inf", choices=["2", "inf"])
     parser.add_argument("--inp-eps", type=float, default=8 / 255)
