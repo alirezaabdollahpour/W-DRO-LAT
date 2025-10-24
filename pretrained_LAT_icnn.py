@@ -60,8 +60,8 @@ from pretrained_LAT import (  # type: ignore
 
 PENALTY_LAMBDA_MIN = 1e-4
 PENALTY_LAMBDA_MAX = 1e4
-DEFAULT_CALIBRATION_RATIO_MIN = 0.5
-DEFAULT_CALIBRATION_RATIO_MAX = 2.0
+DEFAULT_CALIBRATION_RATIO_MIN = 1.0
+DEFAULT_CALIBRATION_RATIO_MAX = 6.0
 CALIBRATION_SMOOTHING = 0.1
 
 
@@ -1140,85 +1140,108 @@ def train_one_epoch(
         adv_objective_last: Optional[torch.Tensor] = None
         penalty_monitor = torch.zeros((), device=z_detached.device, dtype=z_detached.dtype)
         sv_estimate_last: Optional[torch.Tensor] = None
-        for ascent_step in range(max(1, icnn_ascent_steps)):
-            opt_icnn.zero_grad(set_to_none=True)
-            z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
-            if not torch.isfinite(z_adv_ascent).all():
-                warnings.warn(
-                    "Encountered non-finite values in adversarial latents during ascent; "
-                    "skipping this ascent step.",
-                    RuntimeWarning,
-                )
-                continue
-            logits_adv = head(z_adv_ascent)
-            ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
-            per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
-            penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
-                z_detached,
-                z_adv_ascent,
-                head,
-                penalty_lambda,
-                per_sample_mse,
-                cosine_cfg,
-                logits_adv=logits_adv,
-            )
-            sv_estimate: Optional[torch.Tensor] = None
-            sv_penalty = torch.zeros((), device=ce_adv.device, dtype=ce_adv.dtype)
-            if jacobian_reg_weight > 0.0:
-                sv_estimate = estimate_local_jacobian_sv(
-                    icnn,
-                    z_detached,
-                    num_samples=jacobian_reg_samples,
-                    power_iters=jacobian_reg_iters,
-                    rng=rng,
-                )
-                if sv_estimate is not None and torch.isfinite(sv_estimate):
-                    sv_penalty = jacobian_reg_weight * sv_estimate.pow(2)
-                else:
-                    sv_estimate = None
-            if (
-                not torch.isfinite(ce_adv)
-                or not torch.isfinite(penalty_term)
-                or not torch.isfinite(penalty_monitor)
-                or not torch.isfinite(sv_penalty)
-            ):
-                warnings.warn(
-                    "Non-finite adversarial loss components detected; skipping ascent step.",
-                    RuntimeWarning,
-                )
-                continue
-            adv_objective = ce_adv - penalty_term - sv_penalty
-            if sv_estimate is not None:
-                sv_estimate_last = sv_estimate.detach()
-            (-adv_objective).backward()
-            if tracker is not None:
-                tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
-            grad_finite = all(
-                (p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters()
-            )
-            if not grad_finite:
-                warnings.warn(
-                    "Non-finite gradients in ICNN adversary; skipping optimizer step.",
-                    RuntimeWarning,
-                )
+        ascent_steps = max(1, icnn_ascent_steps)
+        ascent_bar = tqdm(
+            range(ascent_steps),
+            desc="ICNN Ascent",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        try:
+            for ascent_step in ascent_bar:
                 opt_icnn.zero_grad(set_to_none=True)
-                continue
-
-            # Remove stray gradients on the classifier, which acts as a frozen critic.
-            for p in head.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
-            torch.nn.utils.clip_grad_norm_(icnn.parameters(), max_norm=10.0)
-            opt_icnn.step()
-            for param in icnn.parameters():
-                if not torch.isfinite(param).all():
+                z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
+                if not torch.isfinite(z_adv_ascent).all():
                     warnings.warn(
-                        "Detected non-finite ICNN parameters after update; sanitizing values.",
+                        "Encountered non-finite values in adversarial latents during ascent; "
+                        "skipping this ascent step.",
                         RuntimeWarning,
                     )
-                    param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
-            icnn.project_convexity()
-            adv_objective_last = adv_objective.detach()
+                    continue
+                logits_adv = head(z_adv_ascent)
+                ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
+                per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
+                penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
+                    z_detached,
+                    z_adv_ascent,
+                    head,
+                    penalty_lambda,
+                    per_sample_mse,
+                    cosine_cfg,
+                    logits_adv=logits_adv,
+                )
+                sv_estimate: Optional[torch.Tensor] = None
+                sv_penalty = torch.zeros((), device=ce_adv.device, dtype=ce_adv.dtype)
+                if jacobian_reg_weight > 0.0:
+                    sv_estimate = estimate_local_jacobian_sv(
+                        icnn,
+                        z_detached,
+                        num_samples=jacobian_reg_samples,
+                        power_iters=jacobian_reg_iters,
+                        rng=rng,
+                    )
+                    if sv_estimate is not None and torch.isfinite(sv_estimate):
+                        sv_penalty = jacobian_reg_weight * sv_estimate.pow(2)
+                    else:
+                        sv_estimate = None
+                if (
+                    not torch.isfinite(ce_adv)
+                    or not torch.isfinite(penalty_term)
+                    or not torch.isfinite(penalty_monitor)
+                    or not torch.isfinite(sv_penalty)
+                ):
+                    warnings.warn(
+                        "Non-finite adversarial loss components detected; skipping ascent step.",
+                        RuntimeWarning,
+                    )
+                    continue
+                adv_objective = ce_adv - penalty_term - sv_penalty
+                if sv_estimate is not None:
+                    sv_estimate_last = sv_estimate.detach()
+                if torch.isfinite(ce_adv) and torch.isfinite(penalty_term):
+                    bar_postfix: Dict[str, str] = {
+                        "ce": f"{float(ce_adv.item()):.4f}",
+                        "pen": f"{float(penalty_term.item()):.4f}",
+                    }
+                    if sv_estimate is not None and torch.isfinite(sv_estimate):
+                        bar_postfix["jac_sv"] = f"{float(sv_estimate.item()):.4f}"
+                    ascent_bar.set_postfix(bar_postfix, refresh=False)
+                (-adv_objective).backward()
+                if tracker is not None:
+                    tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
+                grad_finite = all(
+                    (p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters()
+                )
+                if not grad_finite:
+                    warnings.warn(
+                        "Non-finite gradients in ICNN adversary; skipping optimizer step.",
+                        RuntimeWarning,
+                    )
+                    opt_icnn.zero_grad(set_to_none=True)
+                    continue
+
+                # Remove stray gradients on the classifier, which acts as a frozen critic.
+                for p in head.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()
+                torch.nn.utils.clip_grad_norm_(icnn.parameters(), max_norm=1.0)
+                opt_icnn.step()
+                for param in icnn.parameters():
+                    if not torch.isfinite(param).all():
+                        warnings.warn(
+                            "Detected non-finite ICNN parameters after update; sanitizing values.",
+                            RuntimeWarning,
+                        )
+                        param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+                icnn.project_convexity()
+                adv_objective_last = adv_objective.detach()
+        finally:
+            ascent_bar.close()
+
+        # Clear any stray gradients created during adversary ascent before the outer update.
+        for param in model_params:
+            if param.grad is not None:
+                param.grad = None
 
         # --- Model update (Danskin-style outer gradient) ---
         opt_theta.zero_grad(set_to_none=True)
@@ -1459,7 +1482,7 @@ def parse_args():
     parser.add_argument(
         "--lr-omega",
         type=float,
-        default=0.05,
+        default=0.0005,
         help="Step size γ_ω for ICNN adversary parameters.",
     )
     parser.add_argument(
@@ -1640,7 +1663,7 @@ def parse_args():
     parser.add_argument(
         "--jacobian-sv-batches",
         type=int,
-        default=4,
+        default=10,
         help="Number of minibatches to sample when estimating transport Jacobian singular values.",
     )
     parser.add_argument(
@@ -1843,7 +1866,14 @@ def main():
         }
         opt_icnn = AdEMAMix(icnn_param_groups, **ademamix_kwargs)
     print(f"ICNN optimizer: {args.icnn_optimizer}")
-    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
+    # lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(
+        opt_theta,
+        milestones=[total_epochs // 2, (3 * total_epochs) // 4],
+        gamma=0.1,
+    )
+    
+    
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     tracker = TransportDeltaTracker(
