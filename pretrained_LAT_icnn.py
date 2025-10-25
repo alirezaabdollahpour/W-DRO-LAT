@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from ademamix import AdEMAMix
+from torch.nn.utils import parameters_to_vector
 from utils import (
     evaluate_under_input_pgd,
     get_cifar10_loaders,
@@ -223,11 +224,11 @@ def save_transport_delta_plot(
 
 
 def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Return mean squared difference per sample between tensors a and b."""
+    """Return per-sample squared difference sum between tensors a and b."""
     if a.shape != b.shape:
-        raise ValueError("Tensors must have identical shapes to compute mean square difference.")
+        raise ValueError("Tensors must have identical shapes to compute squared difference.")
     diff = (a - b).reshape(a.size(0), -1)
-    return diff.pow(2).mean(dim=1)
+    return diff.pow(2).sum(dim=1)
 
 
 def _extract_penalty_features(
@@ -272,22 +273,9 @@ def compute_transport_penalty(
     cosine_cfg: Optional[Dict[str, Any]],
     logits_adv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    if z_src.ndim == 0:
-        default_quad_scale = 1.0
-    elif z_src.size(0) == 0:
-        if z_src.ndim > 1:
-            default_quad_scale = float(max(int(np.prod(z_src.shape[1:])), 1))
-        else:
-            default_quad_scale = 1.0
-    else:
-        default_quad_scale = float(max(int(z_src[0].numel()), 1))
-    quad_scale = (
-        float(cosine_cfg.get("quadratic_scale", default_quad_scale))
-        if cosine_cfg
-        else default_quad_scale
-    )
+    quad_scale = float(cosine_cfg.get("quadratic_scale", 1.0)) if cosine_cfg else 1.0
     mse_mean = mse_per_sample.mean()
-    mse_sum = quad_scale * mse_mean
+    mse_term = quad_scale * mse_mean
     if cosine_cfg and cosine_cfg.get("enabled", False):
         feature_type = str(cosine_cfg.get("feature", "latent"))
         eps = float(cosine_cfg.get("eps", 1e-8))
@@ -298,11 +286,11 @@ def compute_transport_penalty(
         cos_mean = cos_dist.mean()
         cos_weight = penalty_lambda * float(cosine_cfg.get("lambda", 1.0))
         quad_weight = penalty_lambda * float(cosine_cfg.get("quadratic_weight", 0.0))
-        penalty = cos_weight * cos_mean + quad_weight * mse_sum
+        penalty = cos_weight * cos_mean + quad_weight * mse_term
         monitor = mse_mean
         return penalty, monitor, logits_adv
 
-    penalty = penalty_lambda * mse_sum
+    penalty = penalty_lambda * mse_term
     monitor = mse_mean
     return penalty, monitor, logits_adv
 
@@ -1080,6 +1068,104 @@ def estimate_local_jacobian_sv(
     return torch.stack(estimates).mean()
 
 
+class BBArmijoState:
+    def __init__(
+        self,
+        alpha0: float,
+        alpha_min: float,
+        alpha_max: float,
+        ls_c: float,
+        ls_shrink: float,
+        ls_max_steps: int,
+    ) -> None:
+        self.alpha_min = float(max(alpha_min, 1e-12))
+        self.alpha_max = float(max(alpha_max, self.alpha_min))
+        self.alpha_prev = float(min(max(alpha0, self.alpha_min), self.alpha_max))
+        self.ls_c = float(ls_c)
+        self.ls_shrink = float(ls_shrink)
+        self.ls_max_steps = int(max(ls_max_steps, 1))
+        self.prev_params_vec: Optional[torch.Tensor] = None
+        self.prev_grad_vec: Optional[torch.Tensor] = None
+
+    def propose(self, params_vec: torch.Tensor, grad_vec: torch.Tensor) -> float:
+        if (
+            self.prev_params_vec is None
+            or self.prev_grad_vec is None
+            or self.prev_params_vec.numel() != params_vec.numel()
+            or self.prev_grad_vec.numel() != grad_vec.numel()
+        ):
+            alpha = self.alpha_prev
+        else:
+            s = params_vec - self.prev_params_vec
+            y = grad_vec - self.prev_grad_vec
+            denom = torch.dot(s, y)
+            if torch.isfinite(denom) and float(denom.abs().item()) > 1e-12:
+                num = torch.dot(s, s)
+                alpha = float((num / denom).item())
+            else:
+                alpha = self.alpha_prev
+        if not math.isfinite(alpha):
+            alpha = self.alpha_prev
+        alpha = max(self.alpha_min, min(self.alpha_max, float(alpha)))
+        return alpha
+
+    def update_history(self, params_vec: torch.Tensor, grad_vec: torch.Tensor, alpha: float) -> None:
+        self.prev_params_vec = params_vec.detach().clone()
+        self.prev_grad_vec = grad_vec.detach().clone()
+        alpha_clamped = max(self.alpha_min, min(self.alpha_max, float(alpha)))
+        self.alpha_prev = alpha_clamped
+
+
+def _evaluate_icnn_adv_objective(
+    icnn: InputConvexPotential,
+    head: nn.Module,
+    z_source: torch.Tensor,
+    y: torch.Tensor,
+    penalty_lambda: float,
+    cosine_cfg: Optional[Dict[str, Any]],
+    use_margin_adv: bool,
+    jacobian_reg_weight: float,
+    jacobian_reg_samples: int,
+    jacobian_reg_iters: int,
+    rng: Optional[torch.Generator],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    with torch.enable_grad():
+        z_adv_eval, _ = adversarial_pushforward(icnn, z_source, detach_for_model=False)
+        logits_eval = head(z_adv_eval)
+        if use_margin_adv:
+            logits_correct = logits_eval.gather(1, y.unsqueeze(1)).squeeze(1)
+            margins = logits_eval - logits_correct.unsqueeze(1)
+            num_classes = logits_eval.size(1)
+            correct_mask = F.one_hot(y, num_classes=num_classes).bool()
+            margins = margins.masked_fill(correct_mask, float("-inf"))
+            adv_primary = torch.logsumexp(margins, dim=1).mean()
+        else:
+            adv_primary = F.cross_entropy(logits_eval, y, reduction="mean")
+        per_sample_mse = per_sample_mean_square_diff(z_adv_eval, z_source)
+        penalty_term, _, _ = compute_transport_penalty(
+            z_source,
+            z_adv_eval,
+            head,
+            penalty_lambda,
+            per_sample_mse,
+            cosine_cfg,
+            logits_adv=logits_eval,
+        )
+        sv_penalty = torch.zeros_like(adv_primary)
+        if jacobian_reg_weight > 0.0:
+            sv_estimate = estimate_local_jacobian_sv(
+                icnn,
+                z_source,
+                num_samples=jacobian_reg_samples,
+                power_iters=jacobian_reg_iters,
+                rng=rng,
+            )
+            if sv_estimate is not None and torch.isfinite(sv_estimate):
+                sv_penalty = jacobian_reg_weight * sv_estimate.pow(2)
+        adv_objective = adv_primary - penalty_term - sv_penalty
+    return adv_objective.detach(), per_sample_mse.detach()
+
+
 def train_one_epoch(
     phi: nn.Module,
     head: nn.Module,
@@ -1099,6 +1185,8 @@ def train_one_epoch(
     jacobian_reg_iters: int = 1,
     rng: Optional[torch.Generator] = None,
     use_margin_adv: bool = True,
+    icnn_step_rule: str = "constant",
+    icnn_bb_config: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, float, float, float, float]:
     phi.train(not head_only)
     head.train()
@@ -1142,6 +1230,16 @@ def train_one_epoch(
         penalty_monitor = torch.zeros((), device=z_detached.device, dtype=z_detached.dtype)
         sv_estimate_last: Optional[torch.Tensor] = None
         ascent_steps = max(1, icnn_ascent_steps)
+        bb_state: Optional[BBArmijoState] = None
+        if icnn_step_rule == "bb-armijo" and icnn_bb_config is not None:
+            bb_state = BBArmijoState(
+                icnn_bb_config["alpha0"],
+                icnn_bb_config["alpha_min"],
+                icnn_bb_config["alpha_max"],
+                icnn_bb_config["ls_c"],
+                icnn_bb_config["ls_shrink"],
+                icnn_bb_config["ls_max_steps"],
+            )
         ascent_bar = tqdm(
             range(ascent_steps),
             desc="ICNN Ascent",
@@ -1236,16 +1334,109 @@ def train_one_epoch(
                     if p.grad is not None:
                         p.grad.zero_()
                 torch.nn.utils.clip_grad_norm_(icnn.parameters(), max_norm=1.0)
-                opt_icnn.step()
-                for param in icnn.parameters():
-                    if not torch.isfinite(param).all():
-                        warnings.warn(
-                            "Detected non-finite ICNN parameters after update; sanitizing values.",
-                            RuntimeWarning,
+                if icnn_step_rule == "bb-armijo" and bb_state is not None:
+                    params_tensors: List[torch.Tensor] = []
+                    grad_tensors: List[torch.Tensor] = []
+                    for group in opt_icnn.param_groups:
+                        weight_decay = float(group.get("weight_decay", 0.0))
+                        for param in group["params"]:
+                            params_tensors.append(param.detach().clone())
+                            grad_tensor = torch.zeros_like(param)
+                            if param.grad is not None:
+                                grad_tensor = param.grad.detach().clone()
+                            if weight_decay != 0.0:
+                                grad_tensor = grad_tensor + weight_decay * param.detach()
+                            grad_tensors.append(grad_tensor)
+                    if not grad_tensors:
+                        adv_objective_last = adv_objective.detach()
+                        continue
+                    grad_vec = parameters_to_vector(grad_tensors)
+                    params_vec = parameters_to_vector(params_tensors)
+                    grad_norm_sq = float(grad_vec.pow(2).sum().item())
+                    adv_obj_current = float(adv_objective.detach().item())
+                    if (not math.isfinite(grad_norm_sq)) or grad_norm_sq <= 0.0:
+                        bb_state.update_history(params_vec, grad_vec, bb_state.alpha_prev)
+                        adv_objective_last = adv_objective.detach()
+                        continue
+
+                    alpha_candidate = bb_state.propose(params_vec, grad_vec)
+                    params_backup = [param.detach().clone() for param in icnn.parameters()]
+                    accepted = False
+                    adv_objective_candidate: Optional[torch.Tensor] = None
+
+                    for _ in range(bb_state.ls_max_steps):
+                        for group in opt_icnn.param_groups:
+                            group["lr"] = alpha_candidate
+                        opt_icnn.step()
+                        icnn.project_convexity()
+                        adv_objective_candidate, _ = _evaluate_icnn_adv_objective(
+                            icnn,
+                            head,
+                            z_detached,
+                            y,
+                            penalty_lambda,
+                            cosine_cfg,
+                            use_margin_adv,
+                            jacobian_reg_weight,
+                            jacobian_reg_samples,
+                            jacobian_reg_iters,
+                            rng,
                         )
-                        param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
-                icnn.project_convexity()
-                adv_objective_last = adv_objective.detach()
+                        if torch.isfinite(adv_objective_candidate):
+                            lhs = float(adv_objective_candidate.item())
+                            rhs = adv_obj_current + bb_state.ls_c * alpha_candidate * grad_norm_sq
+                            if lhs >= rhs:
+                                accepted = True
+                                break
+                        with torch.no_grad():
+                            for param, saved in zip(icnn.parameters(), params_backup):
+                                param.copy_(saved)
+                        alpha_candidate *= bb_state.ls_shrink
+                        if alpha_candidate < bb_state.alpha_min:
+                            break
+
+                    if not accepted:
+                        alpha_candidate = max(bb_state.alpha_min, min(bb_state.alpha_max, alpha_candidate))
+                        for group in opt_icnn.param_groups:
+                            group["lr"] = alpha_candidate
+                        opt_icnn.step()
+                        icnn.project_convexity()
+                        adv_objective_candidate, _ = _evaluate_icnn_adv_objective(
+                            icnn,
+                            head,
+                            z_detached,
+                            y,
+                            penalty_lambda,
+                            cosine_cfg,
+                            use_margin_adv,
+                            jacobian_reg_weight,
+                            jacobian_reg_samples,
+                            jacobian_reg_iters,
+                            rng,
+                        )
+                    for param in icnn.parameters():
+                        if not torch.isfinite(param).all():
+                            warnings.warn(
+                                "Detected non-finite ICNN parameters after update; sanitizing values.",
+                                RuntimeWarning,
+                            )
+                            param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+                    if adv_objective_candidate is not None and torch.isfinite(adv_objective_candidate):
+                        adv_objective_last = adv_objective_candidate
+                    else:
+                        adv_objective_last = adv_objective.detach()
+                    bb_state.update_history(params_vec, grad_vec, alpha_candidate)
+                else:
+                    opt_icnn.step()
+                    for param in icnn.parameters():
+                        if not torch.isfinite(param).all():
+                            warnings.warn(
+                                "Detected non-finite ICNN parameters after update; sanitizing values.",
+                                RuntimeWarning,
+                            )
+                            param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+                    icnn.project_convexity()
+                    adv_objective_last = adv_objective.detach()
         finally:
             ascent_bar.close()
 
@@ -1502,11 +1693,54 @@ def parse_args():
         help="Step size γ_ω for ICNN adversary parameters.",
     )
     parser.add_argument(
+        "--icnn-step-rule",
+        type=str,
+        choices=["constant", "bb-armijo"],
+        default="constant",
+        help="Adaptive step-size rule for ICNN ascent (constant keeps optimizer LR; bb-armijo uses BB + Armijo).",
+    )
+    parser.add_argument(
+        "--icnn-alpha0",
+        type=float,
+        default=0.0005,
+        help="Initial step size guess for ICNN BB/Armijo rule.",
+    )
+    parser.add_argument(
+        "--icnn-ls-c",
+        type=float,
+        default=0.1,
+        help="Armijo sufficient increase constant for ICNN BB rule.",
+    )
+    parser.add_argument(
+        "--icnn-ls-shrink",
+        type=float,
+        default=0.5,
+        help="Backtracking shrink factor for ICNN Armijo search.",
+    )
+    parser.add_argument(
+        "--icnn-ls-max-steps",
+        type=int,
+        default=10,
+        help="Maximum Armijo backtracking iterations for ICNN BB rule.",
+    )
+    parser.add_argument(
+        "--icnn-alpha-min",
+        type=float,
+        default=1e-6,
+        help="Minimum clamp on ICNN BB step size.",
+    )
+    parser.add_argument(
+        "--icnn-alpha-max",
+        type=float,
+        default=1.0,
+        help="Maximum clamp on ICNN BB step size.",
+    )
+    parser.add_argument(
         "--icnn-optimizer",
         type=str,
-        choices=["adam", "ademamix"],
+        choices=["adam", "ademamix", "sgd"],
         default="ademamix",
-        help="Optimizer used for ICNN weights (adam or ademamix).",
+        help="Optimizer used for ICNN weights (adam, ademamix, or sgd).",
     )
     parser.add_argument("--icnn-beta1", type=float, default=0.9)
     parser.add_argument("--icnn-beta2", type=float, default=0.999)
@@ -1816,7 +2050,6 @@ def main():
         "lambda": float(args.cosine_lambda),
         "quadratic_weight": float(args.cosine_quadratic_weight),
         "eps": float(args.cosine_eps),
-        "quadratic_scale": float(latent_dim),
     }
     if cosine_cfg["enabled"]:
         print(
@@ -1866,13 +2099,35 @@ def main():
             continue
         decay = 0.0 if ("weight_param" in name or "bias" in name) else 1e-4
         icnn_param_groups.append({"params": [param], "weight_decay": decay})
-    if args.icnn_optimizer == "adam":
+    use_bb_armijo = args.icnn_step_rule == "bb-armijo"
+    icnn_optimizer_name = args.icnn_optimizer
+    if use_bb_armijo and icnn_optimizer_name != "sgd":
+        print(
+            "ICNN step rule 'bb-armijo' requires SGD-style updates; overriding optimizer to SGD."
+        )
+        icnn_optimizer_name = "sgd"
+    if use_bb_armijo and args.icnn_alpha0 <= 0.0:
+        args.icnn_alpha0 = max(args.lr_omega, 1e-6)
+        print(
+            f"Adjusted icnn_alpha0 to {args.icnn_alpha0:.6f} to ensure positive initial step size."
+        )
+    icnn_bb_config = None
+    if use_bb_armijo:
+        icnn_bb_config = {
+            "alpha0": float(args.icnn_alpha0),
+            "alpha_min": float(args.icnn_alpha_min),
+            "alpha_max": float(args.icnn_alpha_max),
+            "ls_c": float(args.icnn_ls_c),
+            "ls_shrink": float(args.icnn_ls_shrink),
+            "ls_max_steps": int(args.icnn_ls_max_steps),
+        }
+    if icnn_optimizer_name == "adam":
         opt_icnn = optim.Adam(
             icnn_param_groups,
             lr=args.lr_omega,
             betas=(args.icnn_beta1, args.icnn_beta2),
         )
-    else:
+    elif icnn_optimizer_name == "ademamix":
         ademamix_kwargs = {
             "lr": args.lr_omega,
             "betas": (args.icnn_beta1, args.icnn_beta2, args.ademamix_beta3),
@@ -1881,7 +2136,14 @@ def main():
             "alpha_warmup": args.ademamix_alpha_warmup,
         }
         opt_icnn = AdEMAMix(icnn_param_groups, **ademamix_kwargs)
-    print(f"ICNN optimizer: {args.icnn_optimizer}")
+    else:
+        sgd_lr = args.icnn_alpha0 if use_bb_armijo else args.lr_omega
+        opt_icnn = optim.SGD(
+            icnn_param_groups,
+            lr=sgd_lr,
+            momentum=0.0,
+        )
+    print(f"ICNN optimizer: {icnn_optimizer_name}")
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
 
     
@@ -1981,6 +2243,8 @@ def main():
             jacobian_reg_iters=args.jacobian_reg_iters,
             rng=global_rng,
             use_margin_adv=args.use_margin_loss,
+            icnn_step_rule=args.icnn_step_rule,
+            icnn_bb_config=icnn_bb_config,
         )
 
         test_loss, test_acc = evaluate(phi, head, testloader, device)
