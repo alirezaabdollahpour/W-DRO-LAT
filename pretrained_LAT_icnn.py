@@ -1098,6 +1098,7 @@ def train_one_epoch(
     jacobian_reg_samples: int = 1,
     jacobian_reg_iters: int = 1,
     rng: Optional[torch.Generator] = None,
+    use_margin_adv: bool = True,
 ) -> Tuple[float, float, float, float, float]:
     phi.train(not head_only)
     head.train()
@@ -1159,7 +1160,17 @@ def train_one_epoch(
                     )
                     continue
                 logits_adv = head(z_adv_ascent)
-                ce_adv = F.cross_entropy(logits_adv, y, reduction="mean")
+                if use_margin_adv:
+                    logits_correct = logits_adv.gather(1, y.unsqueeze(1)).squeeze(1)
+                    margins = logits_adv - logits_correct.unsqueeze(1)
+                    num_classes = logits_adv.size(1)
+                    correct_mask = F.one_hot(y, num_classes=num_classes).bool()
+                    margins = margins.masked_fill(correct_mask, float("-inf"))
+                    adv_primary = torch.logsumexp(margins, dim=1).mean()
+                    metric_key = "margin"
+                else:
+                    adv_primary = F.cross_entropy(logits_adv, y, reduction="mean")
+                    metric_key = "ce"
                 per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
                 penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
                     z_detached,
@@ -1171,7 +1182,7 @@ def train_one_epoch(
                     logits_adv=logits_adv,
                 )
                 sv_estimate: Optional[torch.Tensor] = None
-                sv_penalty = torch.zeros((), device=ce_adv.device, dtype=ce_adv.dtype)
+                sv_penalty = torch.zeros((), device=adv_primary.device, dtype=adv_primary.dtype)
                 if jacobian_reg_weight > 0.0:
                     sv_estimate = estimate_local_jacobian_sv(
                         icnn,
@@ -1185,7 +1196,7 @@ def train_one_epoch(
                     else:
                         sv_estimate = None
                 if (
-                    not torch.isfinite(ce_adv)
+                    not torch.isfinite(adv_primary)
                     or not torch.isfinite(penalty_term)
                     or not torch.isfinite(penalty_monitor)
                     or not torch.isfinite(sv_penalty)
@@ -1195,12 +1206,12 @@ def train_one_epoch(
                         RuntimeWarning,
                     )
                     continue
-                adv_objective = ce_adv - penalty_term - sv_penalty
+                adv_objective = adv_primary - penalty_term - sv_penalty
                 if sv_estimate is not None:
                     sv_estimate_last = sv_estimate.detach()
-                if torch.isfinite(ce_adv) and torch.isfinite(penalty_term):
+                if torch.isfinite(adv_primary) and torch.isfinite(penalty_term):
                     bar_postfix: Dict[str, str] = {
-                        "ce": f"{float(ce_adv.item()):.4f}",
+                        metric_key: f"{float(adv_primary.item()):.4f}",
                         "pen": f"{float(penalty_term.item()):.4f}",
                     }
                     if sv_estimate is not None and torch.isfinite(sv_estimate):
@@ -1468,6 +1479,11 @@ def parse_args():
         type=float,
         default=5.0,
         help="Fixed λ multiplying the quadratic transport penalty.",
+    )
+    parser.add_argument(
+        "--use-margin-loss",
+        action="store_true",
+        help="Use the log-sum-exp margin objective for the ICNN adversary (non-zero-sum view).",
     )
     parser.add_argument("--icnn-hidden", type=_parse_hidden_units, nargs="+", default=[512, 256])
     parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="softplus")
@@ -1866,12 +1882,8 @@ def main():
         }
         opt_icnn = AdEMAMix(icnn_param_groups, **ademamix_kwargs)
     print(f"ICNN optimizer: {args.icnn_optimizer}")
-    # lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(
-        opt_theta,
-        milestones=[total_epochs // 2, (3 * total_epochs) // 4],
-        gamma=0.1,
-    )
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
+
     
     
 
@@ -1968,6 +1980,7 @@ def main():
             jacobian_reg_samples=args.jacobian_reg_samples,
             jacobian_reg_iters=args.jacobian_reg_iters,
             rng=global_rng,
+            use_margin_adv=args.use_margin_loss,
         )
 
         test_loss, test_acc = evaluate(phi, head, testloader, device)
