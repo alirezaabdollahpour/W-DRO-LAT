@@ -886,7 +886,9 @@ def main():
                     bs=args.autoattack_bs,
                 )
                 with torch.no_grad():
-                    logits_adv = pixel_model(x_adv.to(device))
+                    x_adv = x_adv.to(device=device, dtype=torch.float32)
+                    x_adv_norm = to_normalized(x_adv)
+                    logits_adv = base(x_adv_norm)
                     preds_adv = logits_adv.argmax(dim=1)
                     acc_adv = (preds_adv == y_c10_device).float().mean().item() * 100.0
                 print(f"  CIFAR-10 AutoAttack: {acc_adv:.2f}% robust accuracy ({num_samples} samples)")
