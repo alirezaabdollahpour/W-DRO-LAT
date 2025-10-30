@@ -224,11 +224,11 @@ def save_transport_delta_plot(
 
 
 def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Return per-sample squared difference sum between tensors a and b."""
+    """Return mean squared difference per sample between tensors a and b."""
     if a.shape != b.shape:
-        raise ValueError("Tensors must have identical shapes to compute squared difference.")
+        raise ValueError("Tensors must have identical shapes to compute mean square difference.")
     diff = (a - b).reshape(a.size(0), -1)
-    return diff.pow(2).sum(dim=1)
+    return diff.pow(2).mean(dim=1)
 
 
 def _extract_penalty_features(
@@ -637,10 +637,16 @@ def _parse_hidden_units(token: str) -> int:
         raise argparse.ArgumentTypeError(f"Invalid integer value: {token!r}") from exc
 
 
+# def _clamp_penalty_lambda(value: float) -> float:
+#     if not math.isfinite(value):
+#         return PENALTY_LAMBDA_MIN
+#     return float(min(max(value, PENALTY_LAMBDA_MIN), PENALTY_LAMBDA_MAX))
+
 def _clamp_penalty_lambda(value: float) -> float:
     if not math.isfinite(value):
-        return PENALTY_LAMBDA_MIN
-    return float(min(max(value, PENALTY_LAMBDA_MIN), PENALTY_LAMBDA_MAX))
+        return 0.0  # or raise an error
+    return float(value)
+
 
 
 def _reduce_latents_for_plot(
@@ -1243,7 +1249,7 @@ def train_one_epoch(
         ascent_bar = tqdm(
             range(ascent_steps),
             desc="ICNN Ascent",
-            leave=False,
+            leave=True,
             dynamic_ncols=True,
         )
         try:
@@ -1310,7 +1316,9 @@ def train_one_epoch(
                 if torch.isfinite(adv_primary) and torch.isfinite(penalty_term):
                     bar_postfix: Dict[str, str] = {
                         metric_key: f"{float(adv_primary.item()):.4f}",
+                        "adv_primary": f"{float(adv_primary.item()):.8f}",
                         "pen": f"{float(penalty_term.item()):.4f}",
+                        "adv_obj": f"{float(adv_objective.item()):.9f}",
                     }
                     if sv_estimate is not None and torch.isfinite(sv_estimate):
                         bar_postfix["jac_sv"] = f"{float(sv_estimate.item()):.4f}"
@@ -1541,7 +1549,7 @@ def evaluate_under_icnn(
     total_samples = 0
     total_penalty = 0.0
 
-    progress = tqdm(loader, desc="ICNN Eval", leave=False)
+    progress = tqdm(loader, desc="ICNN Eval", leave=True)
     for x, y in progress:
         x, y = _to_device((x, y), device)
         z = phi(x)
