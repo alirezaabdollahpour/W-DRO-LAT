@@ -33,6 +33,9 @@ import os
 import tarfile
 import json
 import argparse
+import inspect
+from functools import partial
+import math
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -41,8 +44,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.autograd import grad
 from tqdm.auto import tqdm
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from model import ResNet18 as ResNet18Plain  # alias kept consistent with your code
 from model import PreActResNet18
 from pretrained_LAT import build_split_resnet18
@@ -82,6 +86,8 @@ DEFAULT_CIFAR10C_CORRUPTIONS = [
     "saturate",
 ]
 
+DEFAULT_AUTOATTACK_ITERS = 100
+
 
 class PhiHeadWrapper(nn.Module):
     def __init__(self, phi: nn.Module, head: nn.Module):
@@ -102,6 +108,244 @@ class PixelModelWrapper(nn.Module):
 
     def forward(self, x_pix: torch.Tensor) -> torch.Tensor:
         return self.base(to_normalized(x_pix))
+
+
+class AdvLibProgressLogger:
+    """Hybrid logger that mirrors the VisdomLogger API while driving a tqdm progress bar."""
+
+    def __init__(
+        self,
+        attack_name: str,
+        total_steps: int,
+        use_tqdm: bool = True,
+        visdom_logger: Optional["VisdomLogger"] = None,
+    ) -> None:
+        self.attack_name = attack_name
+        self.total_steps = max(int(total_steps), 1)
+        self._visdom = visdom_logger
+        self._latest_step = -1
+        self._metrics: Dict[str, float] = {}
+        self._bar = None
+        if use_tqdm:
+            self._bar = tqdm(
+                total=self.total_steps,
+                desc=attack_name,
+                leave=False,
+                dynamic_ncols=True,
+            )
+
+    @staticmethod
+    def _to_float(value: object) -> float:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return float("nan")
+            value = value.detach().float()
+            return float(value.mean().item())
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except Exception:
+            return float("nan")
+
+    def _advance_bar(self, step: int) -> None:
+        if self._bar is None:
+            return
+        target = min(self.total_steps, int(step) + 1)
+        if target > self._bar.n:
+            self._bar.n = target
+
+    def accumulate_line(self, names, step, values, title: str = "", **kwargs) -> None:
+        if isinstance(names, str):
+            names_seq = [names]
+        else:
+            names_seq = list(names)
+        if isinstance(values, (list, tuple)):
+            values_seq = list(values)
+        else:
+            values_seq = [values]
+        for key, val in zip(names_seq, values_seq):
+            self._metrics[str(key)] = self._to_float(val)
+        self._latest_step = max(self._latest_step, int(step))
+        self._advance_bar(step)
+        if self._visdom is not None:
+            self._visdom.accumulate_line(names, step, values, title=title or "", **kwargs)
+
+    def update_lines(self) -> None:
+        if self._bar is not None:
+            if self._metrics:
+                # show up to three metrics to keep the bar readable
+                first_items = list(self._metrics.items())[:3]
+                postfix = {k: f"{v:.4f}" if math.isfinite(v) else f"{v:.2e}" for k, v in first_items}
+                self._bar.set_postfix(postfix, refresh=False)
+            self._bar.refresh()
+        if self._visdom is not None:
+            self._visdom.update_lines()
+
+    def manual_step(self, step: int, metrics: Optional[Dict[str, float]] = None) -> None:
+        if metrics:
+            for name, value in metrics.items():
+                self.accumulate_line(name, step, value)
+        else:
+            self._latest_step = max(self._latest_step, int(step))
+            self._advance_bar(step)
+        self.update_lines()
+
+    def get_metrics(self) -> Dict[str, float]:
+        return dict(self._metrics)
+
+    def close(self) -> None:
+        if self._bar is not None:
+            if self._latest_step >= 0:
+                self._advance_bar(self._latest_step)
+                self._bar.refresh()
+            self._bar.close()
+            self._bar = None
+        if self._visdom is not None:
+            try:
+                self._visdom.update_lines()
+            except Exception:
+                pass
+        self._metrics.clear()
+        self._latest_step = -1
+
+
+def run_fmn_with_progress(
+    model: nn.Module,
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    norm: float,
+    steps: int,
+    *,
+    targeted: bool = False,
+    alpha_init: float = 1.0,
+    alpha_final: Optional[float] = None,
+    gamma_init: float = 0.05,
+    gamma_final: float = 0.001,
+    starting_points: Optional[torch.Tensor] = None,
+    binary_search_steps: int = 10,
+    progress_logger: Optional[AdvLibProgressLogger] = None,
+) -> torch.Tensor:
+    """FMN attack with a lightweight tqdm/Visdom progress hook."""
+    from adv_lib.attacks.fast_minimum_norm import (
+        l0_mid_points,
+        l0_projection_,
+        l1_mid_points,
+        l1_projection_,
+        l2_mid_points,
+        l2_projection_,
+        linf_mid_points,
+        linf_projection_,
+    )
+    from adv_lib.utils.losses import difference_of_logits
+
+    _dual_projection_mid_points = {
+        0: (None, l0_projection_, l0_mid_points),
+        1: (float("inf"), l1_projection_, l1_mid_points),
+        2: (2, l2_projection_, l2_mid_points),
+        float("inf"): (1, linf_projection_, linf_mid_points),
+    }
+    if inputs.min() < 0 or inputs.max() > 1:
+        raise ValueError("Input values should be in the [0, 1] range.")
+    device = inputs.device
+    batch_size = inputs.size(0)
+    batch_view = lambda tensor: tensor.view(batch_size, *[1] * (inputs.ndim - 1))
+    dual, projection, mid_point = _dual_projection_mid_points[norm]
+    alpha_final = alpha_init / 100 if alpha_final is None else alpha_final
+    multiplier = 1 if targeted else -1
+
+    if starting_points is not None:
+        start_preds = model(starting_points).argmax(dim=1)
+        is_adv = (start_preds == labels) if targeted else (start_preds != labels)
+        if not is_adv.all():
+            raise ValueError("Starting points are not all adversarial.")
+        lower_bound = torch.zeros(batch_size, device=device)
+        upper_bound = torch.ones(batch_size, device=device)
+        for _ in range(binary_search_steps):
+            eps = (lower_bound + upper_bound) / 2
+            mid_points = mid_point(x0=inputs, x1=starting_points, ε=eps)
+            pred_labels = model(mid_points).argmax(dim=1)
+            is_adv = (pred_labels == labels) if targeted else (pred_labels != labels)
+            lower_bound = torch.where(is_adv, lower_bound, eps)
+            upper_bound = torch.where(is_adv, eps, upper_bound)
+
+        delta = mid_point(x0=inputs, x1=starting_points, ε=upper_bound).sub_(inputs)
+    else:
+        delta = torch.zeros_like(inputs)
+    delta.requires_grad_(True)
+
+    if norm == 0:
+        eps = torch.ones(batch_size, device=device) if starting_points is None else delta.flatten(1).norm(p=0, dim=1)
+    else:
+        eps = torch.full((batch_size,), float("inf"), device=device)
+
+    worst_norm = torch.maximum(inputs, 1 - inputs).flatten(1).norm(p=norm, dim=1)
+    best_norm = worst_norm.clone()
+    best_adv = inputs.clone()
+    adv_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    logger = progress_logger
+
+    for i in range(steps):
+        cosine = (1 + math.cos(math.pi * i / steps)) / 2
+        alpha = alpha_final + (alpha_init - alpha_final) * cosine
+        gamma = gamma_final + (gamma_init - gamma_final) * cosine
+
+        delta_norm = delta.data.flatten(1).norm(p=norm, dim=1)
+        adv_inputs = inputs + delta
+        logits = model(adv_inputs)
+        pred_labels = logits.argmax(dim=1)
+
+        if i == 0:
+            labels_infhot = torch.zeros_like(logits).scatter_(1, labels.unsqueeze(1), float("inf"))
+            logit_diff_func = partial(difference_of_logits, labels=labels, labels_infhot=labels_infhot)
+
+        logit_diffs = logit_diff_func(logits=logits)
+        loss = multiplier * logit_diffs
+        delta_grad = grad(loss.sum(), delta, only_inputs=True)[0]
+
+        is_adv = (pred_labels == labels) if targeted else (pred_labels != labels)
+        is_smaller = delta_norm < best_norm
+        is_both = is_adv & is_smaller
+        adv_found.logical_or_(is_adv)
+        best_norm = torch.where(is_both, delta_norm, best_norm)
+        best_adv = torch.where(batch_view(is_both), adv_inputs.detach(), best_adv)
+
+        if norm == 0:
+            eps = torch.where(
+                is_adv,
+                torch.minimum(torch.minimum(eps - 1, (eps * (1 - gamma)).floor_()), best_norm),
+                torch.maximum(eps + 1, (eps * (1 + gamma)).floor_()),
+            )
+            eps.clamp_(min=0)
+        else:
+            distance_to_boundary = loss.detach().abs_().div_(delta_grad.flatten(1).norm(p=dual, dim=1).clamp_(min=1e-12))
+            eps = torch.where(
+                is_adv,
+                torch.minimum(eps * (1 - gamma), best_norm),
+                torch.where(adv_found, eps * (1 + gamma), delta_norm + distance_to_boundary),
+            )
+
+        eps = torch.minimum(eps, worst_norm)
+        grad_l2_norms = delta_grad.flatten(1).norm(p=2, dim=1).clamp_(min=1e-12)
+        delta.data.addcdiv_(delta_grad, batch_view(grad_l2_norms), value=alpha)
+        projection(δ=delta.data, ε=eps)
+        delta.data.add_(inputs).clamp_(min=0, max=1).sub_(inputs)
+
+        if logger is not None:
+            metrics = {
+                "success": float(adv_found.float().mean().item()),
+                "ε": float(eps.mean().item()),
+                "best_norm": float(best_norm.masked_select(adv_found).mean().item())
+                if adv_found.any()
+                else float("inf"),
+            }
+            logger.manual_step(i, metrics)
+
+    if logger is not None:
+        logger.update_lines()
+
+    return best_adv
 
 # -----------------------------
 # Globals & utilities
@@ -500,6 +744,33 @@ def parse_args():
     p.add_argument("--autoattack-restarts", type=int, default=None,
                    help="Override number of random restarts for APGD-based AutoAttack components.")
 
+    # adv_lib evaluation
+    p.add_argument("--advlib", action="store_true", help="Enable adv_lib attack evaluation (FMN/PD-PGD).")
+    p.add_argument(
+        "--advlib-only",
+        action="store_true",
+        help="Run only adv_lib attacks (skip clean/PGD/CIFAR-10 variants).",
+    )
+    p.add_argument(
+        "--advlib-attacks",
+        type=str,
+        nargs="+",
+        choices=["fmn", "pdpgd"],
+        default=["fmn", "pdpgd"],
+        help="Subset of adv_lib attacks to run (default: fmn and pdpgd).",
+    )
+    p.add_argument(
+        "--advlib-visdom",
+        action="store_true",
+        help="Stream adv_lib attack metrics to a Visdom server (requires visdom).",
+    )
+    p.add_argument(
+        "--advlib-visdom-port",
+        type=int,
+        default=8097,
+        help="Visdom server port used for adv_lib monitoring callbacks.",
+    )
+
     # Input-space PGD config (pixel units)
     p.add_argument("--inp-p", type=str, default="inf", choices=["2", "inf"],
                    help="Norm for input-space PGD evaluation")
@@ -520,18 +791,25 @@ def main():
     device = get_device()
     print("Using device:", device)
 
+    if args.autoattack_only and args.advlib_only:
+        raise ValueError("Specify at most one of --autoattack-only or --advlib-only.")
     if args.autoattack_only:
         args.autoattack = True
+    if args.advlib_only:
+        args.advlib = True
+
     autoattack_requested = bool(args.autoattack)
-    perform_standard_eval = not args.autoattack_only
+    advlib_requested = bool(args.advlib)
+    perform_standard_eval = not (args.autoattack_only or args.advlib_only)
 
     if autoattack_requested and args.autoattack_bs <= 0:
         raise ValueError("--autoattack-bs must be positive.")
     if autoattack_requested and args.autoattack_eps <= 0:
         raise ValueError("--autoattack-eps must be positive.")
-    autoattack_max_examples = None
-    if autoattack_requested and args.autoattack_max_examples > 0:
-        autoattack_max_examples = int(args.autoattack_max_examples)
+    adv_eval_max_examples = None
+    if args.autoattack_max_examples > 0:
+        adv_eval_max_examples = int(args.autoattack_max_examples)
+    autoattack_max_examples = adv_eval_max_examples if autoattack_requested else None
     autoattack_attacks = None
     if autoattack_requested:
         if args.autoattack_attacks is not None:
@@ -542,6 +820,23 @@ def main():
         elif args.autoattack_attacks is not None:
             print("[autoattack] Ignoring --autoattack-attacks because version is not 'custom'.")
             autoattack_attacks = None
+
+    advlib_attacks: List[str] = []
+    advlib_norm = None
+    advlib_steps = args.autoattack_iters if args.autoattack_iters is not None else DEFAULT_AUTOATTACK_ITERS
+    if advlib_requested:
+        advlib_attacks = list(dict.fromkeys(args.advlib_attacks))
+        if len(advlib_attacks) == 0:
+            raise ValueError("At least one adv_lib attack must be selected.")
+        norm_key = args.autoattack_norm.lower()
+        if norm_key == "linf":
+            advlib_norm = float("inf")
+        elif norm_key == "l2":
+            advlib_norm = 2.0
+        elif norm_key == "l1":
+            advlib_norm = 1.0
+        else:
+            raise ValueError(f"Unsupported norm for adv_lib attacks: {args.autoattack_norm}")
 
     # 1) Load backbone from your WRM-LAT checkpoint
     base, meta = load_backbone_from_ckpt(args.ckpt, device)
@@ -831,7 +1126,13 @@ def main():
         else:
             print("\nInput-space PGD: disabled (use --inp-steps > 0 to enable)")
     else:
-        print("\nSkipping clean/PGD evaluations (--autoattack-only).")
+        if args.autoattack_only:
+            skip_reason = "--autoattack-only"
+        elif args.advlib_only:
+            skip_reason = "--advlib-only"
+        else:
+            skip_reason = "requested configuration"
+        print(f"\nSkipping clean/PGD evaluations ({skip_reason}).")
 
     if autoattack_requested:
         print("\nEvaluating AutoAttack robustness...")
@@ -841,6 +1142,10 @@ def main():
             print(f"  AutoAttack unavailable: {err}")
             results["scores"]["autoattack"] = {"status": "unavailable", "error": str(err)}
         else:
+            try:
+                from adv_lib.utils.visdom_logger import VisdomLogger as AdvLibVisdomLogger
+            except Exception:
+                AdvLibVisdomLogger = None  # type: ignore[assignment]
             pixel_model = PixelModelWrapper(base)
             pixel_model.eval()
             x_c10_pix, y_c10 = collect_pixels_and_labels(
@@ -908,6 +1213,165 @@ def main():
                     "iters": args.autoattack_iters,
                     "restarts": args.autoattack_restarts,
                 }
+
+    if advlib_requested:
+        print("\nEvaluating adv_lib attacks...")
+        try:
+            from adv_lib.attacks import pdpgd as advlib_pdpgd
+        except ImportError as err:
+            print(f"  adv_lib unavailable: {err}")
+            results["scores"]["adv_lib"] = {"status": "unavailable", "error": str(err)}
+        else:
+            try:
+                from adv_lib.utils.visdom_logger import VisdomLogger as AdvLibVisdomLogger  # type: ignore
+            except Exception:
+                AdvLibVisdomLogger = None  # type: ignore[assignment]
+            pixel_model = PixelModelWrapper(base)
+            pixel_model.eval()
+            x_c10_pix_advlib, y_c10_advlib = collect_pixels_and_labels(
+                c10_loader,
+                max_examples=adv_eval_max_examples,
+                desc="adv_lib CIFAR-10",
+            )
+            num_samples = int(y_c10_advlib.numel())
+            if num_samples == 0:
+                print("  adv_lib: no samples collected.")
+                results["scores"]["adv_lib"] = {"status": "empty"}
+            else:
+                x_c10_pix_advlib = x_c10_pix_advlib.to(device=device, dtype=torch.float32)
+                x_c10_pix_advlib = x_c10_pix_advlib.clamp_(0.0, 1.0)
+                y_c10_device = y_c10_advlib.to(device)
+                attack_summaries = {}
+                det_enabled = (
+                    torch.are_deterministic_algorithms_enabled()
+                    if hasattr(torch, "are_deterministic_algorithms_enabled")
+                    else False
+                )
+                set_det = getattr(torch, "use_deterministic_algorithms", None)
+                visdom_enabled = bool(args.advlib_visdom and AdvLibVisdomLogger is not None)
+                visdom_warned = False
+
+                def make_visdom_logger():
+                    nonlocal visdom_enabled, visdom_warned
+                    if not visdom_enabled or AdvLibVisdomLogger is None:
+                        return None
+                    try:
+                        return AdvLibVisdomLogger(port=args.advlib_visdom_port)
+                    except Exception as vis_err:  # pragma: no cover - visualization optional
+                        if not visdom_warned:
+                            print(
+                                f"  adv_lib: Visdom logger unavailable ({vis_err}); disabling Visdom logging."
+                            )
+                            visdom_warned = True
+                        visdom_enabled = False
+                        return None
+
+                attack_progress = tqdm(
+                    advlib_attacks,
+                    desc="adv_lib attacks",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+                for attack_id in attack_progress:
+                    attack_inputs = x_c10_pix_advlib.clone()
+                    vis_logger = make_visdom_logger()
+                    progress_logger = AdvLibProgressLogger(
+                        f"adv_lib {attack_id}",
+                        total_steps=advlib_steps,
+                        visdom_logger=vis_logger,
+                    )
+                    adv_samples = None
+                    metrics_snapshot: Dict[str, float] = {}
+                    try:
+                        if det_enabled and set_det is not None:
+                            set_det(False)
+                        if attack_id == "fmn":
+                            adv_samples = run_fmn_with_progress(
+                                model=pixel_model,
+                                inputs=attack_inputs,
+                                labels=y_c10_device,
+                                norm=advlib_norm,
+                                steps=advlib_steps,
+                                progress_logger=progress_logger,
+                            )
+                        elif attack_id == "pdpgd":
+                            attack_kwargs = {
+                                "model": pixel_model,
+                                "inputs": attack_inputs,
+                                "labels": y_c10_device,
+                                "norm": advlib_norm,
+                                "num_steps": advlib_steps,
+                            }
+                            if "callback" in inspect.signature(advlib_pdpgd).parameters:
+                                attack_kwargs["callback"] = progress_logger
+                            adv_samples = advlib_pdpgd(**attack_kwargs)
+                        else:
+                            raise ValueError(f"Unsupported adv_lib attack '{attack_id}'.")
+                        metrics_snapshot = progress_logger.get_metrics()
+                    except Exception as err:
+                        metrics_snapshot = progress_logger.get_metrics()
+                        print(f"  adv_lib {attack_id}: error -> {err}")
+                        attack_summaries[attack_id] = {"status": "error", "error": str(err)}
+                        attack_progress.set_postfix({"attack": attack_id, "status": "error"})
+                        continue
+                    finally:
+                        if det_enabled and set_det is not None:
+                            set_det(True)
+                        progress_logger.close()
+                    if adv_samples is None:
+                        continue
+                    adv_samples = adv_samples.to(device=device, dtype=torch.float32)
+                    adv_samples = adv_samples.clamp_(0.0, 1.0)
+                    with torch.no_grad():
+                        logits_adv = base(to_normalized(adv_samples))
+                        preds_adv = logits_adv.argmax(dim=1)
+                        acc_adv = (preds_adv == y_c10_device).float().mean().item() * 100.0
+                    success_ratio = metrics_snapshot.get("success")
+                    if success_ratio is not None and math.isfinite(success_ratio):
+                        print(
+                            f"  adv_lib {attack_id}: {acc_adv:.2f}% robust accuracy "
+                            f"({num_samples} samples) | success {success_ratio*100:.2f}%"
+                        )
+                    else:
+                        print(f"  adv_lib {attack_id}: {acc_adv:.2f}% robust accuracy ({num_samples} samples)")
+                    postfix = {"attack": attack_id, "acc": f"{acc_adv:.2f}"}
+                    if success_ratio is not None and math.isfinite(success_ratio):
+                        postfix["success"] = f"{success_ratio:.2f}"
+                    attack_progress.set_postfix(postfix)
+                    summary = {
+                        "status": "ok",
+                        "acc": round(acc_adv, 2),
+                        "norm": args.autoattack_norm,
+                        "iters": advlib_steps,
+                        "num_examples": num_samples,
+                    }
+                    metric_key_map = {
+                        "success": "success",
+                        "ε": "eps",
+                        "best_norm": "best_norm",
+                    }
+                    for metric_key, summary_key in metric_key_map.items():
+                        value = metrics_snapshot.get(metric_key)
+                        if value is None or not math.isfinite(value):
+                            continue
+                        summary[summary_key] = round(float(value), 6)
+                    attack_summaries[attack_id] = summary
+                attack_progress.close()
+                if not attack_summaries:
+                    results["scores"]["adv_lib"] = {"status": "skipped"}
+                else:
+                    overall_status = (
+                        "ok"
+                        if any(v.get("status") == "ok" for v in attack_summaries.values())
+                        else "error"
+                    )
+                    results["scores"]["adv_lib"] = {
+                        "status": overall_status,
+                        "attacks": attack_summaries,
+                        "norm": args.autoattack_norm,
+                        "iters": advlib_steps,
+                        "max_examples": adv_eval_max_examples,
+                    }
 
     # 5) Save JSON
     save_path = parameterized_filename(
