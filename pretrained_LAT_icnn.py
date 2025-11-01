@@ -1172,6 +1172,7 @@ def _evaluate_icnn_adv_objective(
     return adv_objective.detach(), per_sample_mse.detach()
 
 
+
 def train_one_epoch(
     phi: nn.Module,
     head: nn.Module,
@@ -1229,252 +1230,244 @@ def train_one_epoch(
                 total_samples += batch_size
             continue
 
-        # --- ICNN adversary update ---
+        if method not in {"icnn", "icnn_pretrain", "adv_finetune"}:
+            raise ValueError(f"Unsupported training method: {method}")
+
+        run_icnn_ascent = method != "adv_finetune"
+        skip_model_update = method == "icnn_pretrain"
+
         opt_theta.zero_grad(set_to_none=True)
         z = phi(x)
         z_detached = z.detach()
         adv_objective_last: Optional[torch.Tensor] = None
         penalty_monitor = torch.zeros((), device=z_detached.device, dtype=z_detached.dtype)
         sv_estimate_last: Optional[torch.Tensor] = None
-        ascent_steps = max(1, icnn_ascent_steps)
-        bb_state: Optional[BBArmijoState] = None
-        if icnn_step_rule == "bb-armijo" and icnn_bb_config is not None:
-            bb_state = BBArmijoState(
-                icnn_bb_config["alpha0"],
-                icnn_bb_config["alpha_min"],
-                icnn_bb_config["alpha_max"],
-                icnn_bb_config["ls_c"],
-                icnn_bb_config["ls_shrink"],
-                icnn_bb_config["ls_max_steps"],
+
+        if run_icnn_ascent:
+            ascent_steps = max(1, icnn_ascent_steps)
+            bb_state: Optional[BBArmijoState] = None
+            if icnn_step_rule == "bb-armijo" and icnn_bb_config is not None:
+                bb_state = BBArmijoState(
+                    icnn_bb_config["alpha0"],
+                    icnn_bb_config["alpha_min"],
+                    icnn_bb_config["alpha_max"],
+                    icnn_bb_config["ls_c"],
+                    icnn_bb_config["ls_shrink"],
+                    icnn_bb_config["ls_max_steps"],
+                )
+            ascent_bar = tqdm(
+                range(ascent_steps),
+                desc="ICNN Ascent",
+                leave=True,
+                dynamic_ncols=True,
             )
-        ascent_bar = tqdm(
-            range(ascent_steps),
-            desc="ICNN Ascent",
-            leave=True,
-            dynamic_ncols=True,
-        )
-        try:
-            for ascent_step in ascent_bar:
-                opt_icnn.zero_grad(set_to_none=True)
-                z_adv_ascent, _ = adversarial_pushforward(icnn, z_detached, detach_for_model=False)
-                if not torch.isfinite(z_adv_ascent).all():
-                    warnings.warn(
-                        "Encountered non-finite values in adversarial latents during ascent; "
-                        "skipping this ascent step.",
-                        RuntimeWarning,
-                    )
-                    continue
-                logits_adv = head(z_adv_ascent)
-                if use_redlr_loss:
-                    num_classes = logits_adv.size(1)
-                    if num_classes < 3:
-                        raise RuntimeError(
-                            "ReDLR loss requires at least three classes; received logits with "
-                            f"{num_classes} classes."
-                        )
-                    batch_indices = torch.arange(
-                        logits_adv.size(0), device=logits_adv.device, dtype=torch.long
-                    )
-                    logits_correct = logits_adv[batch_indices, y]
-                    logits_sorted, indices = logits_adv.sort(dim=1, descending=True)
-                    redlr = torch.zeros_like(logits_correct)
-                    is_correct = indices[:, 0] == y
-                    if is_correct.any():
-                        numer = logits_correct[is_correct] - logits_sorted[is_correct, 1]
-                        denom = logits_sorted[is_correct, 0] - logits_sorted[is_correct, 2]
-                        redlr[is_correct] = -numer / denom
-                    adv_primary = redlr.mean()
-                    metric_key = "redlr"
-                elif use_margin_adv:
-                    logits_correct = logits_adv.gather(1, y.unsqueeze(1)).squeeze(1)
-                    margins = logits_adv - logits_correct.unsqueeze(1)
-                    num_classes = logits_adv.size(1)
-                    correct_mask = F.one_hot(y, num_classes=num_classes).bool()
-                    margins = margins.masked_fill(correct_mask, float("-inf"))
-                    adv_primary = torch.logsumexp(margins, dim=1).mean()
-                    metric_key = "margin"
-                else:
-                    adv_primary = F.cross_entropy(logits_adv, y, reduction="mean")
-                    metric_key = "ce"
-                per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
-                penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
-                    z_detached,
-                    z_adv_ascent,
-                    head,
-                    penalty_lambda,
-                    per_sample_mse,
-                    cosine_cfg,
-                    logits_adv=logits_adv,
-                )
-                sv_estimate: Optional[torch.Tensor] = None
-                sv_penalty = torch.zeros((), device=adv_primary.device, dtype=adv_primary.dtype)
-                if jacobian_reg_weight > 0.0:
-                    sv_estimate = estimate_local_jacobian_sv(
-                        icnn,
-                        z_detached,
-                        num_samples=jacobian_reg_samples,
-                        power_iters=jacobian_reg_iters,
-                        rng=rng,
-                    )
-                    if sv_estimate is not None and torch.isfinite(sv_estimate):
-                        sv_penalty = jacobian_reg_weight * sv_estimate.pow(2)
-                    else:
-                        sv_estimate = None
-                if (
-                    not torch.isfinite(adv_primary)
-                    or not torch.isfinite(penalty_term)
-                    or not torch.isfinite(penalty_monitor)
-                    or not torch.isfinite(sv_penalty)
-                ):
-                    warnings.warn(
-                        "Non-finite adversarial loss components detected; skipping ascent step.",
-                        RuntimeWarning,
-                    )
-                    continue
-                adv_objective = adv_primary - penalty_term - sv_penalty
-                if sv_estimate is not None:
-                    sv_estimate_last = sv_estimate.detach()
-                if torch.isfinite(adv_primary) and torch.isfinite(penalty_term):
-                    bar_postfix: Dict[str, str] = {
-                        metric_key: f"{float(adv_primary.item()):.4f}",
-                        "adv_primary": f"{float(adv_primary.item()):.8f}",
-                        "pen": f"{float(penalty_term.item()):.4f}",
-                        "adv_obj": f"{float(adv_objective.item()):.9f}",
-                    }
-                    if sv_estimate is not None and torch.isfinite(sv_estimate):
-                        bar_postfix["jac_sv"] = f"{float(sv_estimate.item()):.4f}"
-                    ascent_bar.set_postfix(bar_postfix, refresh=False)
-                (-adv_objective).backward()
-                if tracker is not None:
-                    tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
-                grad_finite = all(
-                    (p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters()
-                )
-                if not grad_finite:
-                    warnings.warn(
-                        "Non-finite gradients in ICNN adversary; skipping optimizer step.",
-                        RuntimeWarning,
-                    )
+            try:
+                for ascent_step in ascent_bar:
                     opt_icnn.zero_grad(set_to_none=True)
-                    continue
-
-                # Remove stray gradients on the classifier, which acts as a frozen critic.
-                for p in head.parameters():
-                    if p.grad is not None:
-                        p.grad.zero_()
-                torch.nn.utils.clip_grad_norm_(icnn.parameters(), max_norm=1.0)
-                if icnn_step_rule == "bb-armijo" and bb_state is not None:
-                    params_tensors: List[torch.Tensor] = []
-                    grad_tensors: List[torch.Tensor] = []
-                    for group in opt_icnn.param_groups:
-                        weight_decay = float(group.get("weight_decay", 0.0))
-                        for param in group["params"]:
-                            params_tensors.append(param.detach().clone())
-                            grad_tensor = torch.zeros_like(param)
-                            if param.grad is not None:
-                                grad_tensor = param.grad.detach().clone()
-                            if weight_decay != 0.0:
-                                grad_tensor = grad_tensor + weight_decay * param.detach()
-                            grad_tensors.append(grad_tensor)
-                    if not grad_tensors:
-                        adv_objective_last = adv_objective.detach()
-                        continue
-                    grad_vec = parameters_to_vector(grad_tensors)
-                    params_vec = parameters_to_vector(params_tensors)
-                    grad_norm_sq = float(grad_vec.pow(2).sum().item())
-                    adv_obj_current = float(adv_objective.detach().item())
-                    if (not math.isfinite(grad_norm_sq)) or grad_norm_sq <= 0.0:
-                        bb_state.update_history(params_vec, grad_vec, bb_state.alpha_prev)
-                        adv_objective_last = adv_objective.detach()
-                        continue
-
-                    alpha_candidate = bb_state.propose(params_vec, grad_vec)
-                    params_backup = [param.detach().clone() for param in icnn.parameters()]
-                    accepted = False
-                    adv_objective_candidate: Optional[torch.Tensor] = None
-
-                    for _ in range(bb_state.ls_max_steps):
-                        for group in opt_icnn.param_groups:
-                            group["lr"] = alpha_candidate
-                        opt_icnn.step()
-                        icnn.project_convexity()
-                        adv_objective_candidate, _ = _evaluate_icnn_adv_objective(
-                            icnn,
-                            head,
-                            z_detached,
-                            y,
-                            penalty_lambda,
-                            cosine_cfg,
-                            use_margin_adv,
-                            jacobian_reg_weight,
-                            jacobian_reg_samples,
-                            jacobian_reg_iters,
-                            rng,
+                    z_adv_ascent, _ = adversarial_pushforward(
+                        icnn, z_detached, detach_for_model=False
+                    )
+                    if not torch.isfinite(z_adv_ascent).all():
+                        warnings.warn(
+                            "Encountered non-finite values in adversarial latents during ascent; "
+                            "skipping this ascent step.",
+                            RuntimeWarning,
                         )
-                        if torch.isfinite(adv_objective_candidate):
-                            lhs = float(adv_objective_candidate.item())
-                            rhs = adv_obj_current + bb_state.ls_c * alpha_candidate * grad_norm_sq
-                            if lhs >= rhs:
+                        continue
+                    logits_adv = head(z_adv_ascent)
+                    if use_redlr_loss:
+                        num_classes = logits_adv.size(1)
+                        if num_classes < 3:
+                            raise RuntimeError(
+                                "ReDLR loss requires at least three classes; received logits with "
+                                f"{num_classes} classes."
+                            )
+                        batch_indices = torch.arange(
+                            logits_adv.size(0), device=logits_adv.device, dtype=torch.long
+                        )
+                        logits_correct = logits_adv[batch_indices, y]
+                        logits_sorted, indices = logits_adv.sort(dim=1, descending=True)
+                        redlr = torch.zeros_like(logits_correct)
+                        is_correct = indices[:, 0] == y
+                        if is_correct.any():
+                            numer = logits_correct[is_correct] - logits_sorted[is_correct, 1]
+                            denom = logits_sorted[is_correct, 0] - logits_sorted[is_correct, 2]
+                            redlr[is_correct] = -numer / denom
+                        adv_primary = redlr.mean()
+                        metric_key = "redlr"
+                    elif use_margin_adv:
+                        logits_correct = logits_adv.gather(1, y.unsqueeze(1)).squeeze(1)
+                        margins = logits_adv - logits_correct.unsqueeze(1)
+                        num_classes = logits_adv.size(1)
+                        correct_mask = F.one_hot(y, num_classes=num_classes).bool()
+                        margins = margins.masked_fill(correct_mask, float("-inf"))
+                        adv_primary = torch.logsumexp(margins, dim=1).mean()
+                        metric_key = "margin"
+                    else:
+                        adv_primary = F.cross_entropy(logits_adv, y, reduction="mean")
+                        metric_key = "ce"
+                    per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
+                    penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
+                        z_detached,
+                        z_adv_ascent,
+                        head,
+                        penalty_lambda,
+                        per_sample_mse,
+                        cosine_cfg,
+                        logits_adv=logits_adv,
+                    )
+                    sv_estimate: Optional[torch.Tensor] = None
+                    sv_penalty = torch.zeros((), device=adv_primary.device, dtype=adv_primary.dtype)
+                    if jacobian_reg_weight > 0.0:
+                        sv_estimate = estimate_local_jacobian_sv(
+                            icnn,
+                            z_detached,
+                            num_samples=jacobian_reg_samples,
+                            power_iters=jacobian_reg_iters,
+                            rng=rng,
+                        )
+                        if sv_estimate is not None and torch.isfinite(sv_estimate):
+                            sv_penalty = jacobian_reg_weight * sv_estimate.pow(2)
+                        else:
+                            sv_estimate = None
+                    if (
+                        not torch.isfinite(adv_primary)
+                        or not torch.isfinite(penalty_term)
+                        or not torch.isfinite(penalty_monitor)
+                        or not torch.isfinite(sv_penalty)
+                    ):
+                        warnings.warn(
+                            "Non-finite adversarial loss components detected; skipping ascent step.",
+                            RuntimeWarning,
+                        )
+                        continue
+                    adv_objective = adv_primary - penalty_term - sv_penalty
+                    if sv_estimate is not None:
+                        sv_estimate_last = sv_estimate.detach()
+                    if torch.isfinite(adv_primary) and torch.isfinite(penalty_term):
+                        bar_postfix: Dict[str, str] = {
+                            metric_key: f"{float(adv_primary.item()):.4f}",
+                            "adv_primary": f"{float(adv_primary.item()):.8f}",
+                            "pen": f"{float(penalty_term.item()):.4f}",
+                            "adv_obj": f"{float(adv_objective.item()):.9f}",
+                        }
+                        if sv_estimate is not None and torch.isfinite(sv_estimate):
+                            bar_postfix["jac_sv"] = f"{float(sv_estimate.item()):.4f}"
+                        ascent_bar.set_postfix(bar_postfix, refresh=False)
+                    (-adv_objective).backward()
+                    if tracker is not None:
+                        tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
+                    grad_finite = all(
+                        (p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters()
+                    )
+                    if not grad_finite:
+                        warnings.warn(
+                            "Non-finite gradients in ICNN adversary; skipping optimizer step.",
+                            RuntimeWarning,
+                        )
+                        opt_icnn.zero_grad(set_to_none=True)
+                        continue
+
+                    for p in head.parameters():
+                        if p.grad is not None:
+                            p.grad.zero_()
+                    torch.nn.utils.clip_grad_norm_(icnn.parameters(), max_norm=1.0)
+                    if icnn_step_rule == "bb-armijo" and bb_state is not None:
+                        params_tensors: List[torch.Tensor] = []
+                        grad_tensors: List[torch.Tensor] = []
+                        for group in opt_icnn.param_groups:
+                            weight_decay = float(group.get("weight_decay", 0.0))
+                            for param in group["params"]:
+                                params_tensors.append(param.detach().clone())
+                                grad_tensor = torch.zeros_like(param)
+                                if param.grad is not None:
+                                    grad_tensor = param.grad.detach().clone()
+                                if weight_decay != 0.0:
+                                    grad_tensor = grad_tensor + weight_decay * param.detach()
+                                grad_tensors.append(grad_tensor)
+                        if not grad_tensors:
+                            adv_objective_last = adv_objective.detach()
+                            continue
+                        grad_vec = parameters_to_vector(grad_tensors)
+                        params_vec = parameters_to_vector(params_tensors)
+                        grad_norm_sq = float(grad_vec.pow(2).sum().item())
+                        adv_obj_current = float(adv_objective.detach().item())
+                        if (not math.isfinite(grad_norm_sq)) or grad_norm_sq <= 0.0:
+                            bb_state.update_history(params_vec, grad_vec, bb_state.alpha_prev)
+                            adv_objective_last = adv_objective.detach()
+                            continue
+
+                        alpha_candidate = bb_state.propose(params_vec, grad_vec)
+                        params_backup = [param.detach().clone() for param in icnn.parameters()]
+                        accepted = False
+                        adv_objective_candidate: Optional[torch.Tensor] = None
+
+                        for _ in range(bb_state.ls_max_steps):
+                            for group in opt_icnn.param_groups:
+                                group["lr"] = alpha_candidate
+                            opt_icnn.step()
+                            icnn.project_convexity()
+                            adv_objective_candidate, _ = _evaluate_icnn_adv_objective(
+                                icnn,
+                                head,
+                                z_detached,
+                                y,
+                                penalty_lambda,
+                                cosine_cfg,
+                                use_margin_adv,
+                                jacobian_reg_weight,
+                                jacobian_reg_samples,
+                                jacobian_reg_iters,
+                                rng,
+                            )
+                            if not torch.isfinite(adv_objective_candidate):
+                                alpha_candidate *= bb_state.ls_shrink
+                                for param, backup in zip(icnn.parameters(), params_backup):
+                                    param.data.copy_(backup)
+                                continue
+
+                            improvement = adv_objective_candidate - adv_objective
+                            sufficient_increase = (
+                                improvement >= bb_state.ls_c * alpha_candidate * grad_norm_sq
+                            )
+                            if sufficient_increase:
                                 accepted = True
                                 break
-                        with torch.no_grad():
-                            for param, saved in zip(icnn.parameters(), params_backup):
-                                param.copy_(saved)
-                        alpha_candidate *= bb_state.ls_shrink
-                        if alpha_candidate < bb_state.alpha_min:
-                            break
 
-                    if not accepted:
-                        alpha_candidate = max(bb_state.alpha_min, min(bb_state.alpha_max, alpha_candidate))
-                        for group in opt_icnn.param_groups:
-                            group["lr"] = alpha_candidate
-                        opt_icnn.step()
-                        icnn.project_convexity()
-                        adv_objective_candidate, _ = _evaluate_icnn_adv_objective(
-                            icnn,
-                            head,
-                            z_detached,
-                            y,
-                            penalty_lambda,
-                            cosine_cfg,
-                            use_margin_adv,
-                            jacobian_reg_weight,
-                            jacobian_reg_samples,
-                            jacobian_reg_iters,
-                            rng,
-                        )
-                    for param in icnn.parameters():
-                        if not torch.isfinite(param).all():
-                            warnings.warn(
-                                "Detected non-finite ICNN parameters after update; sanitizing values.",
-                                RuntimeWarning,
-                            )
-                            param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
-                    if adv_objective_candidate is not None and torch.isfinite(adv_objective_candidate):
-                        adv_objective_last = adv_objective_candidate
+                            alpha_candidate *= bb_state.ls_shrink
+                            for param, backup in zip(icnn.parameters(), params_backup):
+                                param.data.copy_(backup)
+
+                        if not accepted:
+                            for param, backup in zip(icnn.parameters(), params_backup):
+                                param.data.copy_(backup)
+                            bb_state.update_history(params_vec, grad_vec, bb_state.alpha_prev)
+                            adv_objective_last = adv_objective.detach()
+                            continue
+
+                        adv_objective_last = adv_objective_candidate.detach()
+                        bb_state.update_history(params_vec, grad_vec, alpha_candidate)
                     else:
+                        opt_icnn.step()
+                        for param in icnn.parameters():
+                            if not torch.isfinite(param).all():
+                                warnings.warn(
+                                    "Detected non-finite ICNN parameters after update; sanitizing values.",
+                                    RuntimeWarning,
+                                )
+                                param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+                        icnn.project_convexity()
                         adv_objective_last = adv_objective.detach()
-                    bb_state.update_history(params_vec, grad_vec, alpha_candidate)
-                else:
-                    opt_icnn.step()
-                    for param in icnn.parameters():
-                        if not torch.isfinite(param).all():
-                            warnings.warn(
-                                "Detected non-finite ICNN parameters after update; sanitizing values.",
-                                RuntimeWarning,
-                            )
-                            param.data.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
-                    icnn.project_convexity()
-                    adv_objective_last = adv_objective.detach()
-        finally:
-            ascent_bar.close()
+            finally:
+                ascent_bar.close()
 
-        # Clear any stray gradients created during adversary ascent before the outer update.
         for param in model_params:
             if param.grad is not None:
                 param.grad = None
 
-        # --- Model update (Danskin-style outer gradient) ---
+        if skip_model_update:
+            continue
+
         opt_theta.zero_grad(set_to_none=True)
         z_adv_fixed, delta = adversarial_pushforward(icnn, z, detach_for_model=True)
         if not torch.isfinite(z_adv_fixed).all():
@@ -1488,11 +1481,22 @@ def train_one_epoch(
         if not torch.isfinite(loss):
             warnings.warn("Skipping batch with non-finite loss value.", RuntimeWarning)
             continue
+        per_sample_mse = per_sample_mean_square_diff(z_adv_fixed, z)
+        if method == "adv_finetune":
+            _, penalty_monitor, _ = compute_transport_penalty(
+                z,
+                z_adv_fixed,
+                head,
+                penalty_lambda,
+                per_sample_mse,
+                cosine_cfg,
+                logits_adv=logits,
+            )
         loss.backward()
         if model_params:
             torch.nn.utils.clip_grad_norm_(model_params, max_norm=10.0)
             opt_theta.step()
-            delta_sq = per_sample_mean_square_diff(z_adv_fixed, z)
+            delta_sq = per_sample_mse
             if tracker is not None:
                 tracker.record_epoch_batch(delta_sq, batch_idx)
 
@@ -1518,39 +1522,41 @@ def train_one_epoch(
                     "loss": f"{mean_loss:.4f}",
                     "acc": f"{mean_acc*100:.2f}%",
                     "penalty": f"{mean_penalty:.4f}",
-                    "adv_obj": f"{mean_adv_obj:.4f}",
                 }
-                if jacobian_reg_weight > 0.0 and jacobian_counts > 0:
+                if jacobian_counts > 0:
+                    mean_jac_penalty = total_jacobian_penalty / jacobian_counts
                     mean_sv_sq = total_sv_sq / jacobian_counts
-                    mean_sv = math.sqrt(max(mean_sv_sq, 0.0))
-                    mean_jac_pen = total_jacobian_penalty / jacobian_counts
-                    postfix["jac_sv"] = f"{mean_sv:.4f}"
-                    postfix["jac_pen"] = f"{mean_jac_pen:.4f}"
-                progress.set_postfix(refresh=True, **postfix)
+                    postfix.update(
+                        {
+                            "jac_pen": f"{mean_jac_penalty:.4f}",
+                            "jac_sv": f"{math.sqrt(max(mean_sv_sq, 0.0)):.4f}",
+                        }
+                    )
+                if adv_objective_last is not None:
+                    postfix["adv_obj"] = f"{mean_adv_obj:.4f}"
+                progress.set_postfix(postfix, refresh=False)
 
     progress.close()
+
     mean_loss = total_loss / max(1, total_samples)
     mean_acc = total_correct / max(1, total_samples)
     mean_penalty = total_penalty / max(1, len(loader))
     mean_adv_obj = total_adv_obj / max(1, len(loader))
-    if jacobian_counts > 0:
-        mean_sv_sq = total_sv_sq / jacobian_counts
-        mean_sv = math.sqrt(max(mean_sv_sq, 0.0))
-        mean_jacobian_penalty = total_jacobian_penalty / jacobian_counts
-    else:
-        mean_sv = 0.0
+    mean_jacobian_penalty = total_jacobian_penalty / max(1, jacobian_counts)
+    if jacobian_counts == 0:
         mean_jacobian_penalty = 0.0
+    mean_sv_sq = total_sv_sq / max(1, jacobian_counts)
+    mean_jac_sv = math.sqrt(max(mean_sv_sq, 0.0)) if jacobian_counts > 0 else 0.0
+
     return (
         mean_loss,
         mean_acc,
         mean_penalty,
         mean_adv_obj,
         mean_jacobian_penalty,
-        mean_sv,
+        mean_jac_sv,
         jacobian_counts,
     )
-
-
 def evaluate_under_icnn(
     phi: nn.Module,
     head: nn.Module,
@@ -1651,6 +1657,8 @@ CSV_HEADER = [
     "icnn_strong_convexity",
     "epochs_clean",
     "epochs_adv",
+    "epochs_icnn_pretrain",
+    "epochs_adv_finetune",
     "penalty_ascent_steps",
     "batch_size",
     "seed",
@@ -1682,6 +1690,18 @@ def parse_args():
     parser.add_argument("--epochs-clean", type=int, default=0)
     parser.add_argument("--epochs-adv", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=0)  # legacy fallback
+    parser.add_argument(
+        "--epochs-icnn-pretrain",
+        type=int,
+        default=0,
+        help="Run ICNN-only ascent epochs before any classifier updates.",
+    )
+    parser.add_argument(
+        "--epochs-adv-finetune",
+        type=int,
+        default=0,
+        help="Run classifier finetuning epochs using fixed ICNN adversarial latents.",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--lr-theta",
@@ -2009,14 +2029,26 @@ def parse_args():
 
 
 def determine_schedule(args) -> Tuple[int, List[str]]:
-    if args.epochs_clean > 0 or args.epochs_adv > 0:
-        schedule = ["erm"] * args.epochs_clean + ["icnn"] * args.epochs_adv
+    has_explicit = (
+        args.epochs_clean > 0
+        or args.epochs_adv > 0
+        or args.epochs_icnn_pretrain > 0
+        or args.epochs_adv_finetune > 0
+    )
+    if has_explicit:
+        schedule: List[str] = []
+        schedule += ["icnn_pretrain"] * args.epochs_icnn_pretrain
+        schedule += ["adv_finetune"] * args.epochs_adv_finetune
+        schedule += ["icnn"] * args.epochs_adv
+        schedule += ["erm"] * args.epochs_clean
         total_epochs = len(schedule)
     elif args.epochs > 0:
         schedule = ["icnn"] * args.epochs
         total_epochs = args.epochs
     else:
         raise ValueError("Specify either --epochs or ( --epochs-clean + --epochs-adv ).")
+    if total_epochs == 0:
+        raise ValueError("Training schedule is empty; provide positive epoch counts.")
     return total_epochs, schedule
 
 
@@ -2392,6 +2424,8 @@ def main():
                 "icnn_strong_convexity": args.icnn_strong_convexity,
                 "epochs_clean": args.epochs_clean,
                 "epochs_adv": args.epochs_adv,
+                "epochs_icnn_pretrain": args.epochs_icnn_pretrain,
+                "epochs_adv_finetune": args.epochs_adv_finetune,
                 "penalty_ascent_steps": args.icnn_ascent_steps,
                 "batch_size": args.batch_size,
                 "seed": args.seed,
