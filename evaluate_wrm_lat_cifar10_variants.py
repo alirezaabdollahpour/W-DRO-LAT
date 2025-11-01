@@ -863,6 +863,7 @@ def main():
                     "norm": args.autoattack_norm,
                     "eps": args.autoattack_eps,
                     "version": args.autoattack_version,
+                    "verbose": True,
                 }
                 if autoattack_attacks is not None:
                     aa_kwargs["attacks_to_run"] = autoattack_attacks

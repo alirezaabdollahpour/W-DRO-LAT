@@ -1191,6 +1191,7 @@ def train_one_epoch(
     jacobian_reg_iters: int = 1,
     rng: Optional[torch.Generator] = None,
     use_margin_adv: bool = True,
+    use_redlr_loss: bool = False,
     icnn_step_rule: str = "constant",
     icnn_bb_config: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, float, float, float, float]:
@@ -1264,7 +1265,27 @@ def train_one_epoch(
                     )
                     continue
                 logits_adv = head(z_adv_ascent)
-                if use_margin_adv:
+                if use_redlr_loss:
+                    num_classes = logits_adv.size(1)
+                    if num_classes < 3:
+                        raise RuntimeError(
+                            "ReDLR loss requires at least three classes; received logits with "
+                            f"{num_classes} classes."
+                        )
+                    batch_indices = torch.arange(
+                        logits_adv.size(0), device=logits_adv.device, dtype=torch.long
+                    )
+                    logits_correct = logits_adv[batch_indices, y]
+                    logits_sorted, indices = logits_adv.sort(dim=1, descending=True)
+                    redlr = torch.zeros_like(logits_correct)
+                    is_correct = indices[:, 0] == y
+                    if is_correct.any():
+                        numer = logits_correct[is_correct] - logits_sorted[is_correct, 1]
+                        denom = logits_sorted[is_correct, 0] - logits_sorted[is_correct, 2]
+                        redlr[is_correct] = -numer / denom
+                    adv_primary = redlr.mean()
+                    metric_key = "redlr"
+                elif use_margin_adv:
                     logits_correct = logits_adv.gather(1, y.unsqueeze(1)).squeeze(1)
                     margins = logits_adv - logits_correct.unsqueeze(1)
                     num_classes = logits_adv.size(1)
@@ -1684,6 +1705,11 @@ def parse_args():
         action="store_true",
         help="Use the log-sum-exp margin objective for the ICNN adversary (non-zero-sum view).",
     )
+    parser.add_argument(
+        "--use-redlr-loss",
+        action="store_true",
+        help="Use the ReDLR loss for the ICNN adversary (focus on correctly classified samples).",
+    )
     parser.add_argument("--icnn-hidden", type=_parse_hidden_units, nargs="+", default=[512, 256])
     parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="softplus")
     parser.add_argument("--icnn-strong-convexity", type=float, default=1.0)
@@ -1996,6 +2022,12 @@ def determine_schedule(args) -> Tuple[int, List[str]]:
 
 def main():
     args = parse_args()
+    if args.use_redlr_loss and args.use_margin_loss:
+        warnings.warn(
+            "--use-redlr-loss overrides --use-margin-loss; using ReDLR objective for the adversary.",
+            RuntimeWarning,
+        )
+        args.use_margin_loss = False
     ratio_min = max(float(args.calibration_ratio_min), 1e-6)
     ratio_max = max(float(args.calibration_ratio_max), ratio_min)
     if ratio_min != args.calibration_ratio_min or ratio_max != args.calibration_ratio_max:
@@ -2251,6 +2283,7 @@ def main():
             jacobian_reg_iters=args.jacobian_reg_iters,
             rng=global_rng,
             use_margin_adv=args.use_margin_loss,
+            use_redlr_loss=args.use_redlr_loss,
             icnn_step_rule=args.icnn_step_rule,
             icnn_bb_config=icnn_bb_config,
         )
