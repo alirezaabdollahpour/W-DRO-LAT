@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Evaluate a saved WRM-LAT backbone checkpoint on CIFAR-10, CIFAR-10.1 (v6) and CIFAR-10.2.
+Evaluate a saved WRM-LAT backbone checkpoint on CIFAR-10, CIFAR-10.1 (v6), CIFAR-10.2, and CIFAR-10-W.
 
 What this script does
 ---------------------
@@ -9,8 +9,9 @@ What this script does
 2) Reconstructs your utils-style backbone (PreActResNet18 or ResNet18Plain)
    from a **future-proof checkpoint** you saved (with keys: arch, arch_init, state_dict, cut_layer, args, ...).
 3) Applies the **same CIFAR-10 normalization** used in your WRM-LAT code and evaluates clean accuracy.
-4) Optionally evaluates **input-space PGD** (pixel units) on CIFAR-10/10.1/10.2.
-5) Optionally evaluates **AutoAttack** robustness (CIFAR-10) using the robustbench reference settings.
+4) Optionally evaluates clean accuracy on each CIFAR-10-W distribution shift (requires --cifar10w-root).
+5) Optionally evaluates **input-space PGD** (pixel units) on CIFAR-10/10.1/10.2.
+6) Optionally evaluates **AutoAttack** robustness (CIFAR-10) using the robustbench reference settings.
 
 Notes
 -----
@@ -24,6 +25,7 @@ Usage
 python evaluate_wrm_lat_cifar10_variants.py \
   --ckpt /path/to/your_saved_wrm_lat.ckpt \
   --batch-size 256 --num-workers 4 \
+  --cifar10w-root /datasets/cifar10w \
   --inp-eps 0.031372549 --inp-steps 20 --inp-restarts 5 \
   --autoattack --autoattack-bs 128 \
   --autoattack-version custom --autoattack-attacks apgd-ce apgd-dlr
@@ -43,15 +45,20 @@ from urllib.request import urlretrieve
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.autograd import grad
 from tqdm.auto import tqdm
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.datasets import ImageFolder
 from model import ResNet18 as ResNet18Plain  # alias kept consistent with your code
 from model import PreActResNet18
 from pretrained_LAT import build_split_resnet18
 
 from utils import (
+    CIFAR10_MEAN,
+    CIFAR10_STD,
     auto_pgd_step_size,
     evaluate_under_input_pgd,
     dataloader_seed,
@@ -475,6 +482,190 @@ def download_cifar10_variants(data_dir: str = "./cifar10_variants"):
     }
 
 
+CIFAR10_CLASS_NAMES: Tuple[str, ...] = (
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
+)
+_CIFAR10_DIGIT_NAMES: Tuple[str, ...] = tuple(str(i) for i in range(10))
+
+
+class _RemappedTargets(Dataset):
+    """Wrap a dataset and remap its class indices to the canonical CIFAR-10 order."""
+
+    def __init__(self, base: Dataset, mapping: Dict[int, int]):
+        self._base = base
+        self._mapping = mapping
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __getitem__(self, index: int):
+        data, target = self._base[index]
+        return data, self._mapping.get(int(target), int(target))
+
+
+def _looks_like_cifar10_class_root(path: Path) -> bool:
+    try:
+        subdirs = [p for p in path.iterdir() if p.is_dir()]
+    except FileNotFoundError:
+        return False
+    if len(subdirs) < 10:
+        return False
+    names = {p.name.lower() for p in subdirs}
+    if set(name.lower() for name in CIFAR10_CLASS_NAMES).issubset(names):
+        return True
+    if set(_CIFAR10_DIGIT_NAMES).issubset(names):
+        return True
+    return False
+
+
+def locate_cifar10w_split_root(base_dir: Path, max_depth: int = 3) -> Path:
+    """
+    Locate the directory containing CIFAR-10 class folders inside a CIFAR-10-W split.
+
+    Args:
+        base_dir: Directory that should contain the dataset (e.g., bing_cartoon_original).
+        max_depth: Maximum BFS depth while searching for class folders.
+
+    Returns:
+        Path pointing directly at the CIFAR-10 class directory structure.
+
+    Raises:
+        FileNotFoundError: If no suitable class directory layout is found.
+    """
+
+    base_dir = base_dir.expanduser().resolve()
+    if _looks_like_cifar10_class_root(base_dir):
+        return base_dir
+
+    queue: List[Tuple[Path, int]] = [(base_dir, 0)]
+    visited = set()
+
+    while queue:
+        current, depth = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        if depth > max_depth:
+            continue
+        if depth > 0 and _looks_like_cifar10_class_root(current):
+            return current
+        if depth == max_depth:
+            continue
+        try:
+            for child in current.iterdir():
+                if child.is_dir():
+                    queue.append((child, depth + 1))
+        except FileNotFoundError:
+            continue
+
+    raise FileNotFoundError(
+        f"Could not locate CIFAR-10 class folders under '{base_dir}'. "
+        "Ensure the archive is extracted and contains the 10 class directories."
+    )
+
+
+def _remap_targets_if_needed(dataset: ImageFolder) -> Dataset:
+    class_to_idx = dataset.class_to_idx
+    canonical = {name: idx for idx, name in enumerate(CIFAR10_CLASS_NAMES)}
+    canonical_lower = {name.lower(): idx for name, idx in canonical.items()}
+    digits_map = {name: int(name) for name in _CIFAR10_DIGIT_NAMES}
+
+    mapping: Dict[int, int] = {}
+    lowered_lookup = {key.lower(): key for key in class_to_idx.keys()}
+
+    if set(class_to_idx.keys()) == set(canonical.keys()):
+        for cls_name, cls_idx in class_to_idx.items():
+            mapping[cls_idx] = canonical[cls_name]
+    elif set(lowered_lookup.keys()) == set(canonical_lower.keys()):
+        for lowered, original in lowered_lookup.items():
+            mapping[class_to_idx[original]] = canonical_lower[lowered]
+    elif set(class_to_idx.keys()) == set(digits_map.keys()):
+        for cls_name, cls_idx in class_to_idx.items():
+            mapping[cls_idx] = digits_map[cls_name]
+    else:
+        return dataset
+
+    return _RemappedTargets(dataset, mapping)
+
+
+DEFAULT_CIFAR10W_SPLITS: Tuple[str, ...] = (
+    "bing_cartoon_original",
+    "data_360_cartoon_original",
+    "data_360_original",
+    "data_baidu_cartoon_original",
+    "data_baidu_original",
+    "data_bing_original",
+    "data_flickr_original",
+    "data_google_original",
+    "data_pexel_original",
+    "data_sougou_original",
+    "diffusion_cartoon_original",
+    "diffusion_hard_original",
+    "diffusion_original",
+)
+
+
+def build_cifar10w_dataset(split_root: Path) -> Dataset:
+    class_root = locate_cifar10w_split_root(split_root)
+    transform = transforms.Compose(
+        [
+            transforms.Resize((32, 32), interpolation=InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=CIFAR10_MEAN, std=CIFAR10_STD),
+        ]
+    )
+    image_folder = ImageFolder(class_root, transform=transform)
+    return _remap_targets_if_needed(image_folder)
+
+
+def build_cifar10w_loader(
+    split_root: Path,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    seed_offset: int,
+) -> DataLoader:
+    dataset = build_cifar10w_dataset(split_root)
+    generator, worker_init = dataloader_seed(seed, offset=seed_offset)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        worker_init_fn=worker_init,
+        generator=generator,
+    )
+
+
+def available_cifar10w_splits(root_dir: Path, preferred_order: Iterable[str]) -> List[str]:
+    root_dir = root_dir.expanduser()
+    ordered: List[str] = []
+    seen = set()
+    for name in preferred_order:
+        if (root_dir / name).is_dir():
+            ordered.append(name)
+            seen.add(name)
+    extra = sorted(
+        [
+            entry.name
+            for entry in root_dir.iterdir()
+            if entry.is_dir() and entry.name not in seen and not entry.name.startswith(".")
+        ]
+    )
+    ordered.extend(extra)
+    return ordered
+
+
 def _to_nchw_float01(arr: np.ndarray) -> np.ndarray:
     """Ensure array is (N, C, H, W) in [0,1]."""
     a = np.array(arr)
@@ -703,6 +894,24 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-json", type=str, default="cifar10_variants_eval.json")
+    p.add_argument(
+        "--cifar10w-root",
+        type=str,
+        default="",
+        help="Directory containing the extracted CIFAR-10-W splits (as produced by download_cifar10w.py).",
+    )
+    p.add_argument(
+        "--cifar10w-subsets",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional subset of CIFAR-10-W distributions to evaluate (default: canonical 13 and any extra folders).",
+    )
+    p.add_argument(
+        "--skip-cifar10w",
+        action="store_true",
+        help="Disable CIFAR-10-W evaluation even if a root directory is provided.",
+    )
 
     # Optional: evaluate a clean/natural pretrained backbone instead of WRM-LAT ckpt
     p.add_argument("--natural-model", action="store_true",
@@ -881,6 +1090,8 @@ def main():
 
     c101_loader = None
     c102_loader = None
+    cifar10w_root_path: Optional[Path] = None
+    cifar10w_entries: List[Tuple[str, DataLoader]] = []
     if perform_standard_eval:
         # 3) Download + set up CIFAR-10.1 & 10.2
         paths = download_cifar10_variants()
@@ -911,6 +1122,41 @@ def main():
                 generator=gen_c102,
             )
 
+        if not args.skip_cifar10w and args.cifar10w_root:
+            cifar10w_root_path = Path(args.cifar10w_root).expanduser()
+            if not cifar10w_root_path.is_dir():
+                raise FileNotFoundError(
+                    f"CIFAR-10-W root directory not found: {cifar10w_root_path}. "
+                    "Run download_cifar10w.py to obtain the benchmark."
+                )
+            requested_splits = args.cifar10w_subsets
+            if requested_splits is None:
+                requested_splits = available_cifar10w_splits(cifar10w_root_path, DEFAULT_CIFAR10W_SPLITS)
+            if len(requested_splits) == 0:
+                raise RuntimeError(
+                    f"No CIFAR-10-W subsets discovered under {cifar10w_root_path}. "
+                    "Ensure the archives are extracted."
+                )
+            for offset, split_name in enumerate(requested_splits):
+                split_dir = cifar10w_root_path / split_name
+                if not split_dir.is_dir():
+                    print(f"[cifar10w] Skipping '{split_name}': directory not found at {split_dir}")
+                    continue
+                try:
+                    loader = build_cifar10w_loader(
+                        split_dir,
+                        batch_size=args.batch_size,
+                        num_workers=args.num_workers,
+                        seed=args.seed,
+                        seed_offset=10 + offset,
+                    )
+                except FileNotFoundError as exc:
+                    print(f"[cifar10w] Skipping '{split_name}': {exc}")
+                    continue
+                cifar10w_entries.append((split_name, loader))
+        elif args.cifar10w_subsets and not args.cifar10w_root:
+            raise ValueError("--cifar10w-subsets was provided without --cifar10w-root.")
+
     # 4) Evaluate
     results = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -921,6 +1167,8 @@ def main():
         "cut_layer": meta["cut_layer"],
         "used_natural_model": bool(args.natural_model),
         "natural_model_path": os.path.abspath(args.natural_model_path) if args.natural_model else None,
+        "cifar10w_root": str(cifar10w_root_path) if cifar10w_root_path is not None else None,
+        "cifar10w_requested": list(args.cifar10w_subsets) if args.cifar10w_subsets is not None else None,
         "scores": {},
     }
 
@@ -943,6 +1191,19 @@ def main():
             results["scores"]["cifar10.2_test"] = round(acc_c102, 2)
         else:
             print("  CIFAR-10.2 : (not available)")
+
+        if cifar10w_entries:
+            print("\nEvaluating CIFAR-10-W benchmark (clean only)...")
+            results["scores"]["cifar10w"] = {}
+            for split_name, loader in cifar10w_entries:
+                print(f"  {split_name}")
+                acc_split = eval_clean(base, loader, device)
+                print(f"    Accuracy: {acc_split:.2f}% ({len(loader.dataset)} samples)")
+                results["scores"]["cifar10w"][split_name] = round(acc_split, 2)
+        elif cifar10w_root_path is not None:
+            print("\nEvaluating CIFAR-10-W benchmark (clean only)...")
+            print(f"  No valid CIFAR-10-W subsets were found in {cifar10w_root_path}")
+            results["scores"]["cifar10w"] = {"status": "not_found"}
 
         cifar10c_eval_summary = None
         if args.skip_cifar10c:
