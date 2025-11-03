@@ -28,3 +28,5 @@ cifar10_variants/*
 *.npz
 figures/
 figures/*
+cifar10w
+cifar10w/*
