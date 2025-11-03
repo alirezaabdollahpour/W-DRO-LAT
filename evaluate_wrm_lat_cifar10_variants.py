@@ -527,50 +527,45 @@ def _looks_like_cifar10_class_root(path: Path) -> bool:
     return False
 
 
-def locate_cifar10w_split_root(base_dir: Path, max_depth: int = 3) -> Path:
+def locate_cifar10w_class_roots(base_dir: Path, max_depth: int = 4) -> List[Path]:
     """
-    Locate the directory containing CIFAR-10 class folders inside a CIFAR-10-W split.
+    Locate every directory that contains the CIFAR-10 class folders inside a CIFAR-10-W split.
 
     Args:
         base_dir: Directory that should contain the dataset (e.g., bing_cartoon_original).
         max_depth: Maximum BFS depth while searching for class folders.
 
     Returns:
-        Path pointing directly at the CIFAR-10 class directory structure.
-
-    Raises:
-        FileNotFoundError: If no suitable class directory layout is found.
+        Sorted list of paths pointing directly at CIFAR-10 class directory structures.
     """
 
     base_dir = base_dir.expanduser().resolve()
-    if _looks_like_cifar10_class_root(base_dir):
-        return base_dir
-
+    roots: List[Path] = []
     queue: List[Tuple[Path, int]] = [(base_dir, 0)]
-    visited = set()
+    visited: set[Path] = set()
 
     while queue:
         current, depth = queue.pop(0)
         if current in visited:
             continue
         visited.add(current)
-        if depth > max_depth:
+
+        if _looks_like_cifar10_class_root(current):
+            roots.append(current)
+            # Stop descending once a class root is discovered.
             continue
-        if depth > 0 and _looks_like_cifar10_class_root(current):
-            return current
-        if depth == max_depth:
+
+        if depth >= max_depth:
             continue
+
         try:
-            for child in current.iterdir():
+            for child in sorted(current.iterdir()):
                 if child.is_dir():
                     queue.append((child, depth + 1))
         except FileNotFoundError:
             continue
 
-    raise FileNotFoundError(
-        f"Could not locate CIFAR-10 class folders under '{base_dir}'. "
-        "Ensure the archive is extracted and contains the 10 class directories."
-    )
+    return sorted(set(roots))
 
 
 def _remap_targets_if_needed(dataset: ImageFolder) -> Dataset:
@@ -614,8 +609,7 @@ DEFAULT_CIFAR10W_SPLITS: Tuple[str, ...] = (
 )
 
 
-def build_cifar10w_dataset(split_root: Path) -> Dataset:
-    class_root = locate_cifar10w_split_root(split_root)
+def build_cifar10w_dataset(class_root: Path) -> Dataset:
     transform = transforms.Compose(
         [
             transforms.Resize((32, 32), interpolation=InterpolationMode.BICUBIC),
@@ -628,13 +622,13 @@ def build_cifar10w_dataset(split_root: Path) -> Dataset:
 
 
 def build_cifar10w_loader(
-    split_root: Path,
+    class_root: Path,
     batch_size: int,
     num_workers: int,
     seed: int,
     seed_offset: int,
 ) -> DataLoader:
-    dataset = build_cifar10w_dataset(split_root)
+    dataset = build_cifar10w_dataset(class_root)
     generator, worker_init = dataloader_seed(seed, offset=seed_offset)
     return DataLoader(
         dataset,
@@ -1091,7 +1085,7 @@ def main():
     c101_loader = None
     c102_loader = None
     cifar10w_root_path: Optional[Path] = None
-    cifar10w_entries: List[Tuple[str, DataLoader]] = []
+    cifar10w_entries: List[Tuple[str, List[Tuple[str, DataLoader]]]] = []
     if perform_standard_eval:
         # 3) Download + set up CIFAR-10.1 & 10.2
         paths = download_cifar10_variants()
@@ -1142,18 +1136,33 @@ def main():
                 if not split_dir.is_dir():
                     print(f"[cifar10w] Skipping '{split_name}': directory not found at {split_dir}")
                     continue
-                try:
-                    loader = build_cifar10w_loader(
-                        split_dir,
-                        batch_size=args.batch_size,
-                        num_workers=args.num_workers,
-                        seed=args.seed,
-                        seed_offset=10 + offset,
-                    )
-                except FileNotFoundError as exc:
-                    print(f"[cifar10w] Skipping '{split_name}': {exc}")
+                class_roots = locate_cifar10w_class_roots(split_dir)
+                if not class_roots:
+                    print(f"[cifar10w] Skipping '{split_name}': could not locate CIFAR-10 class folders.")
                     continue
-                cifar10w_entries.append((split_name, loader))
+                collections: List[Tuple[str, DataLoader]] = []
+                for coll_idx, class_root in enumerate(class_roots):
+                    try:
+                        loader = build_cifar10w_loader(
+                            class_root,
+                            batch_size=args.batch_size,
+                            num_workers=args.num_workers,
+                            seed=args.seed,
+                            seed_offset=10 + offset * 100 + coll_idx,
+                        )
+                    except FileNotFoundError as exc:
+                        print(f"[cifar10w] Skipping collection under '{split_name}': {exc}")
+                        continue
+                    try:
+                        rel_path = class_root.relative_to(split_dir)
+                        rel_key = rel_path.as_posix() if rel_path != Path(".") else "."
+                    except ValueError:
+                        rel_key = class_root.name
+                    collections.append((rel_key, loader))
+                if collections:
+                    cifar10w_entries.append((split_name, collections))
+                else:
+                    print(f"[cifar10w] Skipping '{split_name}': no valid collections found.")
         elif args.cifar10w_subsets and not args.cifar10w_root:
             raise ValueError("--cifar10w-subsets was provided without --cifar10w-root.")
 
@@ -1195,11 +1204,23 @@ def main():
         if cifar10w_entries:
             print("\nEvaluating CIFAR-10-W benchmark (clean only)...")
             results["scores"]["cifar10w"] = {}
-            for split_name, loader in cifar10w_entries:
-                print(f"  {split_name}")
-                acc_split = eval_clean(base, loader, device)
-                print(f"    Accuracy: {acc_split:.2f}% ({len(loader.dataset)} samples)")
-                results["scores"]["cifar10w"][split_name] = round(acc_split, 2)
+            for split_name, collections in cifar10w_entries:
+                print(f"  Dataset: {split_name}")
+                split_summary = {}
+                for rel_key, loader in collections:
+                    display_name = split_name if rel_key in {".", ""} else f"{split_name}/{rel_key}"
+                    sample_count = len(loader.dataset)
+                    print(f"    Collection: {display_name} ({sample_count} samples)")
+                    acc_split = eval_clean(base, loader, device)
+                    print(f"      Accuracy: {acc_split:.2f}%")
+                    split_summary[display_name] = {
+                        "accuracy": round(acc_split, 2),
+                        "samples": sample_count,
+                    }
+                results["scores"]["cifar10w"][split_name] = {
+                    "collections": split_summary,
+                    "collection_count": len(collections),
+                }
         elif cifar10w_root_path is not None:
             print("\nEvaluating CIFAR-10-W benchmark (clean only)...")
             print(f"  No valid CIFAR-10-W subsets were found in {cifar10w_root_path}")
