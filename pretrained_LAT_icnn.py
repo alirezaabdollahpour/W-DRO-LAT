@@ -19,7 +19,6 @@ between:
 Most utilities (data loading, pretrained split, evaluation) are reused from
 ``pretrained_LAT.py`` and ``utils.py`` to avoid duplication.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -229,6 +228,17 @@ def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tenso
         raise ValueError("Tensors must have identical shapes to compute mean square difference.")
     diff = (a - b).reshape(a.size(0), -1)
     return diff.pow(2).mean(dim=1)
+
+
+def flatten_module_parameters(modules: Sequence[nn.Module]) -> torch.Tensor:
+    """Flatten parameters from one or more modules into a single CPU tensor."""
+    params: List[torch.nn.Parameter] = []
+    for module in modules:
+        params.extend(list(module.parameters()))
+    if not params:
+        return torch.zeros(0, dtype=torch.float32)
+    vec = parameters_to_vector(params)
+    return vec.detach().cpu()
 
 
 def _extract_penalty_features(
@@ -470,7 +480,7 @@ class InputConvexPotential(nn.Module):
         if activation == "relu":
             self.nonlin: nn.Module = nn.ReLU()
         elif activation == "softplus":
-            self.nonlin = nn.Softplus(beta=1.0)
+            self.nonlin = nn.Softplus(beta=20.0)
         else:
             raise ValueError(f"Unsupported ICNN activation: {activation}")
 
@@ -1636,6 +1646,8 @@ CSV_HEADER = [
     "train_penalty",
     "train_jac_penalty",
     "train_jac_sv",
+    "theta_weight_delta",
+    "icnn_weight_delta",
     "adv_objective",
     "test_loss",
     "test_acc",
@@ -2269,6 +2281,8 @@ def main():
     p_input = 2 if args.inp_p == "2" else float("inf")
     jacobian_ready = False
     L_hat_used = None
+    theta_prev_vec = flatten_module_parameters([phi, head])
+    icnn_prev_vec = flatten_module_parameters([icnn])
 
     for epoch, phase in enumerate(schedule, start=1):
         print(f"\n=== Epoch {epoch:02d}/{total_epochs} | Phase: {phase.upper()} ===")
@@ -2363,12 +2377,20 @@ def main():
         else:
             input_pgd_acc, ipgd_l2, ipgd_linf, ipgd_samples = None, None, None, None
 
+        theta_cur_vec = flatten_module_parameters([phi, head])
+        icnn_cur_vec = flatten_module_parameters([icnn])
+        theta_weight_delta = float(torch.norm(theta_cur_vec - theta_prev_vec, p=2).item())
+        icnn_weight_delta = float(torch.norm(icnn_cur_vec - icnn_prev_vec, p=2).item())
+        theta_prev_vec = theta_cur_vec
+        icnn_prev_vec = icnn_cur_vec
+
         msg = (
             f"[Epoch {epoch:02d} | {phase}] train {train_loss:.4f}/{train_acc*100:.2f}% | "
             f"penalty {penalty_avg:.4f} | jac_pen {jac_penalty:.4f} | jac_sv {jac_sv:.4f} | adv_obj {adv_obj:.4f} | "
             f"test {test_loss:.4f}/{test_acc*100:.2f}% | "
             f"icnn {icnn_loss:.4f}/{icnn_acc*100:.2f}% (pen {icnn_penalty:.4f})"
         )
+        msg += f" | d_theta {theta_weight_delta:.4e} | d_icnn {icnn_weight_delta:.4e}"
         if input_pgd_acc is not None:
             sample_note = f", n={ipgd_samples}" if ipgd_samples is not None else ""
             msg += f" | input-PGD {input_pgd_acc*100:.2f}% (L2 {ipgd_l2:.4f}, Linf {ipgd_linf:.4f}{sample_note})"
@@ -2388,6 +2410,8 @@ def main():
                 "reg_iters": int(args.jacobian_reg_iters),
                 "adv_objective": float(adv_obj),
                 "train_penalty": float(penalty_avg),
+                "theta_weight_delta": theta_weight_delta,
+                "icnn_weight_delta": icnn_weight_delta,
             }
         )
 
@@ -2403,6 +2427,8 @@ def main():
                 "train_penalty": round(float(penalty_avg), 6),
                 "train_jac_penalty": round(float(jac_penalty), 6),
                 "train_jac_sv": round(float(jac_sv), 6),
+                "theta_weight_delta": round(theta_weight_delta, 8),
+                "icnn_weight_delta": round(icnn_weight_delta, 8),
                 "adv_objective": round(float(adv_obj), 6),
                 "test_loss": round(test_loss, 6),
                 "test_acc": round(float(test_acc), 6),
@@ -2484,6 +2510,8 @@ def main():
             "reg_iters",
             "adv_objective",
             "train_penalty",
+            "theta_weight_delta",
+            "icnn_weight_delta",
         ]
         jac_epoch_path = jacobian_run_dir / "jacobian_epoch_stats.csv"
         with jac_epoch_path.open("w", newline="") as f_epoch:
