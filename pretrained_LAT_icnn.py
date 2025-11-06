@@ -43,11 +43,14 @@ from tqdm.auto import tqdm
 from ademamix import AdEMAMix
 from torch.nn.utils import parameters_to_vector
 from utils import (
+    CIFAR10_MEAN,
+    CIFAR10_STD,
     evaluate_under_input_pgd,
     get_cifar10_loaders,
     get_device,
     parameterized_filename,
     set_deterministic,
+    to_pixel,
 )
 
 # Reuse the pretrained split/build helpers and clean evaluation loop.
@@ -636,6 +639,66 @@ def adversarial_pushforward(
     return z_adv, delta
 
 
+def _clamp_normalized_inputs_(x: torch.Tensor) -> None:
+    """Clamp normalized CIFAR inputs so that pixel space remains within [0, 1]."""
+    mean = torch.as_tensor(CIFAR10_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    std = torch.as_tensor(CIFAR10_STD, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    lower = (0.0 - mean) / std
+    upper = (1.0 - mean) / std
+    x.clamp_(min=lower, max=upper)
+
+
+def reconstruct_inputs_from_latent(
+    phi: nn.Module,
+    z_target: torch.Tensor,
+    x_init: torch.Tensor,
+    steps: int,
+    lr: float,
+) -> Tuple[torch.Tensor, List[float]]:
+    """
+    Reconstruct pixel-space inputs whose latents match z_target by optimizing x.
+
+    Returns the reconstructed inputs (normalized space) and a sparse loss trace.
+    """
+    steps = max(1, int(steps))
+    lr = max(float(lr), 1e-6)
+
+    x_var = x_init.detach().clone()
+    x_var.requires_grad_(True)
+
+    phi_mode = phi.training
+    phi.eval()
+    grad_flags = [param.requires_grad for param in phi.parameters()]
+    for param in phi.parameters():
+        param.requires_grad_(False)
+
+    optimizer = optim.Adam([x_var], lr=lr)
+    loss_trace: List[float] = []
+    update_interval = max(1, steps // 5)
+    progress = tqdm(range(steps), desc="Latent→input recon", leave=False)
+
+    try:
+        target = z_target.detach()
+        for step in progress:
+            optimizer.zero_grad(set_to_none=True)
+            z_current = phi(x_var)
+            loss = F.mse_loss(z_current, target)
+            loss.backward()
+            optimizer.step()
+            with torch.no_grad():
+                _clamp_normalized_inputs_(x_var)
+            if ((step + 1) % update_interval == 0) or step == steps - 1:
+                loss_trace.append(float(loss.detach().item()))
+            progress.set_postfix({"mse": f"{loss.item():.4e}"})
+    finally:
+        progress.close()
+        for param, flag in zip(phi.parameters(), grad_flags):
+            param.requires_grad_(flag)
+        phi.train(phi_mode)
+
+    return x_var.detach(), loss_trace
+
+
 def _parse_hidden_units(token: str) -> int:
     """Parse hidden layer width tokens while tolerating bracket/comma syntax."""
     cleaned = token.strip().strip("[],")
@@ -838,6 +901,161 @@ def visualize_transport_map(
     fig.savefig(plot_path, dpi=200)
     plt.close(fig)
     print(f"Saved transport map visualization to {plot_path}")
+
+
+def visualize_adversarial_images(
+    phi: nn.Module,
+    head: nn.Module,
+    icnn: InputConvexPotential,
+    loader: DataLoader,
+    device: torch.device,
+    args,
+    run_id: str,
+    split_name: str,
+) -> None:
+    """Reconstruct and plot pixel-space samples induced by the ICNN transport map."""
+    num_samples = max(1, int(args.adv_image_samples))
+    phi_mode = phi.training
+    head_mode = head.training
+    icnn_mode = icnn.training
+    phi.eval()
+    head.eval()
+    icnn.eval()
+
+    xs: List[torch.Tensor] = []
+    ys: List[torch.Tensor] = []
+    collected = 0
+    for batch_x, batch_y in loader:
+        xs.append(batch_x)
+        ys.append(batch_y)
+        collected += batch_x.size(0)
+        if collected >= num_samples:
+            break
+
+    if not xs:
+        print("Adversarial image visualization skipped: no samples collected.")
+        phi.train(phi_mode)
+        head.train(head_mode)
+        icnn.train(icnn_mode)
+        return
+
+    x_batch = torch.cat(xs, dim=0)[:num_samples].to(device)
+    y_batch = torch.cat(ys, dim=0)[:num_samples].to(device)
+
+    with torch.no_grad():
+        z_clean = phi(x_batch)
+        logits_clean = head(z_clean)
+        preds_clean = logits_clean.argmax(dim=1)
+        conf_clean = F.softmax(logits_clean, dim=1).max(dim=1).values
+
+    z_adv_fixed, delta = adversarial_pushforward(icnn, z_clean, detach_for_model=True)
+    with torch.no_grad():
+        logits_adv_latent = head(z_adv_fixed)
+        preds_adv_latent = logits_adv_latent.argmax(dim=1)
+        conf_adv_latent = F.softmax(logits_adv_latent, dim=1).max(dim=1).values
+
+    x_recon, loss_traj = reconstruct_inputs_from_latent(
+        phi,
+        z_adv_fixed.detach(),
+        x_batch.detach(),
+        steps=args.adv_image_steps,
+        lr=args.adv_image_lr,
+    )
+
+    with torch.no_grad():
+        z_recon = phi(x_recon)
+        logits_recon = head(z_recon)
+        preds_recon = logits_recon.argmax(dim=1)
+        conf_recon = F.softmax(logits_recon, dim=1).max(dim=1).values
+        latent_mse = per_sample_mean_square_diff(z_recon, z_adv_fixed)
+
+    x_clean_pix = to_pixel(x_batch.detach()).clamp(0.0, 1.0)
+    x_adv_pix = to_pixel(x_recon).clamp(0.0, 1.0)
+    diff_pix = x_adv_pix - x_clean_pix
+    diff_mag = diff_pix.mul(diff_pix).sum(dim=1).sqrt()
+
+    delta_norm = delta.view(delta.size(0), -1).norm(dim=1)
+    pixel_l2 = diff_pix.view(diff_pix.size(0), -1).norm(dim=1)
+    pixel_linf = diff_pix.view(diff_pix.size(0), -1).abs().max(dim=1).values
+
+    clean_np = x_clean_pix.permute(0, 2, 3, 1).cpu().numpy()
+    adv_np = x_adv_pix.permute(0, 2, 3, 1).cpu().numpy()
+    diff_mag_np = diff_mag.cpu().numpy()
+
+    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 3 * num_samples), squeeze=False)
+    vmax = float(diff_mag.max().item() if diff_mag.numel() else 1.0)
+    if vmax <= 0.0:
+        vmax = 1e-6
+
+    heatmap_artist = None
+    for idx in range(num_samples):
+        axes[idx, 0].imshow(clean_np[idx])
+        axes[idx, 0].set_axis_off()
+        axes[idx, 0].set_title(
+            f"Clean y={int(y_batch[idx])} | ŷ={int(preds_clean[idx])} ({float(conf_clean[idx]):.2f})"
+        )
+
+        axes[idx, 1].imshow(adv_np[idx])
+        axes[idx, 1].set_axis_off()
+        axes[idx, 1].set_title(
+            f"Transported ŷ={int(preds_recon[idx])} ({float(conf_recon[idx]):.2f})\n"
+            f"||Δz||₂={float(delta_norm[idx]):.3f}"
+        )
+
+        heatmap_artist = axes[idx, 2].imshow(
+            diff_mag_np[idx],
+            cmap="magma",
+            vmin=0.0,
+            vmax=vmax,
+        )
+        axes[idx, 2].set_axis_off()
+        axes[idx, 2].set_title(
+            f"||Δx|| heatmap\nMSE_z={float(latent_mse[idx]):.2e}, L2={float(pixel_l2[idx]):.3f}"
+        )
+
+    if heatmap_artist is not None:
+        fig.colorbar(
+            heatmap_artist,
+            ax=axes[:, 2].ravel().tolist(),
+            fraction=0.02,
+            pad=0.04,
+            label="Pixel L2 magnitude",
+        )
+
+    fig.suptitle(f"ICNN transport: clean vs reconstructed adversarial samples ({split_name})")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    out_dir = Path(args.adv_image_dir) / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_path = out_dir / "transport_adversarial_images.png"
+    plot_params = {
+        "split": split_name,
+        "samples": num_samples,
+        "steps": args.adv_image_steps,
+        "lr": args.adv_image_lr,
+    }
+    out_path = parameterized_filename(base_path, plot_params)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved adversarial image visualization to {out_path}")
+
+    print("Adversarial image reconstruction summary:")
+    for idx in range(num_samples):
+        print(
+            f"  idx {idx}: y={int(y_batch[idx])} | clean ŷ={int(preds_clean[idx])} ({float(conf_clean[idx]):.3f}) "
+            f"→ transported ŷ={int(preds_adv_latent[idx])} ({float(conf_adv_latent[idx]):.3f}) "
+            f"→ reconstructed ŷ={int(preds_recon[idx])} ({float(conf_recon[idx]):.3f}); "
+            f"||Δz||₂={float(delta_norm[idx]):.4f}, latent MSE={float(latent_mse[idx]):.4e}, "
+            f"||Δx||₂={float(pixel_l2[idx]):.4f}, ||Δx||_∞={float(pixel_linf[idx]):.4f}"
+        )
+    if loss_traj:
+        print(
+            f"  Reconstruction MSE trajectory: start {loss_traj[0]:.4e} → end {loss_traj[-1]:.4e}"
+        )
+
+    phi.train(phi_mode)
+    head.train(head_mode)
+    icnn.train(icnn_mode)
 
 
 def estimate_mean_grad_norm(
@@ -1955,6 +2173,42 @@ def parse_args():
         help="Dataset split to draw samples from for the transport visualization.",
     )
     parser.add_argument(
+        "--visualize-adversarial-images",
+        action="store_true",
+        help="Reconstruct and plot pixel-space samples induced by the ICNN transport map.",
+    )
+    parser.add_argument(
+        "--adv-image-samples",
+        type=int,
+        default=6,
+        help="Number of examples to display in the adversarial image visualization.",
+    )
+    parser.add_argument(
+        "--adv-image-steps",
+        type=int,
+        default=400,
+        help="Gradient descent steps used when inverting transported latents to pixel space.",
+    )
+    parser.add_argument(
+        "--adv-image-lr",
+        type=float,
+        default=0.05,
+        help="Learning rate used for latent-to-image reconstruction.",
+    )
+    parser.add_argument(
+        "--adv-image-dir",
+        type=str,
+        default="fig/adv_images",
+        help="Directory where adversarial image panels are stored.",
+    )
+    parser.add_argument(
+        "--adv-image-split",
+        type=str,
+        choices=["train", "test"],
+        default="test",
+        help="Dataset split to sample from when visualizing adversarial images.",
+    )
+    parser.add_argument(
         "--track-transport-deltas",
         action="store_true",
         help="Record |T(z)-z|^2 statistics during adversary updates and generate summary plots.",
@@ -2565,6 +2819,19 @@ def main():
             args,
             run_id=run_id,
             split_name=args.transport_viz_split,
+        )
+
+    if args.visualize_adversarial_images:
+        adv_viz_loader = trainloader if args.adv_image_split == "train" else testloader
+        visualize_adversarial_images(
+            phi,
+            head,
+            icnn,
+            adv_viz_loader,
+            device,
+            args,
+            run_id=run_id,
+            split_name=args.adv_image_split,
         )
 
     if args.save:
