@@ -24,14 +24,17 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import random
 import warnings
 from collections import defaultdict
+from contextlib import contextmanager
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 import torch.nn as nn
@@ -654,6 +657,7 @@ def reconstruct_inputs_from_latent(
     x_init: torch.Tensor,
     steps: int,
     lr: float,
+    show_progress: bool = True,
 ) -> Tuple[torch.Tensor, List[float]]:
     """
     Reconstruct pixel-space inputs whose latents match z_target by optimizing x.
@@ -675,11 +679,12 @@ def reconstruct_inputs_from_latent(
     optimizer = optim.Adam([x_var], lr=lr)
     loss_trace: List[float] = []
     update_interval = max(1, steps // 5)
-    progress = tqdm(range(steps), desc="Latent→input recon", leave=False)
+    progress = tqdm(range(steps), desc="Latent→input recon", leave=False) if show_progress else None
+    iterator = progress if progress is not None else range(steps)
 
     try:
         target = z_target.detach()
-        for step in progress:
+        for step in iterator:
             optimizer.zero_grad(set_to_none=True)
             z_current = phi(x_var)
             loss = F.mse_loss(z_current, target)
@@ -689,9 +694,11 @@ def reconstruct_inputs_from_latent(
                 _clamp_normalized_inputs_(x_var)
             if ((step + 1) % update_interval == 0) or step == steps - 1:
                 loss_trace.append(float(loss.detach().item()))
-            progress.set_postfix({"mse": f"{loss.item():.4e}"})
+            if progress is not None:
+                progress.set_postfix({"mse": f"{loss.item():.4e}"})
     finally:
-        progress.close()
+        if progress is not None:
+            progress.close()
         for param, flag in zip(phi.parameters(), grad_flags):
             param.requires_grad_(flag)
         phi.train(phi_mode)
@@ -719,6 +726,97 @@ def _clamp_penalty_lambda(value: float) -> float:
     if not math.isfinite(value):
         return 0.0  # or raise an error
     return float(value)
+
+@contextmanager
+def _temporary_rng_state(seed: Optional[int]):
+    """Temporarily reset global RNG states when a seed is provided."""
+    if seed is None:
+        yield
+        return
+
+    cpu_state = torch.get_rng_state()
+    np_state = np.random.get_state()
+    py_state = random.getstate()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+    random.seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        np.random.set_state(np_state)
+        random.setstate(py_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _resolve_transport_viz_seed(args, split_name: str) -> Optional[int]:
+    """Return the deterministic seed used when drawing visualization samples."""
+    base_seed = getattr(args, "transport_viz_fixed_seed", None)
+    if base_seed is None:
+        base_seed = getattr(args, "seed", None)
+    if base_seed is None:
+        return None
+    offset = 0 if split_name == "train" else 1
+    return int(base_seed) + offset
+
+
+def _select_viz_indices(
+    dataset_len: int,
+    max_samples: int,
+    batch_index: int,
+    stride: Optional[int],
+) -> List[int]:
+    """Return deterministic dataset indices for the visualization batch."""
+    if dataset_len <= 0 or max_samples <= 0:
+        return []
+    stride_val = stride if stride is not None and stride > 0 else max_samples
+    start = max(0, batch_index) * stride_val
+    if start >= dataset_len:
+        start = max(0, dataset_len - max_samples)
+    end = min(dataset_len, start + max_samples)
+    if end - start < max_samples and dataset_len >= max_samples:
+        start = max(0, end - max_samples)
+        end = start + max_samples
+    return list(range(start, end))
+
+
+def _collect_fixed_dataset_batch(
+    dataset,
+    indices: Sequence[int],
+    seed: Optional[int],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Materialize a fixed batch of samples from a dataset."""
+    if not indices:
+        return None, None
+    xs: List[torch.Tensor] = []
+    ys: List[int] = []
+    with _temporary_rng_state(seed):
+        for idx in indices:
+            sample = dataset[idx]
+            if isinstance(sample, (tuple, list)) and len(sample) >= 2:
+                x_item, y_item = sample[0], sample[1]
+            else:
+                raise ValueError("Dataset samples must provide (input, target).")
+            x_tensor = x_item if isinstance(x_item, torch.Tensor) else torch.as_tensor(x_item)
+            if x_tensor.dim() == 2:
+                x_tensor = x_tensor.unsqueeze(0)
+            xs.append(x_tensor)
+            if isinstance(y_item, torch.Tensor):
+                y_value = int(y_item.item())
+            else:
+                y_value = int(y_item)
+            ys.append(y_value)
+    if not xs:
+        return None, None
+    batch_x = torch.stack(xs, dim=0)
+    batch_y = torch.tensor(ys, dtype=torch.long)
+    return batch_x, batch_y
+
 
 
 
@@ -789,23 +887,70 @@ def visualize_transport_map(
     z_list: List[torch.Tensor] = []
     z_adv_list: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
-    collected = 0
+    dataset = getattr(loader, "dataset", None)
+    fixed_indices: Optional[List[int]] = None
+    sample_source = "loader"
+    fixed_seed = _resolve_transport_viz_seed(args, split_name)
+    requested_batch_index = max(0, int(getattr(args, "transport_viz_batch_index", 0)))
+    fixed_inputs: Optional[torch.Tensor] = None
+    fixed_labels: Optional[torch.Tensor] = None
 
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
+    if dataset is not None and hasattr(dataset, "__getitem__"):
+        stride = getattr(loader, "batch_size", None)
+        fixed_indices = _select_viz_indices(
+            len(dataset),
+            max_samples,
+            requested_batch_index,
+            stride,
+        )
+        try:
+            fixed_inputs, fixed_labels = _collect_fixed_dataset_batch(
+                dataset, fixed_indices, fixed_seed
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Fell back to loader iteration when building fixed viz batch: {exc}",
+                RuntimeWarning,
+            )
+            fixed_inputs = None
+            fixed_labels = None
+            fixed_indices = None
+        else:
+            if fixed_inputs is None or fixed_labels is None or fixed_inputs.size(0) == 0:
+                fixed_inputs = None
+                fixed_labels = None
+                fixed_indices = None
+
+    def append_latents(batch_x: torch.Tensor, batch_y) -> None:
         with torch.no_grad():
-            z = phi(x)
+            z = phi(batch_x)
         z_detached = z.detach()
         with torch.enable_grad():
             z_leaf = z_detached.clone().requires_grad_(True)
             z_push = icnn.gradient(z_leaf, create_graph=False).detach()
         z_list.append(z_detached.cpu())
         z_adv_list.append(z_push.cpu())
-        labels.append(y.cpu())
-        collected += x.size(0)
-        if collected >= max_samples:
-            break
+        y_tensor = batch_y if isinstance(batch_y, torch.Tensor) else torch.as_tensor(batch_y)
+        labels.append(y_tensor.detach().cpu())
+
+    if fixed_inputs is not None and fixed_labels is not None:
+        sample_source = "fixed"
+        chunk_default = getattr(loader, "batch_size", None)
+        chunk_size = chunk_default if chunk_default is not None else max_samples
+        chunk_size = max(1, min(int(chunk_size), fixed_inputs.size(0)))
+        for start in range(0, fixed_inputs.size(0), chunk_size):
+            end = min(start + chunk_size, fixed_inputs.size(0))
+            x_chunk = fixed_inputs[start:end].to(device)
+            y_chunk = fixed_labels[start:end]
+            append_latents(x_chunk, y_chunk)
+    else:
+        collected = 0
+        for x, y in loader:
+            x = x.to(device)
+            append_latents(x, y)
+            collected += x.size(0)
+            if collected >= max_samples:
+                break
 
     phi.train(phi_mode)
     icnn.train(icnn_mode)
@@ -902,6 +1047,26 @@ def visualize_transport_map(
     plt.close(fig)
     print(f"Saved transport map visualization to {plot_path}")
 
+    metadata: Dict[str, object] = {
+        "split": split_name,
+        "method": args.transport_viz_method,
+        "samples_requested": max_samples,
+        "samples_plotted": int(z_tensor.size(0)),
+        "seed": args.seed,
+        "transport_viz_batch_index": requested_batch_index,
+        "transport_viz_fixed_seed": fixed_seed if fixed_seed is not None else args.seed,
+        "sample_source": sample_source,
+    }
+    if fixed_indices:
+        metadata.update(
+            {
+                "fixed_index_start": int(fixed_indices[0]),
+                "fixed_index_count": len(fixed_indices),
+            }
+        )
+    meta_path = viz_dir / "transport_map_metadata.json"
+    meta_path.write_text(json.dumps(metadata, indent=2))
+
 
 def visualize_adversarial_images(
     phi: nn.Module,
@@ -960,6 +1125,7 @@ def visualize_adversarial_images(
         x_batch.detach(),
         steps=args.adv_image_steps,
         lr=args.adv_image_lr,
+        show_progress=False,
     )
 
     with torch.no_grad():
@@ -1058,6 +1224,216 @@ def visualize_adversarial_images(
     icnn.train(icnn_mode)
 
 
+class AdversarialTrajectoryRecorder:
+    """Track adversarial reconstructions for fixed samples across epochs."""
+
+    def __init__(
+        self,
+        samples: torch.Tensor,
+        labels: torch.Tensor,
+        args,
+    ) -> None:
+        self.samples = samples.clone()  # normalized, on CPU
+        self.labels = labels.clone()
+        self.args = args
+        self.records: Dict[int, List[Dict[str, object]]] = {idx: [] for idx in range(samples.size(0))}
+        with torch.no_grad():
+            clean_pix = to_pixel(self.samples).clamp(0.0, 1.0)
+        self.clean_rgb = clean_pix.permute(0, 2, 3, 1).cpu().numpy()
+
+    def record_epoch(
+        self,
+        epoch: int,
+        phase: str,
+        phi: nn.Module,
+        head: nn.Module,
+        icnn: InputConvexPotential,
+        device: torch.device,
+    ) -> None:
+        phase_key = phase.lower()
+        tracked_phases = {"icnn", "adv", "adv_finetune", "icnn_pretrain"}
+        if phase_key not in tracked_phases:
+            return
+        num_samples = self.samples.size(0)
+        if num_samples == 0:
+            return
+
+        phi_mode = phi.training
+        head_mode = head.training
+        icnn_mode = icnn.training
+        phi.eval()
+        head.eval()
+        icnn.eval()
+
+        try:
+            for idx in range(num_samples):
+                x = self.samples[idx : idx + 1].to(device)
+                y = self.labels[idx : idx + 1].to(device)
+
+                with torch.no_grad():
+                    z_clean = phi(x)
+                    logits_clean = head(z_clean)
+                    preds_clean = logits_clean.argmax(dim=1)
+                    conf_clean = F.softmax(logits_clean, dim=1).max(dim=1).values
+
+                z_adv_fixed, delta = adversarial_pushforward(icnn, z_clean, detach_for_model=True)
+
+                with torch.no_grad():
+                    logits_adv_latent = head(z_adv_fixed)
+                    preds_adv_latent = logits_adv_latent.argmax(dim=1)
+                    conf_adv_latent = F.softmax(logits_adv_latent, dim=1).max(dim=1).values
+
+                x_recon, loss_traj = reconstruct_inputs_from_latent(
+                    phi,
+                    z_adv_fixed.detach(),
+                    x.detach(),
+                    steps=self.args.adv_trajectory_steps,
+                    lr=self.args.adv_trajectory_lr,
+                    show_progress=False,
+                )
+
+                with torch.no_grad():
+                    z_recon = phi(x_recon)
+                    logits_recon = head(z_recon)
+                    preds_recon = logits_recon.argmax(dim=1)
+                    conf_recon = F.softmax(logits_recon, dim=1).max(dim=1).values
+                    latent_mse = per_sample_mean_square_diff(z_recon, z_adv_fixed)
+
+                x_clean_pix = to_pixel(x).clamp(0.0, 1.0)
+                x_adv_pix = to_pixel(x_recon).clamp(0.0, 1.0)
+                diff_pix = x_adv_pix - x_clean_pix
+
+                delta_norm = delta.view(delta.size(0), -1).norm(dim=1)
+                pixel_l2 = diff_pix.view(diff_pix.size(0), -1).norm(dim=1)
+                pixel_linf = diff_pix.view(diff_pix.size(0), -1).abs().max(dim=1).values
+
+                record = {
+                    "epoch": int(epoch),
+                    "phase": str(phase),
+                    "label": int(self.labels[idx].item()),
+                    "clean_pred": int(preds_clean.item()),
+                    "clean_conf": float(conf_clean.item()),
+                    "adv_latent_pred": int(preds_adv_latent.item()),
+                    "adv_latent_conf": float(conf_adv_latent.item()),
+                    "recon_pred": int(preds_recon.item()),
+                    "recon_conf": float(conf_recon.item()),
+                    "delta_norm": float(delta_norm.item()),
+                    "latent_mse": float(latent_mse.item()),
+                    "pixel_l2": float(pixel_l2.item()),
+                    "pixel_linf": float(pixel_linf.item()),
+                    "adv_rgb": x_adv_pix[0].permute(1, 2, 0).cpu().numpy(),
+                    "diff_heatmap": diff_pix[0]
+                    .pow(2)
+                    .sum(dim=0)
+                    .sqrt()
+                    .cpu()
+                    .numpy(),
+                    "loss_traj": loss_traj,
+                }
+                self.records[idx].append(record)
+        finally:
+            phi.train(phi_mode)
+            head.train(head_mode)
+            icnn.train(icnn_mode)
+
+    def has_data(self) -> bool:
+        return any(self.records[idx] for idx in self.records)
+
+
+def plot_adversarial_trajectories(
+    recorder: AdversarialTrajectoryRecorder,
+    args,
+    run_id: str,
+) -> None:
+    if recorder is None or not recorder.has_data():
+        return
+
+    out_dir = Path(args.adv_trajectory_dir) / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, record_list in recorder.records.items():
+        if not record_list:
+            continue
+        label = int(recorder.labels[idx].item())
+        clean_rgb = recorder.clean_rgb[idx]
+        heatmaps = [rec["diff_heatmap"] for rec in record_list]
+        vmax = max(float(np.max(h)) for h in heatmaps)
+        if not math.isfinite(vmax) or vmax <= 0.0:
+            vmax = 1e-6
+
+        cols = len(record_list) + 1
+        fig = plt.figure(figsize=(4 * cols, 6))
+        gs = gridspec.GridSpec(2, cols, figure=fig, height_ratios=[1, 1], wspace=0.2, hspace=0.25)
+
+        ax_clean = fig.add_subplot(gs[0, 0])
+        ax_clean.imshow(clean_rgb)
+        ax_clean.set_axis_off()
+        ax_clean.set_title(f"Clean (y={label})")
+
+        ax_clean_heat = fig.add_subplot(gs[1, 0])
+        ax_clean_heat.set_axis_off()
+        timeline_lines = []
+        for rec in record_list:
+            timeline_lines.append(
+                f"Epoch {rec['epoch']:02d} ({rec['phase']}): "
+                f"clean ŷ={rec['clean_pred']} ({rec['clean_conf']:.2f}) → "
+                f"T(z) ŷ={rec['adv_latent_pred']} ({rec['adv_latent_conf']:.2f}) → "
+                f"recon ŷ={rec['recon_pred']} ({rec['recon_conf']:.2f}); "
+                f"||Δz||₂={rec['delta_norm']:.3f}, "
+                f"MSE_z={rec['latent_mse']:.2e}, "
+                f"||Δx||₂={rec['pixel_l2']:.3f}, "
+                f"||Δx||_∞={rec['pixel_linf']:.3f}"
+            )
+        ax_clean_heat.text(
+            0.0,
+            0.5,
+            "\n".join(timeline_lines),
+            fontsize=9,
+            va="center",
+            ha="left",
+            transform=ax_clean_heat.transAxes,
+        )
+
+        heat_axes = []
+        for col, rec in enumerate(record_list, start=1):
+            ax_adv = fig.add_subplot(gs[0, col])
+            ax_adv.imshow(rec["adv_rgb"])
+            ax_adv.set_axis_off()
+            ax_adv.set_title(
+                f"Epoch {rec['epoch']:02d} ({rec['phase']})\n"
+                f"ŷ={rec['recon_pred']} ({rec['recon_conf']:.2f})"
+            )
+
+            ax_heat = fig.add_subplot(gs[1, col])
+            im = ax_heat.imshow(rec["diff_heatmap"], cmap="magma", vmin=0.0, vmax=vmax)
+            ax_heat.set_axis_off()
+            ax_heat.set_title(
+                f"||Δx|| heatmap\n||Δz||₂={rec['delta_norm']:.3f}"
+            )
+            heat_axes.append(ax_heat)
+
+        if heat_axes:
+            fig.colorbar(
+                im,
+                ax=heat_axes,
+                fraction=0.025,
+                pad=0.06,
+                label="Pixel L2 magnitude",
+            )
+
+        fig.suptitle(f"Adversarial trajectory | sample {idx} | y={label}")
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        base_path = out_dir / f"trajectory_sample_{idx}.png"
+        plot_params = {
+            "samples": len(record_list),
+            "cut": args.cut_layer,
+            "icnn": "-".join(map(str, args.icnn_hidden)),
+        }
+        out_path = parameterized_filename(base_path, plot_params)
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        print(f"Saved adversarial trajectory for sample {idx} to {out_path}")
 def estimate_mean_grad_norm(
     phi: nn.Module,
     head: nn.Module,
@@ -1466,12 +1842,17 @@ def train_one_epoch(
 
         opt_theta.zero_grad(set_to_none=True)
         z = phi(x)
-        z_detached = z.detach()
+        z_detached = z.detach() 
+        with torch.no_grad():
+            clean_logits = head(z_detached)
+            clean_correct_mask = clean_logits.argmax(dim=1) == y
+        attack_indices = clean_correct_mask.nonzero(as_tuple=True)[0]
+        has_attack_samples = attack_indices.numel() > 0
         adv_objective_last: Optional[torch.Tensor] = None
         penalty_monitor = torch.zeros((), device=z_detached.device, dtype=z_detached.dtype)
         sv_estimate_last: Optional[torch.Tensor] = None
 
-        if run_icnn_ascent:
+        if run_icnn_ascent and has_attack_samples:
             ascent_steps = max(1, icnn_ascent_steps)
             bb_state: Optional[BBArmijoState] = None
             if icnn_step_rule == "bb-armijo" and icnn_bb_config is not None:
@@ -1483,6 +1864,8 @@ def train_one_epoch(
                     icnn_bb_config["ls_shrink"],
                     icnn_bb_config["ls_max_steps"],
                 )
+            z_source_attack = z_detached[attack_indices]
+            y_attack = y[attack_indices]
             ascent_bar = tqdm(
                 range(ascent_steps),
                 desc="ICNN Ascent",
@@ -1493,7 +1876,7 @@ def train_one_epoch(
                 for ascent_step in ascent_bar:
                     opt_icnn.zero_grad(set_to_none=True)
                     z_adv_ascent, _ = adversarial_pushforward(
-                        icnn, z_detached, detach_for_model=False
+                        icnn, z_source_attack, detach_for_model=False
                     )
                     if not torch.isfinite(z_adv_ascent).all():
                         warnings.warn(
@@ -1513,10 +1896,10 @@ def train_one_epoch(
                         batch_indices = torch.arange(
                             logits_adv.size(0), device=logits_adv.device, dtype=torch.long
                         )
-                        logits_correct = logits_adv[batch_indices, y]
+                        logits_correct = logits_adv[batch_indices, y_attack]
                         logits_sorted, indices = logits_adv.sort(dim=1, descending=True)
                         redlr = torch.zeros_like(logits_correct)
-                        is_correct = indices[:, 0] == y
+                        is_correct = indices[:, 0] == y_attack
                         if is_correct.any():
                             numer = logits_correct[is_correct] - logits_sorted[is_correct, 1]
                             denom = logits_sorted[is_correct, 0] - logits_sorted[is_correct, 2]
@@ -1524,19 +1907,19 @@ def train_one_epoch(
                         adv_primary = redlr.mean()
                         metric_key = "redlr"
                     elif use_margin_adv:
-                        logits_correct = logits_adv.gather(1, y.unsqueeze(1)).squeeze(1)
+                        logits_correct = logits_adv.gather(1, y_attack.unsqueeze(1)).squeeze(1)
                         margins = logits_adv - logits_correct.unsqueeze(1)
                         num_classes = logits_adv.size(1)
-                        correct_mask = F.one_hot(y, num_classes=num_classes).bool()
-                        margins = margins.masked_fill(correct_mask, float("-inf"))
+                        target_mask = F.one_hot(y_attack, num_classes=num_classes).bool()
+                        margins = margins.masked_fill(target_mask, float("-inf"))
                         adv_primary = torch.logsumexp(margins, dim=1).mean()
                         metric_key = "margin"
                     else:
-                        adv_primary = F.cross_entropy(logits_adv, y, reduction="mean")
+                        adv_primary = F.cross_entropy(logits_adv, y_attack, reduction="mean")
                         metric_key = "ce"
-                    per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_detached)
+                    per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_source_attack)
                     penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
-                        z_detached,
+                        z_source_attack,
                         z_adv_ascent,
                         head,
                         penalty_lambda,
@@ -1549,7 +1932,7 @@ def train_one_epoch(
                     if jacobian_reg_weight > 0.0:
                         sv_estimate = estimate_local_jacobian_sv(
                             icnn,
-                            z_detached,
+                            z_source_attack,
                             num_samples=jacobian_reg_samples,
                             power_iters=jacobian_reg_iters,
                             rng=rng,
@@ -1638,8 +2021,8 @@ def train_one_epoch(
                             adv_objective_candidate, _ = _evaluate_icnn_adv_objective(
                                 icnn,
                                 head,
-                                z_detached,
-                                y,
+                                z_source_attack,
+                                y_attack,
                                 penalty_lambda,
                                 cosine_cfg,
                                 use_margin_adv,
@@ -1688,6 +2071,8 @@ def train_one_epoch(
                         adv_objective_last = adv_objective.detach()
             finally:
                 ascent_bar.close()
+        elif run_icnn_ascent:
+            adv_objective_last = torch.zeros((), device=z_detached.device, dtype=z_detached.dtype)
 
         for param in model_params:
             if param.grad is not None:
@@ -1697,7 +2082,20 @@ def train_one_epoch(
             continue
 
         opt_theta.zero_grad(set_to_none=True)
-        z_adv_fixed, delta = adversarial_pushforward(icnn, z, detach_for_model=True)
+        delta_full = torch.zeros_like(z)
+        if has_attack_samples:
+            z_attack = z[attack_indices]
+            z_adv_subset, delta_subset = adversarial_pushforward(
+                icnn, z_attack, detach_for_model=True
+            )
+            if not torch.isfinite(z_adv_subset).all():
+                warnings.warn(
+                    "Skipping batch update due to non-finite adversarial latents on correctly classified samples.",
+                    RuntimeWarning,
+                )
+                continue
+            delta_full[attack_indices] = delta_subset
+        z_adv_fixed = z + delta_full
         if not torch.isfinite(z_adv_fixed).all():
             warnings.warn(
                 "Skipping batch update due to non-finite adversarial latents.",
@@ -2173,6 +2571,18 @@ def parse_args():
         help="Dataset split to draw samples from for the transport visualization.",
     )
     parser.add_argument(
+        "--transport-viz-batch-index",
+        type=int,
+        default=0,
+        help="Zero-based batch index used to select a fixed visualization subset.",
+    )
+    parser.add_argument(
+        "--transport-viz-fixed-seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed override when sampling the fixed visualization batch (defaults to --seed).",
+    )
+    parser.add_argument(
         "--visualize-adversarial-images",
         action="store_true",
         help="Reconstruct and plot pixel-space samples induced by the ICNN transport map.",
@@ -2207,6 +2617,35 @@ def parse_args():
         choices=["train", "test"],
         default="test",
         help="Dataset split to sample from when visualizing adversarial images.",
+    )
+    parser.add_argument(
+        "--track-adv-trajectory",
+        action="store_true",
+        help="Track selected samples across adversarial epochs and visualise their trajectory.",
+    )
+    parser.add_argument(
+        "--adv-trajectory-samples",
+        type=int,
+        default=3,
+        help="Number of training samples to monitor throughout adversarial training.",
+    )
+    parser.add_argument(
+        "--adv-trajectory-steps",
+        type=int,
+        default=200,
+        help="Latent inversion steps per epoch when tracking adversarial trajectories.",
+    )
+    parser.add_argument(
+        "--adv-trajectory-lr",
+        type=float,
+        default=0.03,
+        help="Latent inversion learning rate for trajectory tracking.",
+    )
+    parser.add_argument(
+        "--adv-trajectory-dir",
+        type=str,
+        default="fig/adv_trajectories",
+        help="Directory where adversarial trajectory panels are stored.",
     )
     parser.add_argument(
         "--track-transport-deltas",
@@ -2350,6 +2789,27 @@ def main():
     print(f"Training schedule: {' → '.join(schedule)}")
 
     trainloader, testloader = get_cifar10_loaders(batch_size=args.batch_size, seed=args.seed)
+
+    trajectory_recorder: Optional[AdversarialTrajectoryRecorder] = None
+    if args.track_adv_trajectory:
+        desired = max(1, int(args.adv_trajectory_samples))
+        collected_x: List[torch.Tensor] = []
+        collected_y: List[torch.Tensor] = []
+        train_iter = iter(trainloader)
+        while len(collected_x) < desired:
+            try:
+                batch_x, batch_y = next(train_iter)
+            except StopIteration:
+                break
+            collected_x.append(batch_x)
+            collected_y.append(batch_y)
+        if collected_x:
+            samples = torch.cat(collected_x, dim=0)[:desired].cpu()
+            labels = torch.cat(collected_y, dim=0)[:desired].cpu()
+            trajectory_recorder = AdversarialTrajectoryRecorder(samples, labels, args)
+            print(f"Tracking {samples.size(0)} samples for adversarial trajectory visualisation.")
+        else:
+            print("Requested adversarial trajectory tracking, but no samples were collected.")
 
     log_csv_path = parameterized_filename(
         args.log_csv,
@@ -2717,6 +3177,9 @@ def main():
 
         lr_scheduler.step()
 
+        if trajectory_recorder is not None:
+            trajectory_recorder.record_epoch(epoch, phase, phi, head, icnn, device)
+
         if (
             args.calibrate_penalty
             and not cosine_cfg["enabled"]
@@ -2833,6 +3296,9 @@ def main():
             run_id=run_id,
             split_name=args.adv_image_split,
         )
+
+    if trajectory_recorder is not None:
+        plot_adversarial_trajectories(trajectory_recorder, args, run_id)
 
     if args.save:
         Path(args.save).parent.mkdir(parents=True, exist_ok=True)
