@@ -1,0 +1,334 @@
+wandb_version: 1
+
+pretrained_path:
+  desc: null
+  value: /mnt/lts4/scratch/students/aabdolla/LAT/ResNet_checkpoints/R2.pth
+pretrained_strict:
+  desc: null
+  value: false
+epochs_clean:
+  desc: null
+  value: 0
+epochs_adv:
+  desc: null
+  value: 2
+epochs:
+  desc: null
+  value: 0
+epochs_icnn_pretrain:
+  desc: null
+  value: 5
+epochs_adv_finetune:
+  desc: null
+  value: 0
+batch_size:
+  desc: null
+  value: 256
+lr_theta:
+  desc: null
+  value: 0.1
+momentum:
+  desc: null
+  value: 0.9
+weight_decay:
+  desc: null
+  value: 0.0005
+seed:
+  desc: null
+  value: 1
+head_only:
+  desc: null
+  value: false
+penalty_lambda:
+  desc: null
+  value: 300.0
+use_margin_loss:
+  desc: null
+  value: true
+use_redlr_loss:
+  desc: null
+  value: false
+icnn_hidden:
+  desc: null
+  value:
+  - 512
+  - 512
+icnn_activation:
+  desc: null
+  value: softplus
+icnn_strong_convexity:
+  desc: null
+  value: 1.0
+icnn_init:
+  desc: null
+  value: principled
+lr_omega:
+  desc: null
+  value: 0.0005
+icnn_step_rule:
+  desc: null
+  value: bb-armijo
+icnn_alpha0:
+  desc: null
+  value: 0.0005
+icnn_ls_c:
+  desc: null
+  value: 0.1
+icnn_ls_shrink:
+  desc: null
+  value: 0.5
+icnn_ls_max_steps:
+  desc: null
+  value: 10
+icnn_alpha_min:
+  desc: null
+  value: 1.0e-06
+icnn_alpha_max:
+  desc: null
+  value: 1.0
+icnn_optimizer:
+  desc: null
+  value: ademamix
+icnn_beta1:
+  desc: null
+  value: 0.9
+icnn_beta2:
+  desc: null
+  value: 0.999
+ademamix_beta3:
+  desc: null
+  value: 0.9999
+ademamix_alpha:
+  desc: null
+  value: 4.0
+ademamix_beta3_warmup:
+  desc: null
+  value: 5
+ademamix_alpha_warmup:
+  desc: null
+  value: 3
+icnn_ascent_steps:
+  desc: null
+  value: 5
+cosine_penalty:
+  desc: null
+  value: false
+cosine_feature:
+  desc: null
+  value: latent
+cosine_lambda:
+  desc: null
+  value: 1.0
+cosine_quadratic_weight:
+  desc: null
+  value: 1.0
+cosine_eps:
+  desc: null
+  value: 1.0e-06
+cut_layer:
+  desc: null
+  value: input
+log_csv:
+  desc: null
+  value: ./runs_log_icnn.csv
+save:
+  desc: null
+  value: ''
+jacobian_aware:
+  desc: null
+  value: true
+jacobian_batches:
+  desc: null
+  value: 4
+jacobian_iters:
+  desc: null
+  value: 10
+jacobian_reg_weight:
+  desc: null
+  value: 0.0
+jacobian_reg_samples:
+  desc: null
+  value: 1
+jacobian_reg_iters:
+  desc: null
+  value: 1
+jacobian_log_dir:
+  desc: null
+  value: results/jacobian_logs
+inp_p:
+  desc: null
+  value: inf
+inp_eps:
+  desc: null
+  value: 0.03137254901960784
+inp_steps:
+  desc: null
+  value: 20
+inp_step_size:
+  desc: null
+  value: 0.0
+inp_restarts:
+  desc: null
+  value: 5
+eval_input_pgd:
+  desc: null
+  value: true
+eval_input_pgd_samples:
+  desc: null
+  value: 1000
+visualize_transport:
+  desc: null
+  value: true
+transport_viz_method:
+  desc: null
+  value: tsne
+transport_viz_samples:
+  desc: null
+  value: 512
+transport_viz_dir:
+  desc: null
+  value: fig/transport_maps
+transport_viz_split:
+  desc: null
+  value: test
+transport_viz_batch_index:
+  desc: null
+  value: 0
+transport_viz_fixed_seed:
+  desc: null
+  value: null
+visualize_adversarial_images:
+  desc: null
+  value: true
+adv_image_samples:
+  desc: null
+  value: 6
+adv_image_steps:
+  desc: null
+  value: 400
+adv_image_lr:
+  desc: null
+  value: 0.05
+adv_image_dir:
+  desc: null
+  value: fig/adv_images
+adv_image_split:
+  desc: null
+  value: test
+adv_image_every_epoch:
+  desc: null
+  value: true
+track_adv_trajectory:
+  desc: null
+  value: false
+adv_trajectory_samples:
+  desc: null
+  value: 3
+adv_trajectory_steps:
+  desc: null
+  value: 200
+adv_trajectory_lr:
+  desc: null
+  value: 0.03
+adv_trajectory_dir:
+  desc: null
+  value: fig/adv_trajectories
+use_wandb:
+  desc: null
+  value: true
+wandb_project:
+  desc: null
+  value: Robustness_In_Concept_Space
+wandb_entity:
+  desc: null
+  value: null
+wandb_run_name:
+  desc: null
+  value: null
+wandb_mode:
+  desc: null
+  value: online
+track_transport_deltas:
+  desc: null
+  value: true
+track_transport_batches:
+  desc: null
+  value: 4
+transport_delta_plot_dir:
+  desc: null
+  value: fig/transport_deltas
+estimate_transport_jacobian:
+  desc: null
+  value: true
+jacobian_sv_batches:
+  desc: null
+  value: 10
+jacobian_sv_samples:
+  desc: null
+  value: 512
+jacobian_sv_split:
+  desc: null
+  value: test
+icnn_conv:
+  desc: null
+  value: false
+icnn_kernel_size:
+  desc: null
+  value: 3
+latent_eps_target:
+  desc: null
+  value: 2.0
+calibrate_penalty:
+  desc: null
+  value: false
+gamma_calibration_batches:
+  desc: null
+  value: 4
+calibration_ratio_min:
+  desc: null
+  value: 1.0
+calibration_ratio_max:
+  desc: null
+  value: 6.0
+_wandb:
+  desc: null
+  value:
+    python_version: 3.10.12
+    cli_version: 0.17.8
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1763239203
+    t:
+      1:
+      - 1
+      - 55
+      2:
+      - 1
+      - 5
+      - 41
+      - 53
+      - 55
+      3:
+      - 1
+      - 2
+      - 13
+      - 16
+      - 23
+      - 61
+      - 62
+      4: 3.10.12
+      5: 0.17.8
+      8:
+      - 5
+      13: linux-x86_64
+schedule:
+  desc: null
+  value:
+  - icnn_pretrain
+  - icnn_pretrain
+  - icnn_pretrain
+  - icnn_pretrain
+  - icnn_pretrain
+  - icnn
+  - icnn

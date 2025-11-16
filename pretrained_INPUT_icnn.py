@@ -56,6 +56,7 @@ from utils import (
     set_deterministic,
     to_pixel,
 )
+from wandb_logger import WandBLogger
 
 # Reuse clean evaluation helpers from the latent-training script.
 from pretrained_LAT import (  # type: ignore
@@ -1103,14 +1104,23 @@ def visualize_adversarial_images(
     ys: List[torch.Tensor] = []
     collected = 0
     for batch_x, batch_y in loader:
-        xs.append(batch_x)
-        ys.append(batch_y)
-        collected += batch_x.size(0)
+        batch_x = batch_x.to(device)
+        batch_y = batch_y.to(device)
+        with torch.no_grad():
+            logits_batch = head(phi(batch_x))
+            preds_batch = logits_batch.argmax(dim=1)
+            correct_mask = preds_batch == batch_y
+        if correct_mask.any():
+            xs.append(batch_x[correct_mask].cpu())
+            ys.append(batch_y[correct_mask].cpu())
+            collected += int(correct_mask.sum().item())
         if collected >= num_samples:
             break
 
     if not xs:
-        print("Adversarial image visualization skipped: no samples collected.")
+        print(
+            "Adversarial image visualization skipped: no correctly classified samples collected."
+        )
         phi.train(phi_mode)
         head.train(head_mode)
         icnn.train(icnn_mode)
@@ -1873,11 +1883,14 @@ def train_one_epoch(
     icnn_step_rule: str = "constant",
     icnn_bb_config: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, float, float, float, float]:
-    phi.train(not head_only)
-    head.train()
+    freeze_model = method == "icnn_pretrain"
+    phi.train(False if freeze_model else not head_only)
+    head.train(not freeze_model)
     icnn.train()
     penalty_lambda = _clamp_penalty_lambda(float(penalty_lambda))
-    model_params = [p for p in list(phi.parameters()) + list(head.parameters()) if p.requires_grad]
+    model_params: List[torch.Tensor] = []
+    if not freeze_model:
+        model_params = [p for p in list(phi.parameters()) + list(head.parameters()) if p.requires_grad]
 
     total_loss = 0.0
     total_correct = 0
@@ -2731,6 +2744,38 @@ def parse_args():
         default="fig/adv_trajectories",
         help="Directory where adversarial trajectory panels are stored.",
     )
+    parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="icnn-input",
+        help="wandb project name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional wandb entity/organization.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional wandb run name (defaults to timestamp).",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="wandb logging mode.",
+    )
+    parser.add_argument(
+        "--wandb-api-key",
+        type=str,
+        default=None,
+        help="API key for wandb authentication (overrides WANDB_API_KEY env var when provided).",
+    )
     parser.add_argument(
         "--track-transport-deltas",
         action="store_true",
@@ -2872,6 +2917,23 @@ def main():
     total_epochs, schedule = determine_schedule(args)
     print(f"Training schedule: {' → '.join(schedule)}")
 
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    wandb_enabled = args.use_wandb and args.wandb_mode != "disabled"
+    wandb_config = {}
+    for key, value in vars(args).items():
+        if key == "wandb_api_key":
+            continue
+        wandb_config[key] = list(value) if isinstance(value, (list, tuple)) else value
+    wandb_logger = WandBLogger(
+        enabled=wandb_enabled,
+        project=args.wandb_project,
+        run_name=args.wandb_run_name or f"input-icnn-{run_id}",
+        entity=args.wandb_entity,
+        mode=args.wandb_mode if wandb_enabled else "disabled",
+        api_key=args.wandb_api_key,
+        config=wandb_config,
+    )
+
     trainloader, testloader = get_cifar10_loaders(batch_size=args.batch_size, seed=args.seed)
 
     trajectory_recorder: Optional[AdversarialTrajectoryRecorder] = None
@@ -2928,6 +2990,11 @@ def main():
     print("\n[Sanity] Evaluating pretrained model on clean data before ICNN training...")
     clean_loss, clean_acc = evaluate(phi, head, testloader, device)
     print(f"[Sanity] Clean baseline — loss: {clean_loss:.4f}, acc: {clean_acc*100:.2f}%")
+    if wandb_logger.enabled:
+        wandb_logger.log(
+            {"sanity/clean_loss": clean_loss, "sanity/clean_acc": clean_acc},
+            step=0,
+        )
 
     cosine_cfg = {
         "enabled": bool(args.cosine_penalty),
@@ -3034,7 +3101,9 @@ def main():
     
     
 
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if wandb_logger.enabled:
+        wandb_logger.update_config({"schedule": schedule})
+        wandb_logger.watch([head, icnn])
     tracker = TransportDeltaTracker(
         enabled=args.track_transport_deltas,
         max_batches=max(0, args.track_transport_batches),
@@ -3085,6 +3154,7 @@ def main():
     theta_prev_vec = flatten_module_parameters([phi, head])
     icnn_prev_vec = flatten_module_parameters([icnn])
     minimax_sanity_done = args.epochs_icnn_pretrain <= 0
+    final_epoch_log: Optional[Dict[str, Any]] = None
 
     for epoch, phase in enumerate(schedule, start=1):
         print(f"\n=== Epoch {epoch:02d}/{total_epochs} | Phase: {phase.upper()} ===")
@@ -3095,6 +3165,14 @@ def main():
             sanity_loss, sanity_acc = evaluate(phi, head, testloader, device)
             print(f"[Sanity] Pre-minimax — loss: {sanity_loss:.4f}, acc: {sanity_acc*100:.2f}%")
             minimax_sanity_done = True
+            if wandb_logger.enabled:
+                wandb_logger.log(
+                    {
+                        "sanity/pre_minimax_loss": sanity_loss,
+                        "sanity/pre_minimax_acc": sanity_acc,
+                    },
+                    step=epoch,
+                )
 
         if phase == "icnn" and args.jacobian_aware and not jacobian_ready:
             L_hat, eps_latent = jacobian_aware_latent_eps(
@@ -3220,6 +3298,50 @@ def main():
         if jacobian_ready and L_hat_used is not None:
             msg += f" | L_hat {L_hat_used:.4f}"
         print(msg)
+        if wandb_logger.enabled:
+            theta_lr = (
+                float(opt_theta.param_groups[0]["lr"])
+                if getattr(opt_theta, "param_groups", None)
+                else None
+            )
+            icnn_lr = (
+                float(opt_icnn.param_groups[0]["lr"])
+                if getattr(opt_icnn, "param_groups", None)
+                else None
+            )
+            epoch_log: Dict[str, Any] = {
+                "epoch": epoch,
+                "phase": phase,
+                "train/loss": train_loss,
+                "train/acc": train_acc,
+                "train/penalty": penalty_avg,
+                "train/jacobian_penalty": jac_penalty,
+                "train/jacobian_sv": jac_sv,
+                "train/adv_objective": adv_obj,
+                "train/jacobian_counts": jac_counts,
+                "test/loss": test_loss,
+                "test/acc": test_acc,
+                "icnn/loss": icnn_loss,
+                "icnn/acc": icnn_acc,
+                "icnn/penalty": icnn_penalty,
+                "weights/delta_theta": theta_weight_delta,
+                "weights/delta_icnn": icnn_weight_delta,
+                "lambdas/penalty_lambda": args.penalty_lambda,
+                "lr/theta": theta_lr,
+                "lr/icnn": icnn_lr,
+            }
+            if input_pgd_acc is not None:
+                epoch_log.update(
+                    {
+                        "robust/input_pgd_acc": input_pgd_acc,
+                        "robust/input_pgd_avg_l2": ipgd_l2,
+                        "robust/input_pgd_avg_linf": ipgd_linf,
+                    }
+                )
+            if L_hat_used is not None:
+                epoch_log["jacobian/L_hat"] = L_hat_used
+            wandb_logger.log(epoch_log, step=epoch)
+            final_epoch_log = dict(epoch_log)
 
         jacobian_epoch_records.append(
             {
@@ -3320,7 +3442,21 @@ def main():
                     f"smoothing {smoothing:.4f}, penalty_lambda {args.penalty_lambda:.6f} → {new_lambda:.6f}"
                 )
                 args.penalty_lambda = new_lambda
+                if wandb_logger.enabled:
+                    wandb_logger.log(
+                        {
+                            "calibration/avg_delta": avg_delta,
+                            "calibration/ratio_raw": ratio_raw,
+                            "calibration/ratio_clamped": ratio_clamped,
+                            "calibration/smoothing": smoothing,
+                            "lambdas/penalty_lambda": args.penalty_lambda,
+                        },
+                        step=epoch,
+                    )
         tracker.finish_epoch()
+
+    if wandb_logger.enabled and final_epoch_log is not None:
+        wandb_logger.log_summary(final_epoch_log)
 
     save_transport_delta_plot(tracker, args, run_id)
 
@@ -3360,6 +3496,15 @@ def main():
         summary_path = jacobian_run_dir / "summary.json"
         summary_path.write_text(json.dumps(jacobian_summary, indent=2))
         print(f"Saved Jacobian epoch statistics to {jac_epoch_path}")
+        if wandb_logger.enabled:
+            wandb_logger.log(
+                {
+                    "jacobian/epochs_recorded": jacobian_summary["epochs_recorded"],
+                    "jacobian/mean_sv_overall": overall_mean_sv,
+                    "jacobian/max_sv_overall": overall_max_sv,
+                },
+                step=total_epochs,
+            )
 
     if args.estimate_transport_jacobian:
         jac_loader = trainloader if args.jacobian_sv_split == "train" else testloader
@@ -3380,6 +3525,14 @@ def main():
             )
             summary_path = jacobian_run_dir / "summary.json"
             summary_path.write_text(json.dumps(jacobian_summary, indent=2))
+            if wandb_logger.enabled:
+                wandb_logger.log(
+                    {
+                        "jacobian/transport_sigma_max": max_sv,
+                        "jacobian/transport_sigma_mean": mean_sv,
+                    },
+                    step=total_epochs,
+                )
 
     if args.visualize_transport:
         viz_loader = trainloader if args.transport_viz_split == "train" else testloader
@@ -3421,6 +3574,9 @@ def main():
             args.save,
         )
         print(f"Saved checkpoint to {args.save}")
+
+    if wandb_logger.enabled:
+        wandb_logger.finish()
 
 
 if __name__ == "__main__":
