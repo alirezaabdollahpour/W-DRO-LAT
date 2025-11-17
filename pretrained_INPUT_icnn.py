@@ -71,6 +71,16 @@ DEFAULT_CALIBRATION_RATIO_MIN = 1.0
 DEFAULT_CALIBRATION_RATIO_MAX = 6.0
 CALIBRATION_SMOOTHING = 0.1
 
+# Amortization-related hyperparameters (can later be exposed as CLI flags)
+USE_AMORTIZATION_LOSSES = True
+
+AMORT_INNER_STEPS = 5        # number of refinement steps for x* (L_obj / L_reg)
+AMORT_INNER_LR = 0.05        # step size for inner refinement
+
+AMORT_WEIGHT_OBJ = 1.0       # weight on L_obj (objective gap)
+AMORT_WEIGHT_CYCLE = 1.0     # weight on L_cycle (first-order residual)
+AMORT_WEIGHT_REG = 1.0       # weight on L_reg (distance T_ω(x) vs refined x*)
+
 
 class TransportDeltaTracker:
     """Utility for recording |T(z)-z|^2 statistics during training."""
@@ -235,6 +245,57 @@ def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tenso
         raise ValueError("Tensors must have identical shapes to compute mean square difference.")
     diff = (a - b).reshape(a.size(0), -1)
     return diff.pow(2).mean(dim=1)
+
+
+def dro_inner_objective_per_sample(
+    x_adv: torch.Tensor,
+    x_src: torch.Tensor,
+    y: torch.Tensor,
+    phi: nn.Module,
+    head: nn.Module,
+    penalty_lambda: float,
+    use_margin_adv: bool = True,
+    use_redlr_loss: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Per-sample inner objective
+
+        F_theta(x'; x,y) = ℓ_theta(x') - λ ||x' - x||^2,
+
+    where ℓ_theta is chosen by `use_margin_adv` / `use_redlr_loss`.
+    Returns (F_per_sample, primary_loss_per_sample, penalty_per_sample).
+    """
+    # Forward logits through model
+    logits = head(phi(x_adv))
+
+    if use_redlr_loss:
+        num_classes = logits.size(1)
+        if num_classes < 3:
+            raise RuntimeError("ReDLR requires at least 3 classes.")
+        batch_idx = torch.arange(logits.size(0), device=logits.device)
+        logits_correct = logits[batch_idx, y]
+        logits_sorted, indices = logits.sort(dim=1, descending=True)
+        redlr = torch.zeros_like(logits_correct)
+        is_correct = indices[:, 0] == y
+        if is_correct.any():
+            numer = logits_correct[is_correct] - logits_sorted[is_correct, 1]
+            denom = logits_sorted[is_correct, 0] - logits_sorted[is_correct, 2]
+            redlr[is_correct] = -numer / denom
+        primary_per_sample = redlr
+    elif use_margin_adv:
+        logits_correct = logits.gather(1, y.unsqueeze(1)).squeeze(1)
+        margins = logits - logits_correct.unsqueeze(1)
+        num_classes = logits.size(1)
+        mask = F.one_hot(y, num_classes=num_classes).bool()
+        margins = margins.masked_fill(mask, float("-inf"))
+        primary_per_sample = torch.logsumexp(margins, dim=1)
+    else:
+        primary_per_sample = F.cross_entropy(logits, y, reduction="none")
+
+    mse_per_sample = per_sample_mean_square_diff(x_adv, x_src)
+    penalty_per_sample = penalty_lambda * mse_per_sample
+    F_per_sample = primary_per_sample - penalty_per_sample
+    return F_per_sample, primary_per_sample, penalty_per_sample
 
 
 def flatten_module_parameters(modules: Sequence[nn.Module]) -> torch.Tensor:
@@ -715,6 +776,81 @@ def reconstruct_inputs_from_latent(
         phi.train(phi_mode)
 
     return x_var.detach(), loss_trace
+
+
+def refine_inner_maximizer_input(
+    x_init: torch.Tensor,
+    x_src: torch.Tensor,
+    y: torch.Tensor,
+    phi: nn.Module,
+    head: nn.Module,
+    penalty_lambda: float,
+    steps: int,
+    lr: float,
+    use_margin_adv: bool = True,
+    use_redlr_loss: bool = False,
+) -> torch.Tensor:
+    """
+    Given an initial adversarial point x_init (e.g. T_ω(x_src)), refine it towards
+    an (approximate) maximizer of
+
+        F_theta(x'; x_src, y) = ℓ(f_theta(x'), y) - λ ||x' - x_src||^2
+
+    using gradient ascent in x'-space (Adam).
+    """
+    steps = max(1, int(steps))
+    lr = max(float(lr), 1e-6)
+
+    # Make x the only trainable variable
+    x_var = x_init.detach().clone()
+    x_var.requires_grad_(True)
+
+    # Freeze model parameters (we only want gradients wrt x_var)
+    phi_mode = phi.training
+    head_mode = head.training
+    phi.eval()
+    head.eval()
+    phi_grad_flags = [p.requires_grad for p in phi.parameters()]
+    head_grad_flags = [p.requires_grad for p in head.parameters()]
+    for p in phi.parameters():
+        p.requires_grad_(False)
+    for p in head.parameters():
+        p.requires_grad_(False)
+
+    optimizer = optim.Adam([x_var], lr=lr)
+
+    grad_enabled_prev = torch.is_grad_enabled()
+    torch.set_grad_enabled(True)
+    try:
+        for _ in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            F_per_sample, _, _ = dro_inner_objective_per_sample(
+                x_adv=x_var,
+                x_src=x_src,
+                y=y,
+                phi=phi,
+                head=head,
+                penalty_lambda=penalty_lambda,
+                use_margin_adv=use_margin_adv,
+                use_redlr_loss=use_redlr_loss,
+            )
+            # Maximize F_theta ⇒ minimize negative
+            loss_inner = -F_per_sample.mean()
+            loss_inner.backward()
+            optimizer.step()
+            with torch.no_grad():
+                _clamp_normalized_inputs_(x_var)
+    finally:
+        torch.set_grad_enabled(grad_enabled_prev)
+        # Restore model state
+        phi.train(phi_mode)
+        head.train(head_mode)
+        for p, flag in zip(phi.parameters(), phi_grad_flags):
+            p.requires_grad_(flag)
+        for p, flag in zip(head.parameters(), head_grad_flags):
+            p.requires_grad_(flag)
+
+    return x_var.detach()
 
 
 def _parse_hidden_units(token: str) -> int:
@@ -1811,12 +1947,13 @@ class BBArmijoState:
 
 def _evaluate_icnn_adv_objective(
     icnn: InputConvexPotential,
+    phi: nn.Module,
     head: nn.Module,
     z_source: torch.Tensor,
     y: torch.Tensor,
     penalty_lambda: float,
-    cosine_cfg: Optional[Dict[str, Any]],
     use_margin_adv: bool,
+    use_redlr_loss: bool,
     jacobian_reg_weight: float,
     jacobian_reg_samples: int,
     jacobian_reg_iters: int,
@@ -1824,27 +1961,19 @@ def _evaluate_icnn_adv_objective(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     with torch.enable_grad():
         z_adv_eval, _ = adversarial_pushforward(icnn, z_source, detach_for_model=False)
-        logits_eval = head(z_adv_eval)
-        if use_margin_adv:
-            logits_correct = logits_eval.gather(1, y.unsqueeze(1)).squeeze(1)
-            margins = logits_eval - logits_correct.unsqueeze(1)
-            num_classes = logits_eval.size(1)
-            correct_mask = F.one_hot(y, num_classes=num_classes).bool()
-            margins = margins.masked_fill(correct_mask, float("-inf"))
-            adv_primary = torch.logsumexp(margins, dim=1).mean()
-        else:
-            adv_primary = F.cross_entropy(logits_eval, y, reduction="mean")
-        per_sample_mse = per_sample_mean_square_diff(z_adv_eval, z_source)
-        penalty_term, _, _ = compute_transport_penalty(
-            z_source,
-            z_adv_eval,
-            head,
-            penalty_lambda,
-            per_sample_mse,
-            cosine_cfg,
-            logits_adv=logits_eval,
+        F_per_sample, primary_per_sample, _ = dro_inner_objective_per_sample(
+            x_adv=z_adv_eval,
+            x_src=z_source,
+            y=y,
+            phi=phi,
+            head=head,
+            penalty_lambda=penalty_lambda,
+            use_margin_adv=use_margin_adv,
+            use_redlr_loss=use_redlr_loss,
         )
-        sv_penalty = torch.zeros_like(adv_primary)
+        adv_primary = primary_per_sample.mean()
+        F_mean = F_per_sample.mean()
+        sv_penalty = torch.zeros_like(F_mean)
         if jacobian_reg_weight > 0.0:
             sv_estimate = estimate_local_jacobian_sv(
                 icnn,
@@ -1855,7 +1984,8 @@ def _evaluate_icnn_adv_objective(
             )
             if sv_estimate is not None and torch.isfinite(sv_estimate):
                 sv_penalty = jacobian_reg_weight * sv_estimate.pow(2)
-        adv_objective = adv_primary - penalty_term - sv_penalty
+        adv_objective = F_mean - sv_penalty
+    per_sample_mse = per_sample_mean_square_diff(z_adv_eval.detach(), z_source)
     return adv_objective.detach(), per_sample_mse.detach()
 
 
@@ -1971,50 +2101,35 @@ def train_one_epoch(
                             RuntimeWarning,
                         )
                         continue
+                    # OLD: logits_adv = head(z_adv_ascent) and hand-built adv_primary / penalty_term
                     logits_adv = head(z_adv_ascent)
+
+                    metric_key = "ce"
                     if use_redlr_loss:
-                        num_classes = logits_adv.size(1)
-                        if num_classes < 3:
-                            raise RuntimeError(
-                                "ReDLR loss requires at least three classes; received logits with "
-                                f"{num_classes} classes."
-                            )
-                        batch_indices = torch.arange(
-                            logits_adv.size(0), device=logits_adv.device, dtype=torch.long
-                        )
-                        logits_correct = logits_adv[batch_indices, y_attack]
-                        logits_sorted, indices = logits_adv.sort(dim=1, descending=True)
-                        redlr = torch.zeros_like(logits_correct)
-                        is_correct = indices[:, 0] == y_attack
-                        if is_correct.any():
-                            numer = logits_correct[is_correct] - logits_sorted[is_correct, 1]
-                            denom = logits_sorted[is_correct, 0] - logits_sorted[is_correct, 2]
-                            redlr[is_correct] = -numer / denom
-                        adv_primary = redlr.mean()
                         metric_key = "redlr"
                     elif use_margin_adv:
-                        logits_correct = logits_adv.gather(1, y_attack.unsqueeze(1)).squeeze(1)
-                        margins = logits_adv - logits_correct.unsqueeze(1)
-                        num_classes = logits_adv.size(1)
-                        target_mask = F.one_hot(y_attack, num_classes=num_classes).bool()
-                        margins = margins.masked_fill(target_mask, float("-inf"))
-                        adv_primary = torch.logsumexp(margins, dim=1).mean()
                         metric_key = "margin"
-                    else:
-                        adv_primary = F.cross_entropy(logits_adv, y_attack, reduction="mean")
-                        metric_key = "ce"
-                    per_sample_mse = per_sample_mean_square_diff(z_adv_ascent, z_source_attack)
-                    penalty_term, penalty_monitor, logits_adv = compute_transport_penalty(
-                        z_source_attack,
-                        z_adv_ascent,
-                        head,
-                        penalty_lambda,
-                        per_sample_mse,
-                        cosine_cfg,
-                        logits_adv=logits_adv,
+
+                    F_per_sample, primary_per_sample, penalty_per_sample = (
+                        dro_inner_objective_per_sample(
+                            x_adv=z_adv_ascent,
+                            x_src=z_source_attack,
+                            y=y_attack,
+                            phi=phi,
+                            head=head,
+                            penalty_lambda=penalty_lambda,
+                            use_margin_adv=use_margin_adv,
+                            use_redlr_loss=use_redlr_loss,
+                        )
+                    )
+                    adv_primary = primary_per_sample.mean()
+                    penalty_monitor = penalty_per_sample.mean()
+                    F_mean = F_per_sample.mean()
+                    per_sample_mse = per_sample_mean_square_diff(
+                        z_adv_ascent.detach(), z_source_attack
                     )
                     sv_estimate: Optional[torch.Tensor] = None
-                    sv_penalty = torch.zeros((), device=adv_primary.device, dtype=adv_primary.dtype)
+                    sv_penalty = torch.zeros_like(F_mean)
                     if jacobian_reg_weight > 0.0:
                         sv_estimate = estimate_local_jacobian_sv(
                             icnn,
@@ -2029,8 +2144,8 @@ def train_one_epoch(
                             sv_estimate = None
                     if (
                         not torch.isfinite(adv_primary)
-                        or not torch.isfinite(penalty_term)
                         or not torch.isfinite(penalty_monitor)
+                        or not torch.isfinite(F_mean)
                         or not torch.isfinite(sv_penalty)
                     ):
                         warnings.warn(
@@ -2038,20 +2153,82 @@ def train_one_epoch(
                             RuntimeWarning,
                         )
                         continue
-                    adv_objective = adv_primary - penalty_term - sv_penalty
+                    adv_objective = F_mean - sv_penalty
+
+                    L_obj = torch.zeros((), device=z_adv_ascent.device)
+                    L_reg = torch.zeros((), device=z_adv_ascent.device)
+                    amort_gap_mean = torch.zeros((), device=z_adv_ascent.device)
+
+                    if USE_AMORTIZATION_LOSSES and AMORT_INNER_STEPS > 0 and AMORT_WEIGHT_OBJ > 0.0:
+                        with torch.no_grad():
+                            x_star = refine_inner_maximizer_input(
+                                x_init=z_adv_ascent,
+                                x_src=z_source_attack,
+                                y=y_attack,
+                                phi=phi,
+                                head=head,
+                                penalty_lambda=penalty_lambda,
+                                steps=AMORT_INNER_STEPS,
+                                lr=AMORT_INNER_LR,
+                                use_margin_adv=use_margin_adv,
+                                use_redlr_loss=use_redlr_loss,
+                            )
+                            F_star_per_sample, _, _ = dro_inner_objective_per_sample(
+                                x_adv=x_star,
+                                x_src=z_source_attack,
+                                y=y_attack,
+                                phi=phi,
+                                head=head,
+                                penalty_lambda=penalty_lambda,
+                                use_margin_adv=use_margin_adv,
+                                use_redlr_loss=use_redlr_loss,
+                            )
+                            F_star_per_sample = F_star_per_sample.detach()
+
+                        gap = (F_star_per_sample - F_per_sample).clamp_min(0.0)
+                        amort_gap_mean = gap.mean().detach()
+                        L_obj = gap.mean()
+                        L_reg = per_sample_mean_square_diff(z_adv_ascent, x_star).mean()
+
+                    L_cycle = torch.zeros((), device=z_adv_ascent.device)
+
+                    if USE_AMORTIZATION_LOSSES and AMORT_WEIGHT_CYCLE > 0.0:
+                        F_mean_for_grad = F_per_sample.mean()
+                        grad_x = torch.autograd.grad(
+                            F_mean_for_grad,
+                            z_adv_ascent,
+                            create_graph=True,
+                            retain_graph=True,
+                            allow_unused=False,
+                        )[0]
+                        grad_x_flat = grad_x.view(grad_x.size(0), -1)
+                        # This implements E[||∇_x' F_theta(T_w(x); x,y)||^2]
+                        L_cycle = grad_x_flat.norm(dim=1).pow(2).mean()
+
                     if sv_estimate is not None:
                         sv_estimate_last = sv_estimate.detach()
-                    if torch.isfinite(adv_primary) and torch.isfinite(penalty_term):
+                    if torch.isfinite(adv_primary) and torch.isfinite(penalty_monitor):
                         bar_postfix: Dict[str, str] = {
                             metric_key: f"{float(adv_primary.item()):.4f}",
                             "adv_primary": f"{float(adv_primary.item()):.8f}",
-                            "pen": f"{float(penalty_term.item()):.4f}",
+                            "pen": f"{float(penalty_monitor.item()):.4f}",
                             "adv_obj": f"{float(adv_objective.item()):.9f}",
                         }
+                        if USE_AMORTIZATION_LOSSES:
+                            bar_postfix["F_gap"] = f"{float(amort_gap_mean.item()):.4f}"
+                            bar_postfix["L_cycle"] = f"{float(L_cycle.item()):.4e}"
                         if sv_estimate is not None and torch.isfinite(sv_estimate):
                             bar_postfix["jac_sv"] = f"{float(sv_estimate.item()):.4f}"
                         ascent_bar.set_postfix(bar_postfix, refresh=False)
-                    (-adv_objective).backward()
+                    icnn_loss = -adv_objective
+                    if USE_AMORTIZATION_LOSSES:
+                        icnn_loss = (
+                            icnn_loss
+                            + AMORT_WEIGHT_OBJ * L_obj
+                            + AMORT_WEIGHT_CYCLE * L_cycle
+                            + AMORT_WEIGHT_REG * L_reg
+                        )
+                    icnn_loss.backward()
                     if tracker is not None:
                         tracker.record_ascent(ascent_step, per_sample_mse.detach(), batch_idx)
                     grad_finite = all(
@@ -2106,12 +2283,13 @@ def train_one_epoch(
                             icnn.project_convexity()
                             adv_objective_candidate, _ = _evaluate_icnn_adv_objective(
                                 icnn,
+                                phi,
                                 head,
                                 z_source_attack,
                                 y_attack,
                                 penalty_lambda,
-                                cosine_cfg,
                                 use_margin_adv,
+                                use_redlr_loss,
                                 jacobian_reg_weight,
                                 jacobian_reg_samples,
                                 jacobian_reg_iters,
