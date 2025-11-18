@@ -74,8 +74,8 @@ CALIBRATION_SMOOTHING = 0.1
 # Amortization-related hyperparameters (can later be exposed as CLI flags)
 USE_AMORTIZATION_LOSSES = True
 
-AMORT_INNER_STEPS = 5        # number of refinement steps for x* (L_obj / L_reg)
-AMORT_INNER_LR = 0.05        # step size for inner refinement
+AMORT_INNER_STEPS = 10        # number of refinement steps for x* (L_obj / L_reg)
+AMORT_INNER_LR = 0.0005        # step size for inner refinement
 
 AMORT_WEIGHT_OBJ = 1.0       # weight on L_obj (objective gap)
 AMORT_WEIGHT_CYCLE = 1.0     # weight on L_cycle (first-order residual)
@@ -818,6 +818,9 @@ def refine_inner_maximizer_input(
         p.requires_grad_(False)
 
     optimizer = optim.Adam([x_var], lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=steps, eta_min=0.0
+    )
 
     grad_enabled_prev = torch.is_grad_enabled()
     torch.set_grad_enabled(True)
@@ -838,6 +841,7 @@ def refine_inner_maximizer_input(
             loss_inner = -F_per_sample.mean()
             loss_inner.backward()
             optimizer.step()
+            scheduler.step()
             with torch.no_grad():
                 _clamp_normalized_inputs_(x_var)
     finally:
@@ -1228,7 +1232,8 @@ def visualize_adversarial_images(
     phase_name: Optional[str] = None,
 ) -> None:
     """Reconstruct and plot pixel-space samples induced by the ICNN transport map."""
-    num_samples = max(1, int(args.adv_image_samples))
+    requested_samples = max(1, int(args.adv_image_samples))
+    require_fooling = bool(getattr(args, "adv_image_require_fooling", False))
     phi_mode = phi.training
     head_mode = head.training
     icnn_mode = icnn.training
@@ -1243,27 +1248,61 @@ def visualize_adversarial_images(
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
         with torch.no_grad():
-            logits_batch = head(phi(batch_x))
+            z_full = phi(batch_x)
+            logits_batch = head(z_full)
             preds_batch = logits_batch.argmax(dim=1)
             correct_mask = preds_batch == batch_y
-        if correct_mask.any():
-            xs.append(batch_x[correct_mask].cpu())
-            ys.append(batch_y[correct_mask].cpu())
-            collected += int(correct_mask.sum().item())
-        if collected >= num_samples:
+        if not correct_mask.any():
+            continue
+
+        candidates_x = batch_x[correct_mask]
+        candidates_y = batch_y[correct_mask]
+        if require_fooling:
+            with torch.no_grad():
+                z_candidates = z_full[correct_mask]
+                z_adv_cand, _ = adversarial_pushforward(icnn, z_candidates, detach_for_model=True)
+                logits_adv_cand = head(z_adv_cand)
+                preds_adv_cand = logits_adv_cand.argmax(dim=1)
+            fool_mask = preds_adv_cand != candidates_y
+            if not fool_mask.any():
+                continue
+            candidates_x = candidates_x[fool_mask]
+            candidates_y = candidates_y[fool_mask]
+
+        xs.append(candidates_x.cpu())
+        ys.append(candidates_y.cpu())
+        collected += int(candidates_x.size(0))
+        if collected >= requested_samples:
             break
 
     if not xs:
-        print(
+        message = (
             "Adversarial image visualization skipped: no correctly classified samples collected."
         )
+        if require_fooling:
+            message = (
+                "Adversarial image visualization skipped: clean-correct samples whose transported "
+                "outputs fooled the classifier were not found."
+            )
+        print(message)
         phi.train(phi_mode)
         head.train(head_mode)
         icnn.train(icnn_mode)
         return
 
-    x_batch = torch.cat(xs, dim=0)[:num_samples].to(device)
-    y_batch = torch.cat(ys, dim=0)[:num_samples].to(device)
+    x_batch = torch.cat(xs, dim=0)
+    y_batch = torch.cat(ys, dim=0)
+    if x_batch.size(0) > requested_samples:
+        x_batch = x_batch[:requested_samples]
+        y_batch = y_batch[:requested_samples]
+    x_batch = x_batch.to(device)
+    y_batch = y_batch.to(device)
+    num_samples = x_batch.size(0)
+    if require_fooling and num_samples < requested_samples:
+        print(
+            f"Requested {requested_samples} fooling samples but only found {num_samples} "
+            f"in the {split_name} split."
+        )
 
     with torch.no_grad():
         z_clean = phi(x_batch)
@@ -1427,8 +1466,10 @@ def visualize_adversarial_images(
         "phase": phase_label,
         "split": split_name,
         "num_samples": num_samples,
+        "samples_requested": requested_samples,
         "adv_image_steps": int(args.adv_image_steps),
         "adv_image_lr": float(args.adv_image_lr),
+        "adv_image_require_fooling": require_fooling,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "hyperparameters": hyper_params,
         "sample_summaries": sample_summaries,
@@ -2217,6 +2258,7 @@ def train_one_epoch(
                         if USE_AMORTIZATION_LOSSES:
                             bar_postfix["F_gap"] = f"{float(amort_gap_mean.item()):.4f}"
                             bar_postfix["L_cycle"] = f"{float(L_cycle.item()):.4e}"
+                            bar_postfix["L_reg"] = f"{float(L_reg.item()):.4e}"
                         if sv_estimate is not None and torch.isfinite(sv_estimate):
                             bar_postfix["jac_sv"] = f"{float(sv_estimate.item()):.4f}"
                         ascent_bar.set_postfix(bar_postfix, refresh=False)
@@ -2599,7 +2641,7 @@ def parse_args():
     parser.add_argument(
         "--lr-theta",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Step size γ_θ for encoder and classifier parameters.",
     )
     parser.add_argument("--momentum", type=float, default=0.9)
@@ -2636,14 +2678,14 @@ def parse_args():
     parser.add_argument(
         "--lr-omega",
         type=float,
-        default=0.0005,
+        default=0.05,
         help="Step size γ_ω for ICNN adversary parameters.",
     )
     parser.add_argument(
         "--icnn-step-rule",
         type=str,
         choices=["constant", "bb-armijo"],
-        default="constant",
+        default="bb-armijo",
         help="Adaptive step-size rule for ICNN ascent (constant keeps optimizer LR; bb-armijo uses BB + Armijo).",
     )
     parser.add_argument(
@@ -2686,7 +2728,7 @@ def parse_args():
         "--icnn-optimizer",
         type=str,
         choices=["adam", "ademamix", "sgd"],
-        default="ademamix",
+        default="sgd",
         help="Optimizer used for ICNN weights (adam, ademamix, or sgd).",
     )
     parser.add_argument("--icnn-beta1", type=float, default=0.9)
@@ -2887,6 +2929,11 @@ def parse_args():
         choices=["train", "test"],
         default="test",
         help="Dataset split to sample from when visualizing adversarial images.",
+    )
+    parser.add_argument(
+        "--adv-image-require-fooling",
+        action="store_true",
+        help="Only visualize samples whose transported outputs fool the classifier.",
     )
     parser.add_argument(
         "--adv-image-every-epoch",

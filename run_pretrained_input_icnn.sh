@@ -16,11 +16,20 @@ python pretrained_INPUT_icnn.py \
   --icnn-ascent-steps 10 \
   --icnn-strong-convexity 1.0 \
   --icnn-step-rule bb-armijo \
-  --penalty-lambda 5 \
+  --penalty-lambda 30 \
   --epochs-icnn-pretrain 0 \
   --epochs-adv-finetune 0 \
-  --epochs-adv 50 \
+  --epochs-adv 5 \
   --epochs-clean 0 \
-  --use-margin-loss \
+  --lr-omega 0.0005 \
+  --lr-theta 0.1 \
+  --icnn-optimizer sgd \
   --adv-image-every-epoch \
-  --visualize-adversarial-images
+  --visualize-adversarial-images \
+  --adv-image-require-fooling \
+  --adv-image-samples 30 \
+  --batch-size 512 \
+  --use-margin-loss \
+  --inp-p "2" \
+  --inp-eps 0.5 \
+  --save R2_INPUT_icnn_lambda_3_epochs_adv_10_l2_PGD.pth \
