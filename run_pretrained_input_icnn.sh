@@ -13,13 +13,13 @@ python pretrained_INPUT_icnn.py \
   --eval-input-pgd-samples 1000 \
   --jacobian-aware \
   --track-transport-deltas \
-  --icnn-ascent-steps 10 \
+  --icnn-ascent-steps 7 \
   --icnn-strong-convexity 1.0 \
   --icnn-step-rule bb-armijo \
-  --penalty-lambda 30 \
-  --epochs-icnn-pretrain 0 \
+  --penalty-lambda 20 \
+  --epochs-icnn-pretrain 2 \
   --epochs-adv-finetune 0 \
-  --epochs-adv 5 \
+  --epochs-adv 30 \
   --epochs-clean 0 \
   --lr-omega 0.0005 \
   --lr-theta 0.1 \
@@ -32,4 +32,4 @@ python pretrained_INPUT_icnn.py \
   --use-margin-loss \
   --inp-p "2" \
   --inp-eps 0.5 \
-  --save R2_INPUT_icnn_lambda_3_epochs_adv_10_l2_PGD.pth \
+  --save R2_INPUT_icnn_lambda_20_epochs_adv_30_l2_PGD.pth \
