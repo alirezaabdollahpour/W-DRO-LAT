@@ -72,7 +72,7 @@ DEFAULT_CALIBRATION_RATIO_MAX = 6.0
 CALIBRATION_SMOOTHING = 0.1
 
 # Amortization-related hyperparameters (can later be exposed as CLI flags)
-USE_AMORTIZATION_LOSSES = True
+USE_AMORTIZATION_LOSSES = False
 
 AMORT_INNER_STEPS = 10        # number of refinement steps for x* (L_obj / L_reg)
 AMORT_INNER_LR = 0.0005        # step size for inner refinement
@@ -2798,6 +2798,24 @@ def parse_args():
     )
     parser.add_argument("--log-csv", type=str, default="./runs_log_icnn.csv")
     parser.add_argument("--save", type=str, default="")
+    parser.add_argument(
+        "--save-best-robust",
+        type=str,
+        default="",
+        help="Path to store the checkpoint with the best robust (input-PGD) accuracy. Defaults to results/input_icnn_best_<run>.pth when empty.",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=3,
+        help="Number of epochs to wait after the best robust checkpoint before applying the drop-based early stopping criterion.",
+    )
+    parser.add_argument(
+        "--early-stop-robust-threshold",
+        type=float,
+        default=0.8,
+        help="Fraction of the best robust accuracy below which training stops after the patience window.",
+    )
 
     parser.add_argument("--jacobian-aware", action="store_true")
     parser.add_argument("--jacobian-batches", type=int, default=4)
@@ -3158,6 +3176,16 @@ def main():
         api_key=args.wandb_api_key,
         config=wandb_config,
     )
+    best_checkpoint_path = args.save_best_robust
+    if not best_checkpoint_path:
+        best_checkpoint_path = str(Path("results") / f"input_icnn_best_{run_id}.pth")
+    args.save_best_robust = best_checkpoint_path
+    early_stop_patience = max(0, int(args.early_stop_patience))
+    robust_drop_fraction = float(args.early_stop_robust_threshold)
+    if not math.isfinite(robust_drop_fraction):
+        robust_drop_fraction = 0.8
+    robust_drop_fraction = min(max(robust_drop_fraction, 0.0), 1.0)
+    print(f"Best robust checkpoints will be saved to: {best_checkpoint_path}")
 
     trainloader, testloader = get_cifar10_loaders(batch_size=args.batch_size, seed=args.seed)
 
@@ -3323,8 +3351,25 @@ def main():
     print(f"ICNN optimizer: {icnn_optimizer_name}")
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(opt_theta, T_max=total_epochs, last_epoch=-1)
 
-    
-    
+    best_robust_acc: Optional[float] = None
+    best_robust_epoch: Optional[int] = None
+    early_stop_triggered = False
+    last_epoch_completed = 0
+
+    def save_model_checkpoint(path: str, epoch_idx: int, robust_acc: Optional[float], label: str) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "phi": phi.state_dict(),
+                "head": head.state_dict(),
+                "icnn": icnn.state_dict(),
+                "args": vars(args),
+                "epoch": epoch_idx,
+                "robust_input_pgd_acc": robust_acc,
+            },
+            path,
+        )
+        print(f"[Checkpoint] Saved {label} checkpoint to {path} (epoch {epoch_idx}, robust_acc={robust_acc})")
 
     if wandb_logger.enabled:
         wandb_logger.update_config({"schedule": schedule})
@@ -3631,6 +3676,33 @@ def main():
             },
         )
 
+        if input_pgd_acc is not None:
+            is_best = best_robust_acc is None or input_pgd_acc > best_robust_acc
+            if is_best:
+                best_robust_acc = float(input_pgd_acc)
+                best_robust_epoch = epoch
+                save_model_checkpoint(
+                    best_checkpoint_path,
+                    epoch_idx=epoch,
+                    robust_acc=best_robust_acc,
+                    label="best-robust",
+                )
+                if wandb_logger.enabled:
+                    wandb_logger.log({"robust/best_input_pgd_acc": best_robust_acc}, step=epoch)
+            elif best_robust_epoch is not None and best_robust_acc is not None:
+                epochs_since_best = epoch - best_robust_epoch
+                if (
+                    epochs_since_best >= early_stop_patience
+                    and input_pgd_acc < robust_drop_fraction * best_robust_acc
+                ):
+                    drop_pct = robust_drop_fraction * 100.0
+                    print(
+                        f"Early stopping triggered at epoch {epoch}: input-PGD accuracy "
+                        f"{input_pgd_acc*100:.2f}% fell below {drop_pct:.1f}% of the best "
+                        f"{best_robust_acc*100:.2f}% after {epochs_since_best} epochs."
+                    )
+                    early_stop_triggered = True
+
         lr_scheduler.step()
 
         if trajectory_recorder is not None:
@@ -3679,6 +3751,30 @@ def main():
                         step=epoch,
                     )
         tracker.finish_epoch()
+        last_epoch_completed = epoch
+        if early_stop_triggered:
+            break
+
+    summary_step = last_epoch_completed if last_epoch_completed > 0 else total_epochs
+    if early_stop_triggered:
+        best_note = (
+            f"{best_robust_acc*100:.2f}% (epoch {best_robust_epoch})"
+            if best_robust_acc is not None and best_robust_epoch is not None
+            else "unknown"
+        )
+        print(
+            f"Early stopping activated at epoch {last_epoch_completed}. "
+            f"Best recorded input-PGD accuracy: {best_note}. "
+            f"Best checkpoint: {best_checkpoint_path}"
+        )
+        if wandb_logger.enabled and best_robust_acc is not None:
+            wandb_logger.log(
+                {
+                    "early_stop/epoch": last_epoch_completed,
+                    "early_stop/best_input_pgd_acc": best_robust_acc,
+                },
+                step=summary_step,
+            )
 
     if wandb_logger.enabled and final_epoch_log is not None:
         wandb_logger.log_summary(final_epoch_log)
@@ -3728,7 +3824,7 @@ def main():
                     "jacobian/mean_sv_overall": overall_mean_sv,
                     "jacobian/max_sv_overall": overall_max_sv,
                 },
-                step=total_epochs,
+                step=summary_step,
             )
 
     if args.estimate_transport_jacobian:
@@ -3756,7 +3852,7 @@ def main():
                         "jacobian/transport_sigma_max": max_sv,
                         "jacobian/transport_sigma_mean": mean_sv,
                     },
-                    step=total_epochs,
+                    step=summary_step,
                 )
 
     if args.visualize_transport:

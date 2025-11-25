@@ -372,6 +372,15 @@ def _infer_arch_from_state_dict(sd: dict) -> str:
     return "PreActResNet18"
 
 
+def _move_normalization_buffers(module: nn.Module, device: torch.device) -> None:
+    """Place normalization tensors (mu/std) on the correct device when they are not registered buffers."""
+    for attr in ("mu", "std"):
+        if hasattr(module, attr):
+            tensor = getattr(module, attr)
+            if isinstance(tensor, torch.Tensor):
+                setattr(module, attr, tensor.to(device))
+
+
 # -----------------------------
 # Checkpoint loader (matches your WRM-LAT save format)
 # -----------------------------
@@ -381,9 +390,39 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
     # Handle phi/head checkpoints saved by pretrained_LAT.py
     if "phi" in ckpt and "head" in ckpt:
         args_ckpt = ckpt.get("args", {})
-        num_classes = int(args_ckpt.get("num_classes", 10))
+        num_classes = int(args_ckpt.get("num_classes", args_ckpt.get("n_cls", 10)))
         cut_layer = args_ckpt.get("cut_layer", "layer4")
-        phi, head = build_split_resnet18(num_classes=num_classes, cut_layer=cut_layer)
+
+        # Input-space checkpoints (phi is identity, head is the full backbone)
+        if cut_layer == "input":
+            head_sd = ckpt["head"]
+            if isinstance(head_sd, dict) and "linear.weight" in head_sd:
+                num_classes = int(head_sd["linear.weight"].shape[0])
+            arch_from_sd = _infer_arch_from_state_dict(head_sd)
+            model_width = args_ckpt.get("model_width", 64)
+            if model_width is None:
+                model_width = 64
+            arch_init = {
+                "n_cls": num_classes,
+                "model_width": int(model_width),
+                "normalize_features": bool(args_ckpt.get("normalize_features", False)),
+                "normalize_logits": bool(args_ckpt.get("normalize_logits", False)),
+            }
+
+            if arch_from_sd == "PreActResNet18":
+                head = PreActResNet18(cuda=device.type == "cuda", **arch_init)
+            else:
+                head = ResNet18Plain(**arch_init)
+            phi = nn.Identity()
+        else:
+            base_backbone = PreActResNet18(
+                n_cls=num_classes,
+                model_width=int(args_ckpt.get("model_width", 64)),
+                normalize_features=bool(args_ckpt.get("normalize_features", False)),
+                normalize_logits=bool(args_ckpt.get("normalize_logits", False)),
+                cuda=device.type == "cuda",
+            )
+            phi, head = build_split_resnet18(num_classes=num_classes, cut_layer=cut_layer, base=base_backbone)
 
         phi_keys = phi.load_state_dict(ckpt["phi"], strict=False)
         head_keys = head.load_state_dict(ckpt["head"], strict=False)
@@ -393,8 +432,10 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
         if head_keys.missing_keys or head_keys.unexpected_keys:
             print(f"[head] load => missing={head_keys.missing_keys}, unexpected={head_keys.unexpected_keys}")
 
-        model = PhiHeadWrapper(phi, head)
-        model.to(device).eval()
+        _move_normalization_buffers(phi, device)
+        _move_normalization_buffers(head, device)
+
+        model = PhiHeadWrapper(phi, head).to(device).eval()
 
         meta = {
             "arch": args_ckpt.get("arch", "PhiHeadWrapper"),
@@ -406,7 +447,7 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
             "args": args_ckpt,
             "epoch": ckpt.get("epoch", None),
             "date": ckpt.get("date", None),
-            "format": "phi_head",
+            "format": "phi_head_input" if cut_layer == "input" else "phi_head",
         }
         return model, meta
 
@@ -415,6 +456,8 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
         "arch_init",
         {"n_cls": 10, "model_width": 64, "normalize_features": False, "normalize_logits": False},
     )
+    if arch == "PreActResNet18" and "cuda" not in arch_init:
+        arch_init = dict(arch_init, cuda=device.type == "cuda")
 
     # Recreate the backbone
     if arch == "PreActResNet18":
@@ -430,6 +473,7 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
     if missing or unexpected:
         print(f"[load] non-strict load => missing={missing}, unexpected={unexpected}")
 
+    _move_normalization_buffers(base, device)
     base.to(device).eval()
 
     meta = {
