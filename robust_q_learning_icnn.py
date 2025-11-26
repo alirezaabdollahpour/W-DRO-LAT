@@ -7,11 +7,14 @@ Robust Q-learning with three training modes on CartPole:
 * ``erm``: nominal Q-learning baseline (no adversary).
 * ``all``: runs all three sequentially and prints a comparison table.
 
-The ICNN branch mirrors the input-space adversary from ``pretrained_INPUT_icnn.py``:
-it maximises the negative Bellman target with a quadratic transport cost
-    min_s { r(s) + λ max_a Q(s, a) + γ ||s - ŝ||^2 }   ⇔   max_ω { -[·] }.
+Inner robust Bellman target (continuous analogue of Sinha et al. 5.3):
+
+    s_adv = argmin_s { r(s) + λ max_a Q(s, a) + γ * ½ ||s - ŝ||^2 }
+
+The ICNN approximates this map T(ŝ) ≈ s_adv via T(ŝ) = ∇φ_ω(ŝ).
 CartPole reward is reshaped to r(θ)=exp(-|θ|) as in the described setting.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -116,6 +119,7 @@ class NonNegativeLinear(nn.Module):
 
     @torch.no_grad()
     def project_non_negative(self) -> None:
+        # With exp/softplus parametrisation, weights are already non-negative.
         return
 
 
@@ -187,9 +191,9 @@ class InputConvexPotential(nn.Module):
             if h is None:
                 h = self.nonlin(z_term)
             else:
-                h = self.nonlin(z_term + h_linear(h))
+                h = self.nonlin(z_term + h_linear(h))  # type: ignore[arg-type]
 
-        assert h is not None  # kept for type checkers
+        assert h is not None
         quadratic = 0.5 * self.strong_convexity * (z_flat.pow(2).sum(dim=1, keepdim=True))
         output = quadratic + self.input_skip(z_flat) + self.hidden_output(h)
         return output.squeeze(-1)
@@ -281,7 +285,6 @@ def make_cartpole(
     try:
         env.reset(seed=None)
     except TypeError:
-        # Older gym versions do not accept the seed kwarg here.
         env.reset()
     env_unwrapped = env.unwrapped
     env_unwrapped.masspole *= mass_scale
@@ -351,13 +354,15 @@ class ReplayBuffer:
 #  Models + adversary utils
 # --------------------------
 class QNetwork(nn.Module):
+    """Smooth Q-network (ELU activations) for compatibility with WRM theory."""
+
     def __init__(self, state_dim: int, action_dim: int, hidden_sizes: Sequence[int]):
         super().__init__()
         layers: List[nn.Module] = []
         prev = state_dim
         for width in hidden_sizes:
             layers.append(nn.Linear(prev, width))
-            layers.append(nn.ReLU())
+            layers.append(nn.ELU())  # smooth activation instead of ReLU
             prev = width
         layers.append(nn.Linear(prev, action_dim))
         self.net = nn.Sequential(*layers)
@@ -413,7 +418,15 @@ def compute_adv_objective(
     state_low: Tensor,
     state_high: Tensor,
     reward_fn: Callable[[Tensor], Tensor],
+    ignore_q_term: bool = False,
 ) -> Tuple[Tensor, Dict[str, float]]:
+    """
+    Compute adversarial objective for ICNN parameters.
+
+    We minimise over ω the expectation of:
+        value_for_optim(s) + γ * c(s, ŝ)
+    where value_for_optim is either r(s) (if ignore_q_term) or r(s)+λ max_a Q(s,a).
+    """
     s_adv, _ = adversarial_pushforward(
         icnn,
         next_state_nom,
@@ -424,11 +437,18 @@ def compute_adv_objective(
     q_next = q_net(s_adv)
     max_q = q_next.max(dim=1).values
     rewards = reward_fn(s_adv)
-    robust_value = rewards + discount * (1.0 - done_mask) * max_q
+
+    full_value = rewards + discount * (1.0 - done_mask) * max_q
+    if ignore_q_term:
+        value_for_optim = rewards
+    else:
+        value_for_optim = full_value
+
     penalty = transport_gamma * transport_cost(s_adv, next_state_nom)
-    adv_objective = -(robust_value + penalty).mean()
+    adv_objective = -(value_for_optim + penalty).mean()
+
     metrics = {
-        "robust_value": float(robust_value.mean().detach().item()),
+        "robust_value": float(full_value.mean().detach().item()),
         "penalty": float(penalty.mean().detach().item()),
     }
     return adv_objective, metrics
@@ -444,22 +464,37 @@ def wrm_adversarial_state(
     state_high: Tensor,
     steps: int,
     lr: float,
+    ignore_q_term: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict[str, float]]:
-    """First-order WRM adversary via projected gradient ascent on the next state."""
+    """
+    First-order WRM adversary via projected gradient descent on the next state.
+
+    If ignore_q_term=True, the inner minimisation matches the Sinha et al. RL experiment:
+        argmin_s { r(s) + γ c(s, ŝ) }
+    otherwise it uses the full WRM objective with r(s)+λ max_a Q(s,a).
+    """
     s_current = next_state_nom.detach()
     for _ in range(max(1, steps)):
         s_current.requires_grad_(True)
         q_next = target_net(s_current)
         max_q = q_next.max(dim=1).values
         rewards = cartpole_reward(s_current)
+
+        full_value = rewards + discount * (1.0 - done_mask) * max_q
+        if ignore_q_term:
+            value_for_optim = rewards
+        else:
+            value_for_optim = full_value
+
         penalty = transport_gamma * transport_cost(s_current, next_state_nom)
-        adv_obj = -(rewards + discount * (1.0 - done_mask) * max_q + penalty).mean()
+        adv_obj = -(value_for_optim + penalty).mean()
         adv_obj.backward()
         with torch.no_grad():
             grad = s_current.grad
             if grad is None or not torch.isfinite(grad).all():
                 s_next = s_current.detach()
             else:
+                # Gradient ascent on adv_obj == gradient descent on value_for_optim + penalty
                 s_next = s_current + lr * grad
             s_next = clamp_state(s_next, state_low, state_high)
         s_current = s_next.detach()
@@ -531,7 +566,9 @@ def train_batch(
                 state_low=state_low,
                 state_high=state_high,
                 reward_fn=cartpole_reward,
+                ignore_q_term=args.wrm_ignore_q,
             )
+            # We minimise robust_value + penalty
             adv_loss = -adv_obj
             adv_loss.backward()
             grad_ok = all((p.grad is None) or torch.isfinite(p.grad).all() for p in icnn.parameters())
@@ -579,6 +616,7 @@ def train_batch(
                             state_low,
                             state_high,
                             cartpole_reward,
+                            ignore_q_term=args.wrm_ignore_q,
                         )
                     improvement = float(adv_candidate.item() - adv_obj_val)
                     sufficient = improvement >= bb_state.ls_c * alpha * grad_norm_sq
@@ -618,6 +656,7 @@ def train_batch(
             state_high=state_high,
             steps=args.wrm_steps,
             lr=args.wrm_lr,
+            ignore_q_term=args.wrm_ignore_q,
         )
     elif method == "erm":
         s_adv = next_states.detach()
@@ -655,25 +694,38 @@ def evaluate_policy(
     episodes: int,
     max_steps: int,
     epsilon_eval: float,
-) -> Dict[str, float]:
-    results: Dict[str, float] = {}
+) -> Dict[str, Dict[str, float]]:
+    """
+    Evaluate a policy on a collection of environments.
+
+    Returns, for each env name, a dict with:
+        * mean_steps:     mean episode length (CartPole-style metric)
+        * mean_reward:    mean shaped reward (r(θ)=exp(-|θ|))
+    """
+    results: Dict[str, Dict[str, float]] = {}
     for name, env in envs.items():
         rewards: List[float] = []
+        lengths: List[int] = []
         for _ in range(episodes):
             state_np, _ = safe_reset(env, seed=None)
             episode_reward = 0.0
+            steps = 0
             for _ in range(max_steps):
                 state = to_tensor(state_np, device)
                 action = epsilon_greedy(q_net, state, epsilon_eval, env.action_space.n)
                 next_state, _reward_env, done, _terminated, _truncated, _ = safe_step(env, action)
-                # Use shaped reward for consistency with training
-                reward = float(cartpole_reward(to_tensor(next_state, device)).item())
-                episode_reward += reward
+                shaped_reward = float(cartpole_reward(to_tensor(next_state, device)).item())
+                episode_reward += shaped_reward
+                steps += 1
                 state_np = next_state
                 if done:
                     break
             rewards.append(episode_reward)
-        results[name] = float(np.mean(rewards))
+            lengths.append(steps)
+        results[name] = {
+            "mean_steps": float(np.mean(lengths)),
+            "mean_shaped_reward": float(np.mean(rewards)),
+        }
     return results
 
 
@@ -682,17 +734,18 @@ def parse_args():
         description="Robust Q-learning on CartPole with ICNN (WRM-ICNN), gradient WRM, or ERM."
     )
     parser.add_argument("--env-id", type=str, default="CartPole-v1")
-    parser.add_argument("--episodes", type=int, default=300)
+    # Training horizon: Sinha et al. train for ~2000 episodes in Fig. 8.
+    parser.add_argument("--episodes", type=int, default=2000)
     parser.add_argument("--max-steps", type=int, default=400)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--train-every", type=int, default=1, help="Gradient updates per env step.")
     parser.add_argument("--updates-per-step", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--buffer-size", type=int, default=50000)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
-    parser.add_argument("--target-update", type=int, default=500)
-    parser.add_argument("--lr-q", type=float, default=1e-3)
-    parser.add_argument("--hidden-q", type=int, nargs="+", default=[128, 128])
+    parser.add_argument("--buffer-size", type=int, default=100_000)
+    parser.add_argument("--warmup-steps", type=int, default=5_000)
+    parser.add_argument("--target-update", type=int, default=1_000)
+    parser.add_argument("--lr-q", type=float, default=3e-4)
+    parser.add_argument("--hidden-q", type=int, nargs="+", default=[256, 256])
     parser.add_argument(
         "--method",
         type=str,
@@ -700,28 +753,72 @@ def parse_args():
         default="wrm-icnn",
         help="Training method: WRM with ICNN transport, WRM via gradient ascent, ERM baseline, or run all sequentially.",
     )
-    parser.add_argument("--transport-gamma", type=float, default=30.0, help="Penalty weight on ||T(s)-ŝ||^2.")
-    parser.add_argument("--icnn-hidden", type=int, nargs="+", default=[512, 512])
+    parser.add_argument(
+        "--transport-gamma",
+        type=float,
+        default=2.0,
+        help="Penalty weight γ on ½||T(s)-ŝ||^2 (smaller => larger adversarial budget).",
+    )
+    parser.add_argument("--icnn-hidden", type=int, nargs="+", default=[128, 128])
     parser.add_argument("--icnn-activation", type=str, choices=["relu", "softplus"], default="softplus")
-    parser.add_argument("--icnn-strong-convexity", type=float, default=1.0)
+    parser.add_argument("--icnn-strong-convexity", type=float, default=0.5)
     parser.add_argument("--icnn-init", type=str, choices=["principled", "xavier"], default="principled")
-    parser.add_argument("--lr-omega", type=float, default=5e-3)
-    parser.add_argument("--icnn-ascent-steps", type=int, default=10)
-    parser.add_argument("--icnn-optimizer", type=str, choices=["adam", "ademamix", "sgd"], default="sgd")
-    parser.add_argument("--icnn-step-rule", type=str, choices=["constant", "bb-armijo"], default="bb-armijo")
+    parser.add_argument("--lr-omega", type=float, default=1e-3)
+    parser.add_argument(
+        "--icnn-ascent-steps",
+        type=int,
+        default=5,
+        help="Number of ICNN updates per Q update (inner minimisation iterations).",
+    )
+    parser.add_argument(
+        "--icnn-optimizer",
+        type=str,
+        choices=["adam", "ademamix", "sgd"],
+        default="sgd",
+        help="Optimizer for ICNN parameters.",
+    )
+    parser.add_argument(
+        "--icnn-step-rule",
+        type=str,
+        choices=["constant", "bb-armijo"],
+        default="bb-armijo",
+        help="Learning-rate rule for ICNN (BB-Armijo only used with SGD).",
+    )
     parser.add_argument("--icnn-alpha0", type=float, default=5e-3)
     parser.add_argument("--icnn-alpha-min", type=float, default=1e-6)
     parser.add_argument("--icnn-alpha-max", type=float, default=0.5)
     parser.add_argument("--icnn-ls-c", type=float, default=0.1)
     parser.add_argument("--icnn-ls-shrink", type=float, default=0.5)
     parser.add_argument("--icnn-ls-max-steps", type=int, default=10)
-    parser.add_argument("--wrm-steps", type=int, default=10, help="Inner ascent steps for WRM (no ICNN).")
-    parser.add_argument("--wrm-lr", type=float, default=0.05, help="Inner ascent step size for WRM (no ICNN).")
-    parser.add_argument("--epsilon-start", type=float, default=0.2)
-    parser.add_argument("--epsilon-end", type=float, default=0.01)
-    parser.add_argument("--epsilon-decay", type=int, default=20000)
-    parser.add_argument("--eval-every", type=int, default=20)
-    parser.add_argument("--eval-episodes", type=int, default=5)
+
+    parser.add_argument(
+        "--wrm-steps",
+        type=int,
+        default=15,
+        help="Inner gradient steps for WRM (no ICNN), cf. T_adv≈15 in the original paper.",
+    )
+    parser.add_argument(
+        "--wrm-lr",
+        type=float,
+        default=0.1,
+        help="Inner gradient step size for WRM (no ICNN).",
+    )
+    parser.add_argument(
+        "--wrm-ignore-q",
+        action="store_true",
+        help="If set, inner WRM objective ignores the Q term (matches Sinha et al. 5.3 tabular experiment).",
+    )
+
+    parser.add_argument("--epsilon-start", type=float, default=0.3)
+    parser.add_argument("--epsilon-end", type=float, default=0.05)
+    parser.add_argument(
+        "--epsilon-decay",
+        type=int,
+        default=100_000,
+        help="Linear decay steps for epsilon-greedy exploration.",
+    )
+    parser.add_argument("--eval-every", type=int, default=50)
+    parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
@@ -764,9 +861,9 @@ def run_single_method(method: str, args, device: torch.device) -> Dict[str, floa
     target_net = QNetwork(state_dim, action_dim, args.hidden_q).to(device)
     target_net.load_state_dict(q_net.state_dict())
 
-    icnn = None
-    opt_icnn = None
-    bb_state = None
+    icnn: Optional[InputConvexPotential] = None
+    opt_icnn: Optional[optim.Optimizer] = None
+    bb_state: Optional[BBArmijoState] = None
     if method == "wrm-icnn":
         icnn = InputConvexPotential(
             input_dim=state_dim,
@@ -807,20 +904,30 @@ def run_single_method(method: str, args, device: torch.device) -> Dict[str, floa
     opt_q = optim.Adam(q_net.parameters(), lr=args.lr_q)
     buffer = ReplayBuffer(args.buffer_size)
     total_steps = 0
-    progress = tqdm(range(args.episodes), desc=f"{method} Episodes")
+    total_updates = 0
+
+    progress = tqdm(range(args.episodes), desc=f"{method} episodes")
 
     for episode in progress:
         state_np, _ = safe_reset(env, seed=None)
         episode_reward = 0.0
+        episode_len = 0
+        episode_updates = 0
+        metric_sums: Dict[str, float] = collections.defaultdict(float)
+        last_epsilon = args.epsilon_start
+
         for _ in range(args.max_steps):
             epsilon = linear_schedule(total_steps, args.epsilon_start, args.epsilon_end, args.epsilon_decay)
+            last_epsilon = epsilon
             state = to_tensor(state_np, device)
             action = epsilon_greedy(q_net, state, epsilon, action_dim)
             next_state, _reward_env, done, _terminated, _truncated, _ = safe_step(env, action)
             reward = float(cartpole_reward(to_tensor(next_state, device)).item())
+
             buffer.push(state_np, action, reward, next_state, done)
             state_np = next_state
             episode_reward += reward
+            episode_len += 1
             total_steps += 1
 
             if (
@@ -830,7 +937,7 @@ def run_single_method(method: str, args, device: torch.device) -> Dict[str, floa
             ):
                 for _ in range(args.updates_per_step):
                     batch = buffer.sample(args.batch_size)
-                    _ = train_batch(
+                    batch_metrics = train_batch(
                         batch,
                         q_net,
                         target_net,
@@ -844,13 +951,40 @@ def run_single_method(method: str, args, device: torch.device) -> Dict[str, floa
                         bb_state,
                         method=method,
                     )
+                    episode_updates += 1
+                    total_updates += 1
+                    for k, v in batch_metrics.items():
+                        metric_sums[k] += v
 
             if total_steps % args.target_update == 0:
                 target_net.load_state_dict(q_net.state_dict())
             if done:
                 break
 
-        if episode % args.eval_every == 0:
+        # Average metrics over this episode's optimisation steps
+        avg_metrics: Dict[str, float] = {}
+        if episode_updates > 0:
+            for k, v in metric_sums.items():
+                avg_metrics[k] = v / float(episode_updates)
+
+        postfix: Dict[str, object] = {
+            "method": method,
+            "eps": f"{last_epsilon:.3f}",
+            "ep_len": episode_len,
+            "ep_rew": f"{episode_reward:.2f}",
+            "updates": total_updates,
+        }
+        if avg_metrics:
+            postfix.update(
+                {
+                    "td": f"{avg_metrics.get('td_loss', float('nan')):.3g}",
+                    "delta": f"{avg_metrics.get('delta_mean', float('nan')):.3g}",
+                    "robust_v": f"{avg_metrics.get('robust_value', float('nan')):.3g}",
+                    "pen": f"{avg_metrics.get('penalty', float('nan')):.3g}",
+                }
+            )
+
+        if (episode + 1) % args.eval_every == 0 or episode == 0:
             eval_scores = evaluate_policy(
                 eval_envs,
                 q_net,
@@ -859,16 +993,18 @@ def run_single_method(method: str, args, device: torch.device) -> Dict[str, floa
                 max_steps=args.max_steps,
                 epsilon_eval=0.05,
             )
-            progress.set_postfix(
-                method=method,
-                ep_reward=f"{episode_reward:.2f}",
-                nominal=f"{eval_scores['nominal']:.2f}",
-                heavy=f"{eval_scores['heavy_pole']:.2f}",
-                strong_g=f"{eval_scores['strong_gravity']:.2f}",
-                refresh=False,
+            postfix.update(
+                {
+                    "nom_len": f"{eval_scores['nominal']['mean_steps']:.1f}",
+                    "heavy_len": f"{eval_scores['heavy_pole']['mean_steps']:.1f}",
+                    "strong_g": f"{eval_scores['strong_gravity']['mean_steps']:.1f}",
+                }
             )
 
-    final_scores = evaluate_policy(
+        progress.set_postfix(postfix, refresh=False)
+
+    # Final evaluation with greedy policy
+    final_eval = evaluate_policy(
         eval_envs,
         q_net,
         device,
@@ -876,9 +1012,13 @@ def run_single_method(method: str, args, device: torch.device) -> Dict[str, floa
         max_steps=args.max_steps,
         epsilon_eval=0.0,
     )
+    final_scores: Dict[str, float] = {}
     print(f"\nFinal evaluation — {method}:")
-    for name, score in final_scores.items():
-        print(f"  {name:15s}: {score:.3f}")
+    for name, metrics in final_eval.items():
+        mean_len = metrics["mean_steps"]
+        mean_rew = metrics["mean_shaped_reward"]
+        print(f"  {name:15s}: len={mean_len:6.2f}, shaped_reward={mean_rew:8.3f}")
+        final_scores[name] = mean_len
     return final_scores
 
 
@@ -894,12 +1034,14 @@ def main():
 
     if len(methods) > 1:
         env_names = list(next(iter(all_results.values())).keys())
-        print("\nComparison (mean episode reward):")
+        print("\nComparison (mean episode length over eval runs):")
         header = ["env"] + methods
         print(" | ".join(f"{h:>15s}" for h in header))
         for env_name in env_names:
-            row = [env_name] + [f"{all_results[m][env_name]:15.3f}" for m in methods]
-            print(" | ".join(row))
+            row_vals = [env_name]
+            for m in methods:
+                row_vals.append(f"{all_results[m][env_name]:15.3f}")
+            print(" | ".join(row_vals))
 
 
 if __name__ == "__main__":
