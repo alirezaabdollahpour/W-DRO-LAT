@@ -30,3 +30,5 @@ figures/
 figures/*
 cifar10w
 cifar10w/*
+plots/
+plots/*
