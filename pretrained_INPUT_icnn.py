@@ -3131,16 +3131,6 @@ def determine_schedule(args) -> Tuple[int, List[str]]:
 
 def main():
     args = parse_args()
-<<<<<<< ours
-    args.adv_method = args.adv_method.lower()
-<<<<<<< ours
-    if args.calibrate_penalty:
-        print("Penalty calibration disabled for all methods; ignoring --calibrate-penalty.")
-        args.calibrate_penalty = False
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
     if args.use_redlr_loss and args.use_margin_loss:
         warnings.warn(
             "--use-redlr-loss overrides --use-margin-loss; using ReDLR objective for the adversary.",
@@ -3723,15 +3713,7 @@ def main():
             and not cosine_cfg["enabled"]
             and args.latent_eps_target
             and args.latent_eps_target > 0
-<<<<<<< ours
-<<<<<<< ours
-            and args.adv_method == "icnn"
-=======
->>>>>>> theirs
-            and phase == args.adv_method
-=======
             and phase == "icnn"
->>>>>>> theirs
         ):
             avg_delta = compute_avg_delta_norm(
                 phi,
