@@ -246,6 +246,21 @@ def per_sample_mean_square_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tenso
     diff = (a - b).reshape(a.size(0), -1)
     return diff.pow(2).mean(dim=1)
 
+def tensor_to_numpy_copy(t: torch.Tensor, dtype: Optional[np.dtype] = None) -> np.ndarray:
+    """
+    Convert a tensor to a standalone NumPy array without relying on torch↔NumPy
+    shared memory (avoids binary compatibility issues in some environments).
+    """
+    t_cpu = t.detach().cpu()
+    if dtype is None:
+        if t_cpu.dtype.is_floating_point or t_cpu.dtype.is_complex:
+            dtype = np.float32
+        elif t_cpu.dtype == torch.bool:
+            dtype = np.bool_
+        else:
+            dtype = np.int64
+    return np.array(t_cpu.tolist(), dtype=dtype)
+
 
 def dro_inner_objective_per_sample(
     x_adv: torch.Tensor,
@@ -975,14 +990,14 @@ def _reduce_latents_for_plot(
     z: torch.Tensor, z_adv: torch.Tensor, method: str, seed: int
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Project latent pairs into 2D using PCA or t-SNE."""
-    z_flat = z.view(z.size(0), -1).cpu().float()
-    z_adv_flat = z_adv.view(z_adv.size(0), -1).cpu().float()
+    z_flat = z.view(z.size(0), -1).detach().float()
+    z_adv_flat = z_adv.view(z_adv.size(0), -1).detach().float()
     if z_flat.size(0) < 2:
         raise ValueError("Need at least two samples for visualization.")
 
     if method == "pca":
-        z_np = z_flat.numpy()
-        z_adv_np = z_adv_flat.numpy()
+        z_np = tensor_to_numpy_copy(z_flat, dtype=np.float64)
+        z_adv_np = tensor_to_numpy_copy(z_adv_flat, dtype=np.float64)
         if (
             not np.isfinite(z_np).all()
             or not np.isfinite(z_adv_np).all()
@@ -1009,7 +1024,7 @@ def _reduce_latents_for_plot(
         print("t-SNE requested but scikit-learn is unavailable; falling back to PCA.")
         return _reduce_latents_for_plot(z, z_adv, "pca", seed)
 
-    stacked = torch.cat([z_flat, z_adv_flat], dim=0).numpy()
+    stacked = tensor_to_numpy_copy(torch.cat([z_flat, z_adv_flat], dim=0), dtype=np.float64)
     if not np.isfinite(stacked).all():
         raise ValueError("Non-finite values encountered when preparing t-SNE input.")
     tsne = TSNE(n_components=2, init="pca", learning_rate="auto", random_state=seed)
@@ -1144,7 +1159,8 @@ def visualize_transport_map(
             z_tensor, z_adv_tensor, "pca", seed=args.seed
         )
 
-    class_colors = plt.cm.tab10(label_tensor.numpy() % 10)
+    label_np = tensor_to_numpy_copy(label_tensor, dtype=np.int64)
+    class_colors = plt.cm.tab10(label_np % 10)
     dx = coords_adv[:, 0] - coords_z[:, 0]
     dy = coords_adv[:, 1] - coords_z[:, 1]
 
@@ -1152,7 +1168,7 @@ def visualize_transport_map(
     scatter = ax.scatter(
         coords_z[:, 0],
         coords_z[:, 1],
-        c=label_tensor.numpy(),
+        c=label_np,
         cmap="tab10",
         s=20,
         alpha=0.9,
@@ -1341,9 +1357,9 @@ def visualize_adversarial_images(
     pixel_l2 = diff_pix.view(diff_pix.size(0), -1).norm(dim=1)
     pixel_linf = diff_pix.view(diff_pix.size(0), -1).abs().max(dim=1).values
 
-    clean_np = x_clean_pix.permute(0, 2, 3, 1).cpu().numpy()
-    adv_np = x_adv_pix.permute(0, 2, 3, 1).cpu().numpy()
-    diff_mag_np = diff_mag.cpu().numpy()
+    clean_np = tensor_to_numpy_copy(x_clean_pix.permute(0, 2, 3, 1))
+    adv_np = tensor_to_numpy_copy(x_adv_pix.permute(0, 2, 3, 1))
+    diff_mag_np = tensor_to_numpy_copy(diff_mag)
 
     fig, axes = plt.subplots(num_samples, 3, figsize=(12, 3 * num_samples), squeeze=False)
     vmax = float(diff_mag.max().item() if diff_mag.numel() else 1.0)
@@ -1499,7 +1515,7 @@ class AdversarialTrajectoryRecorder:
         self.records: Dict[int, List[Dict[str, object]]] = {idx: [] for idx in range(samples.size(0))}
         with torch.no_grad():
             clean_pix = to_pixel(self.samples).clamp(0.0, 1.0)
-        self.clean_rgb = clean_pix.permute(0, 2, 3, 1).cpu().numpy()
+        self.clean_rgb = tensor_to_numpy_copy(clean_pix.permute(0, 2, 3, 1))
 
     def record_epoch(
         self,
@@ -1581,13 +1597,10 @@ class AdversarialTrajectoryRecorder:
                     "latent_mse": float(latent_mse.item()),
                     "pixel_l2": float(pixel_l2.item()),
                     "pixel_linf": float(pixel_linf.item()),
-                    "adv_rgb": x_adv_pix[0].permute(1, 2, 0).cpu().numpy(),
-                    "diff_heatmap": diff_pix[0]
-                    .pow(2)
-                    .sum(dim=0)
-                    .sqrt()
-                    .cpu()
-                    .numpy(),
+                    "adv_rgb": tensor_to_numpy_copy(x_adv_pix[0].permute(1, 2, 0)),
+                    "diff_heatmap": tensor_to_numpy_copy(
+                        diff_pix[0].pow(2).sum(dim=0).sqrt()
+                    ),
                     "loss_traj": loss_traj,
                 }
                 self.records[idx].append(record)
@@ -2816,6 +2829,11 @@ def parse_args():
         default=0.8,
         help="Fraction of the best robust accuracy below which training stops after the patience window.",
     )
+    parser.add_argument(
+        "--early-stop",
+        action="store_true",
+        help="Enable drop-based early stopping on robust (input-PGD) accuracy.",
+    )
 
     parser.add_argument("--jacobian-aware", action="store_true")
     parser.add_argument("--jacobian-batches", type=int, default=4)
@@ -3180,6 +3198,7 @@ def main():
     if not best_checkpoint_path:
         best_checkpoint_path = str(Path("results") / f"input_icnn_best_{run_id}.pth")
     args.save_best_robust = best_checkpoint_path
+    early_stop_enabled = bool(getattr(args, "early_stop", False))
     early_stop_patience = max(0, int(args.early_stop_patience))
     robust_drop_fraction = float(args.early_stop_robust_threshold)
     if not math.isfinite(robust_drop_fraction):
@@ -3356,6 +3375,36 @@ def main():
     early_stop_triggered = False
     last_epoch_completed = 0
 
+    def _icnn_companion_path(base_path: str) -> Path:
+        base = Path(base_path)
+        suffixes = "".join(base.suffixes)
+        stem = base.name
+        if suffixes:
+            stem = stem[: -len(suffixes)]
+        icnn_name = f"{stem}_icnn{suffixes}"
+        return base.with_name(icnn_name)
+
+    def save_icnn_checkpoint_only(
+        base_path: str, epoch_idx: int, robust_acc: Optional[float], label: str
+    ) -> str:
+        icnn_path = _icnn_companion_path(base_path)
+        icnn_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "icnn": icnn.state_dict(),
+                "args": vars(args),
+                "epoch": epoch_idx,
+                "robust_input_pgd_acc": robust_acc,
+                "linked_classifier_ckpt": str(base_path),
+            },
+            icnn_path,
+        )
+        print(
+            f"[Checkpoint] Saved {label} ICNN-only checkpoint to {icnn_path} "
+            f"(paired with {base_path})"
+        )
+        return str(icnn_path)
+
     def save_model_checkpoint(path: str, epoch_idx: int, robust_acc: Optional[float], label: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -3370,6 +3419,7 @@ def main():
             path,
         )
         print(f"[Checkpoint] Saved {label} checkpoint to {path} (epoch {epoch_idx}, robust_acc={robust_acc})")
+        save_icnn_checkpoint_only(path, epoch_idx, robust_acc, label=label)
 
     if wandb_logger.enabled:
         wandb_logger.update_config({"schedule": schedule})
@@ -3689,7 +3739,7 @@ def main():
                 )
                 if wandb_logger.enabled:
                     wandb_logger.log({"robust/best_input_pgd_acc": best_robust_acc}, step=epoch)
-            elif best_robust_epoch is not None and best_robust_acc is not None:
+            elif early_stop_enabled and best_robust_epoch is not None and best_robust_acc is not None:
                 epochs_since_best = epoch - best_robust_epoch
                 if (
                     epochs_since_best >= early_stop_patience
@@ -3752,11 +3802,11 @@ def main():
                     )
         tracker.finish_epoch()
         last_epoch_completed = epoch
-        if early_stop_triggered:
+        if early_stop_enabled and early_stop_triggered:
             break
 
     summary_step = last_epoch_completed if last_epoch_completed > 0 else total_epochs
-    if early_stop_triggered:
+    if early_stop_enabled and early_stop_triggered:
         best_note = (
             f"{best_robust_acc*100:.2f}% (epoch {best_robust_epoch})"
             if best_robust_acc is not None and best_robust_epoch is not None
@@ -3895,6 +3945,13 @@ def main():
             args.save,
         )
         print(f"Saved checkpoint to {args.save}")
+        final_epoch_idx = last_epoch_completed if last_epoch_completed > 0 else total_epochs
+        save_icnn_checkpoint_only(
+            args.save,
+            epoch_idx=final_epoch_idx,
+            robust_acc=best_robust_acc,
+            label="final",
+        )
 
     if wandb_logger.enabled:
         wandb_logger.finish()
