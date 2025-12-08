@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn as nn
 
 from pretrained_INPUT_icnn import InputConvexPotential, adversarial_pushforward
+from model import get_model
 from pretrained_LAT import load_pretrained_resnet18
 from utils import (
     CIFAR10_MEAN,
@@ -206,14 +208,30 @@ def load_pretrained_vit(
     num_classes: int = 10,
 ):
     """
-    Load a ViT checkpoint (timm-style) for CIFAR10 classification.
-    Tries to infer the correct architecture from the filename (vitb16/vitb32/vit14).
+    Load a ViT checkpoint for CIFAR10 classification.
+    Supports vit-pytorch SimpleViT checkpoints (e.g., ViT_checkpoints/ViT1.pth) and timm models.
     """
     ckpt_path = Path(checkpoint_path)
     if _checkpoint_looks_like_html(ckpt_path):
         raise RuntimeError(
             f"Checkpoint at {ckpt_path} looks like an HTML page (download likely failed)."
         )
+
+    raw = torch.load(ckpt_path, map_location=device)
+    state = _extract_state_dict(raw)
+    if state is None:
+        raise RuntimeError(f"Could not find a state dict inside {ckpt_path}")
+
+    if _looks_like_simple_vit_state_dict(state):
+        model = _build_simple_vit_model(state, num_classes)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[ViT-simple] Missing keys ({len(missing)}): {missing}")
+        if unexpected:
+            print(f"[ViT-simple] Unexpected keys ({len(unexpected)}): {unexpected}")
+        width = state.get("transformer.layers.0.0.norm.weight", torch.tensor([])).shape[0]
+        print(f"[ViT-simple] Loaded vit_exp-compatible weights (width={width}) from: {ckpt_path}")
+        return model.to(device)
 
     try:
         import timm
@@ -242,7 +260,6 @@ def load_pretrained_vit(
             f"Could not instantiate ViT model for {ckpt_path}.\n" + "\n".join(init_errors)
         )
 
-    raw = torch.load(ckpt_path, map_location=device)
     state = unwrap_state_dict(raw)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
@@ -262,32 +279,30 @@ def load_classifier(checkpoint_path: str, device: torch.device):
     prefer_vit = "vit" in path.stem.lower()
     errors: List[str] = []
 
-    if not prefer_vit:
+    # When the checkpoint name suggests a ViT, do not silently fall back to ResNet;
+    # surface the ViT loading error instead so the correct model is evaluated.
+    if prefer_vit:
         try:
-            return load_pretrained_resnet18(
-                pretrained_path=str(path),
-                num_classes=10,
-                strict=False,
-                device=device,
-            ).to(device)
+            return load_pretrained_vit(str(path), device=device, num_classes=10)
         except Exception as exc:
-            errors.append(f"ResNet loader failed: {exc}")
+            errors.append(f"ViT loader failed: {exc}")
+            error_msg = "\n".join(errors)
+            raise RuntimeError(f"Unable to load checkpoint {checkpoint_path} as ViT:\n{error_msg}")
+
+    try:
+        return load_pretrained_resnet18(
+            pretrained_path=str(path),
+            num_classes=10,
+            strict=False,
+            device=device,
+        ).to(device)
+    except Exception as exc:
+        errors.append(f"ResNet loader failed: {exc}")
 
     try:
         return load_pretrained_vit(str(path), device=device, num_classes=10)
     except Exception as exc:
         errors.append(f"ViT loader failed: {exc}")
-
-    if prefer_vit:
-        try:
-            return load_pretrained_resnet18(
-                pretrained_path=str(path),
-                num_classes=10,
-                strict=False,
-                device=device,
-            ).to(device)
-        except Exception as exc:
-            errors.append(f"Secondary ResNet attempt failed: {exc}")
 
     error_msg = "\n".join(errors)
     raise RuntimeError(f"Unable to load checkpoint {checkpoint_path}:\n{error_msg}")
@@ -323,6 +338,162 @@ def clamp_normalized(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp(x, min=lower, max=upper)
 
 
+def _looks_like_simple_vit_state_dict(state: Dict[str, torch.Tensor]) -> bool:
+    """Heuristic: vit-pytorch SimpleViT checkpoints use these tensor names."""
+    return all(
+        key in state
+        for key in (
+            "to_patch_embedding.1.weight",
+            "transformer.layers.0.0.norm.weight",
+            "linear_head.1.weight",
+        )
+    )
+
+
+def _build_simple_vit_model(
+    state: Dict[str, torch.Tensor],
+    num_classes: int,
+) -> nn.Module:
+    """Instantiate a SimpleViT variant that matches the checkpoint structure."""
+    try:
+        from vit_pytorch.simple_vit import (
+            Attention,
+            FeedForward,
+            Rearrange,
+            SimpleViT,
+            Transformer,
+            pair,
+            posemb_sincos_2d,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "vit_pytorch is required to load vit_exp checkpoints. Install with `pip install vit-pytorch`."
+        ) from exc
+
+    class TransformerCompat(nn.Module):
+        """Transformer without final LayerNorm (matches saved checkpoints)."""
+
+        def __init__(self, dim: int, depth: int, heads: int, dim_head: int, mlp_dim: int):
+            super().__init__()
+            self.layers = nn.ModuleList(
+                [
+                    nn.ModuleList([Attention(dim, heads=heads, dim_head=dim_head), FeedForward(dim, mlp_dim)])
+                    for _ in range(depth)
+                ]
+            )
+
+        def forward(self, x):
+            for attn, ff in self.layers:
+                x = attn(x) + x
+                x = ff(x) + x
+            return x
+
+    class SimpleViTCompat(nn.Module):
+        """Older SimpleViT variant without LayerNorms in patch embedding (matches saved checkpoints)."""
+
+        def __init__(
+            self,
+            *,
+            image_size,
+            patch_size,
+            num_classes,
+            dim,
+            depth,
+            heads,
+            mlp_dim,
+            channels: int = 3,
+            dim_head: int = 64,
+        ):
+            super().__init__()
+            image_height, image_width = pair(image_size)
+            patch_height, patch_width = pair(patch_size)
+            patch_dim = channels * patch_height * patch_width
+
+            self.to_patch_embedding = nn.Sequential(
+                Rearrange(
+                    "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+                    p1=patch_height,
+                    p2=patch_width,
+                ),
+                nn.Linear(patch_dim, dim),
+            )
+            self.pos_embedding = posemb_sincos_2d(
+                h=image_height // patch_height,
+                w=image_width // patch_width,
+                dim=dim,
+            )
+            self.transformer = TransformerCompat(dim, depth, heads, dim_head, mlp_dim)
+            self.pool = "mean"
+            self.to_latent = nn.Identity()
+            self.linear_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_classes))
+
+        def forward(self, img):
+            x = self.to_patch_embedding(img)
+            x = x + self.pos_embedding.to(device=img.device, dtype=x.dtype)
+            x = self.transformer(x)
+            x = x.mean(dim=1)
+            x = self.to_latent(x)
+            return self.linear_head(x)
+
+    def _infer_depth() -> int:
+        layers = [
+            int(k.split(".")[2])
+            for k in state
+            if k.startswith("transformer.layers.") and k.split(".")[2].isdigit()
+        ]
+        return (max(layers) + 1) if layers else 6
+
+    def _infer_heads_dim() -> Tuple[int, int]:
+        qkv = state.get("transformer.layers.0.0.to_qkv.weight")
+        to_out = state.get("transformer.layers.0.0.to_out.weight")
+        if qkv is None or to_out is None:
+            return 16, 64
+        qkv_dim = int(qkv.shape[0])
+        out_dim = int(to_out.shape[1])
+        heads_dim_prod = out_dim if qkv_dim == 3 * out_dim else qkv_dim // 3
+        if heads_dim_prod % 64 == 0:
+            heads = heads_dim_prod // 64
+            dim_head = 64
+        else:
+            heads = max(1, heads_dim_prod // 64)
+            dim_head = heads_dim_prod // max(1, heads)
+        return heads, dim_head
+
+    linear_w = state.get("to_patch_embedding.2.weight") or state.get("to_patch_embedding.1.weight")
+    if linear_w is None:
+        raise RuntimeError("Could not find patch embedding weights in ViT checkpoint.")
+
+    dim = int(state.get("transformer.layers.0.0.norm.weight", linear_w).shape[0])
+    patch_dim = int(linear_w.shape[1] if linear_w.ndim == 2 else 48)
+    patch_size = int((patch_dim // 3) ** 0.5) if patch_dim % 3 == 0 else 4
+    depth = _infer_depth()
+    heads, dim_head = _infer_heads_dim()
+    mlp_dim = dim * 2
+
+    use_compat = "to_patch_embedding.2.weight" not in state and linear_w.ndim == 2
+    vit_cls = SimpleViTCompat if use_compat else SimpleViT
+    model = vit_cls(
+        image_size=32,
+        patch_size=patch_size,
+        num_classes=num_classes,
+        dim=dim,
+        depth=depth,
+        heads=heads,
+        mlp_dim=mlp_dim,
+        dim_head=dim_head,
+    )
+    return model
+
+
+def _extract_state_dict(raw: object) -> Dict[str, torch.Tensor] | None:
+    """Try common locations for a state dict inside a checkpoint."""
+    try:
+        sd = unwrap_state_dict(raw)
+    except Exception:
+        return None
+    return sd if looks_like_state_dict(sd) else None
+
+
 def run_attack(args: argparse.Namespace) -> None:
     device = get_device()
     set_deterministic(args.seed)
@@ -348,7 +519,8 @@ def run_attack(args: argparse.Namespace) -> None:
     adv_correct = {name: 0 for name in models}
     adv_overlap_counts = {name: 0 for name in models if name != source_name}
     adv_source_misclassified = 0
-    total_seen = 0
+    total_seen_raw = 0
+    total_used = 0
     l2_sum = 0.0
     linf_sum = 0.0
 
@@ -357,22 +529,35 @@ def run_attack(args: argparse.Namespace) -> None:
     saved_labels: List[torch.Tensor] = []
 
     for batch_x, batch_y in loader:
-        if args.max_samples is not None and total_seen >= args.max_samples:
+        if args.max_samples is not None and total_seen_raw >= args.max_samples:
             break
         if args.max_samples is not None:
-            remaining = args.max_samples - total_seen
+            remaining = args.max_samples - total_seen_raw
             if remaining < batch_x.size(0):
                 batch_x = batch_x[:remaining]
                 batch_y = batch_y[:remaining]
 
         x = batch_x.to(device)
         y = batch_y.to(device)
+        total_seen_raw += x.size(0)
 
         with torch.no_grad():
+            clean_preds = {}
             for name, model in models.items():
                 logits = model(x)
                 preds = logits.argmax(dim=1)
-                clean_correct[name] += int((preds == y).sum().item())
+                clean_preds[name] = preds
+
+        source_clean_mask = clean_preds[source_name] == y
+        source_clean_count = int(source_clean_mask.sum().item())
+        if source_clean_count == 0:
+            continue
+
+        x = x[source_clean_mask]
+        y = y[source_clean_mask]
+        for name, preds in clean_preds.items():
+            masked_preds = preds[source_clean_mask]
+            clean_correct[name] += int((masked_preds == y).sum().item())
 
         # Adversarial pushforward T(x) = ∇φ(x); clamp to stay in normalized pixel bounds.
         z_adv, _ = adversarial_pushforward(icnn, x, detach_for_model=True)
@@ -407,17 +592,19 @@ def run_attack(args: argparse.Namespace) -> None:
 
         saved_clean.append(x.cpu())
         saved_adv.append(z_adv.cpu())
-        saved_labels.append(batch_y)
+        saved_labels.append(y.cpu())
 
-        total_seen += x.size(0)
+        total_used += x.size(0)
 
-    if total_seen == 0:
-        raise RuntimeError("No samples were processed. Check dataloader settings.")
+    if total_used == 0:
+        raise RuntimeError(
+            "No samples qualified for analysis (all were misclassified by the clean source model)."
+        )
 
-    clean_acc = {k: v / total_seen for k, v in clean_correct.items()}
-    adv_acc = {k: v / total_seen for k, v in adv_correct.items()}
-    mean_l2 = l2_sum / total_seen
-    mean_linf = linf_sum / total_seen
+    clean_acc = {k: v / total_used for k, v in clean_correct.items()}
+    adv_acc = {k: v / total_used for k, v in adv_correct.items()}
+    mean_l2 = l2_sum / total_used
+    mean_linf = linf_sum / total_used
 
     run_id = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out_dir)
@@ -432,7 +619,8 @@ def run_attack(args: argparse.Namespace) -> None:
     metrics = {
         "run_id": run_id,
         "split": args.split,
-        "samples": total_seen,
+        "samples_raw": total_seen_raw,
+        "samples_analyzed": total_used,
         "icnn_checkpoint": str(Path(args.icnn_checkpoint).resolve()),
         "source_model": str(Path(args.source_model).resolve()),
         "target_models": [str(Path(p).resolve()) for p in args.target_models],
@@ -449,7 +637,7 @@ def run_attack(args: argparse.Namespace) -> None:
             for name, overlap in adv_overlap_counts.items()
         },
         "adv_common_misclassified_rate_overall": {
-            name: overlap / total_seen for name, overlap in adv_overlap_counts.items()
+            name: overlap / total_used for name, overlap in adv_overlap_counts.items()
         },
     }
 
@@ -468,7 +656,7 @@ def run_attack(args: argparse.Namespace) -> None:
         print(f"Saved metrics to {metrics_path}")
 
     print("\n=== Transfer Results ===")
-    print(f"Samples processed: {total_seen}")
+    print(f"Samples processed (raw): {total_seen_raw} | analyzed after clean-source filter: {total_used}")
     print(f"Mean ||delta||_2 (pixel): {mean_l2:.4f} | Mean ||delta||_inf (pixel): {mean_linf:.4f}")
     for name in models:
         print(
@@ -478,7 +666,7 @@ def run_attack(args: argparse.Namespace) -> None:
     print(f"\nAdversarial samples misclassified by source ({source_name}): {adv_source_misclassified}")
     for name, overlap in adv_overlap_counts.items():
         cond_rate = (overlap / adv_source_misclassified) if adv_source_misclassified > 0 else 0.0
-        overall_rate = overlap / total_seen
+        overall_rate = overlap / total_used
         print(
             f"{name}: overlap with source misclassifications {overlap} "
             f"({cond_rate*100:.2f}% of source errors, {overall_rate*100:.2f}% of all samples)"
