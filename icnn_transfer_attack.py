@@ -342,9 +342,12 @@ def run_attack(args: argparse.Namespace) -> None:
 
     icnn, icnn_args = load_icnn_from_checkpoint(args.icnn_checkpoint, example_batch, device)
     models = build_models(args.source_model, args.target_models, device)
+    source_name = next(iter(models.keys()))
 
     clean_correct = {name: 0 for name in models}
     adv_correct = {name: 0 for name in models}
+    adv_overlap_counts = {name: 0 for name in models if name != source_name}
+    adv_source_misclassified = 0
     total_seen = 0
     l2_sum = 0.0
     linf_sum = 0.0
@@ -384,10 +387,23 @@ def run_attack(args: argparse.Namespace) -> None:
             l2_sum += flat.norm(p=2, dim=1).sum().item()
             linf_sum += flat.abs().max(dim=1).values.sum().item()
 
+            batch_miscls = {}
             for name, model in models.items():
                 logits = model(z_adv)
                 preds = logits.argmax(dim=1)
-                adv_correct[name] += int((preds == y).sum().item())
+                correct = preds == y
+                adv_correct[name] += int(correct.sum().item())
+                batch_miscls[name] = ~correct
+
+            source_miscls_mask = batch_miscls[source_name]
+            source_miscls_count = int(source_miscls_mask.sum().item())
+            adv_source_misclassified += source_miscls_count
+            if source_miscls_count > 0:
+                for name, mask in batch_miscls.items():
+                    if name == source_name:
+                        continue
+                    overlap = int((mask & source_miscls_mask).sum().item())
+                    adv_overlap_counts[name] += overlap
 
         saved_clean.append(x.cpu())
         saved_adv.append(z_adv.cpu())
@@ -426,6 +442,15 @@ def run_attack(args: argparse.Namespace) -> None:
         "mean_linf_pix": mean_linf,
         "icnn_args": icnn_args,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "adv_source_misclassified": adv_source_misclassified,
+        "adv_common_misclassified": adv_overlap_counts,
+        "adv_common_misclassified_rate_given_source": {
+            name: (overlap / adv_source_misclassified) if adv_source_misclassified > 0 else 0.0
+            for name, overlap in adv_overlap_counts.items()
+        },
+        "adv_common_misclassified_rate_overall": {
+            name: overlap / total_seen for name, overlap in adv_overlap_counts.items()
+        },
     }
 
     if not args.no_save:
@@ -449,6 +474,14 @@ def run_attack(args: argparse.Namespace) -> None:
         print(
             f"{name}: clean acc {clean_acc[name]*100:.2f}% -> adv acc {adv_acc[name]*100:.2f}% "
             f"(drop { (clean_acc[name]-adv_acc[name])*100:.2f}%)"
+        )
+    print(f"\nAdversarial samples misclassified by source ({source_name}): {adv_source_misclassified}")
+    for name, overlap in adv_overlap_counts.items():
+        cond_rate = (overlap / adv_source_misclassified) if adv_source_misclassified > 0 else 0.0
+        overall_rate = overlap / total_seen
+        print(
+            f"{name}: overlap with source misclassifications {overlap} "
+            f"({cond_rate*100:.2f}% of source errors, {overall_rate*100:.2f}% of all samples)"
         )
 
 
