@@ -111,6 +111,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip writing adversarial examples to disk (metrics still printed).",
     )
+    parser.add_argument(
+        "--gamma-values",
+        type=float,
+        nargs="*",
+        default=[1.0],
+        help="Interpolation weights gamma in [0,1] for T(x,gamma)=(1-gamma)*x + gamma*T(x). "
+        "Include 1.0 to reproduce the original adversarial evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -497,6 +505,11 @@ def _extract_state_dict(raw: object) -> Dict[str, torch.Tensor] | None:
 def run_attack(args: argparse.Namespace) -> None:
     device = get_device()
     set_deterministic(args.seed)
+    gamma_values = [float(g) for g in (args.gamma_values or [1.0])]
+    for g in gamma_values:
+        if g < 0.0 or g > 1.0:
+            raise ValueError(f"Gamma values must be in [0,1]; got {gamma_values}")
+    reference_gamma = 1.0 if 1.0 in gamma_values else gamma_values[-1]
 
     loader, _ = get_cifar10_loader(
         split=args.split,
@@ -516,17 +529,21 @@ def run_attack(args: argparse.Namespace) -> None:
     source_name = next(iter(models.keys()))
 
     clean_correct = {name: 0 for name in models}
-    adv_correct = {name: 0 for name in models}
+    adv_correct_by_gamma = {
+        gamma: {name: 0 for name in models} for gamma in gamma_values
+    }
     adv_overlap_counts = {name: 0 for name in models if name != source_name}
     adv_source_misclassified = 0
     total_seen_raw = 0
     total_used = 0
-    l2_sum = 0.0
-    linf_sum = 0.0
+    l2_sum_by_gamma = {gamma: 0.0 for gamma in gamma_values}
+    linf_sum_by_gamma = {gamma: 0.0 for gamma in gamma_values}
 
     saved_clean: List[torch.Tensor] = []
     saved_adv: List[torch.Tensor] = []
     saved_labels: List[torch.Tensor] = []
+    saved_clean_preds: Dict[str, List[torch.Tensor]] = {name: [] for name in models}
+    saved_adv_preds: Dict[str, List[torch.Tensor]] = {name: [] for name in models}
 
     for batch_x, batch_y in loader:
         if args.max_samples is not None and total_seen_raw >= args.max_samples:
@@ -558,40 +575,52 @@ def run_attack(args: argparse.Namespace) -> None:
         for name, preds in clean_preds.items():
             masked_preds = preds[source_clean_mask]
             clean_correct[name] += int((masked_preds == y).sum().item())
+            saved_clean_preds[name].append(masked_preds.cpu())
 
         # Adversarial pushforward T(x) = ∇φ(x); clamp to stay in normalized pixel bounds.
-        z_adv, _ = adversarial_pushforward(icnn, x, detach_for_model=True)
-        z_adv = clamp_normalized(z_adv).detach()
+        z_adv_base, _ = adversarial_pushforward(icnn, x, detach_for_model=True)
+        z_adv_base = clamp_normalized(z_adv_base).detach()
         
 
         with torch.no_grad():
-            adv_pix = to_pixel(z_adv)
-            clean_pix = to_pixel(x)
-            delta_pix = adv_pix - clean_pix
-            flat = delta_pix.view(delta_pix.size(0), -1)
-            l2_sum += flat.norm(p=2, dim=1).sum().item()
-            linf_sum += flat.abs().max(dim=1).values.sum().item()
+            z_ref: torch.Tensor | None = None
+            for gamma in gamma_values:
+                z_gamma = clamp_normalized((1.0 - gamma) * x + gamma * z_adv_base)
 
-            batch_miscls = {}
-            for name, model in models.items():
-                logits = model(z_adv)
-                preds = logits.argmax(dim=1)
-                correct = preds == y
-                adv_correct[name] += int(correct.sum().item())
-                batch_miscls[name] = ~correct
+                adv_pix = to_pixel(z_gamma)
+                clean_pix = to_pixel(x)
+                delta_pix = adv_pix - clean_pix
+                flat = delta_pix.view(delta_pix.size(0), -1)
+                l2_sum_by_gamma[gamma] += flat.norm(p=2, dim=1).sum().item()
+                linf_sum_by_gamma[gamma] += flat.abs().max(dim=1).values.sum().item()
 
-            source_miscls_mask = batch_miscls[source_name]
-            source_miscls_count = int(source_miscls_mask.sum().item())
-            adv_source_misclassified += source_miscls_count
-            if source_miscls_count > 0:
-                for name, mask in batch_miscls.items():
-                    if name == source_name:
-                        continue
-                    overlap = int((mask & source_miscls_mask).sum().item())
-                    adv_overlap_counts[name] += overlap
+                batch_miscls = {}
+                for name, model in models.items():
+                    logits = model(z_gamma)
+                    preds = logits.argmax(dim=1)
+                    correct = preds == y
+                    adv_correct_by_gamma[gamma][name] += int(correct.sum().item())
+                    batch_miscls[name] = ~correct
+                    if gamma == reference_gamma:
+                        saved_adv_preds[name].append(preds.cpu())
+
+                if gamma == reference_gamma:
+                    z_ref = z_gamma
+                    source_miscls_mask = batch_miscls[source_name]
+                    source_miscls_count = int(source_miscls_mask.sum().item())
+                    adv_source_misclassified += source_miscls_count
+                    if source_miscls_count > 0:
+                        for name, mask in batch_miscls.items():
+                            if name == source_name:
+                                continue
+                            overlap = int((mask & source_miscls_mask).sum().item())
+                            adv_overlap_counts[name] += overlap
+
+            if z_ref is None:
+                z_ref = z_adv_base
 
         saved_clean.append(x.cpu())
-        saved_adv.append(z_adv.cpu())
+        saved_adv.append(z_ref.cpu())
         saved_labels.append(y.cpu())
 
         total_used += x.size(0)
@@ -602,9 +631,29 @@ def run_attack(args: argparse.Namespace) -> None:
         )
 
     clean_acc = {k: v / total_used for k, v in clean_correct.items()}
-    adv_acc = {k: v / total_used for k, v in adv_correct.items()}
-    mean_l2 = l2_sum / total_used
-    mean_linf = linf_sum / total_used
+    adv_acc_by_gamma = {
+        gamma: {k: v / total_used for k, v in counts.items()}
+        for gamma, counts in adv_correct_by_gamma.items()
+    }
+    adv_acc = adv_acc_by_gamma[reference_gamma]
+    mean_l2_by_gamma = {gamma: l2 / total_used for gamma, l2 in l2_sum_by_gamma.items()}
+    mean_linf_by_gamma = {gamma: li / total_used for gamma, li in linf_sum_by_gamma.items()}
+    mean_l2 = mean_l2_by_gamma[reference_gamma]
+    mean_linf = mean_linf_by_gamma[reference_gamma]
+
+    labels_cat = torch.cat(saved_labels, dim=0)
+    clean_preds_cat = {k: torch.cat(v, dim=0) for k, v in saved_clean_preds.items()}
+    adv_preds_cat = {k: torch.cat(v, dim=0) for k, v in saved_adv_preds.items()}
+    adv_disagree_counts = {}
+    adv_common_both = {}
+    source_adv_preds = adv_preds_cat[source_name]
+    source_mis_mask_all = source_adv_preds != labels_cat
+    for name, preds in adv_preds_cat.items():
+        if name == source_name:
+            continue
+        both_mis = source_mis_mask_all & (preds != labels_cat)
+        adv_common_both[name] = int(both_mis.sum().item())
+        adv_disagree_counts[name] = int((both_mis & (preds != source_adv_preds)).sum().item())
 
     run_id = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out_dir)
@@ -626,8 +675,11 @@ def run_attack(args: argparse.Namespace) -> None:
         "target_models": [str(Path(p).resolve()) for p in args.target_models],
         "clean_acc": clean_acc,
         "adv_acc": adv_acc,
+        "adv_acc_by_gamma": adv_acc_by_gamma,
         "mean_l2_pix": mean_l2,
         "mean_linf_pix": mean_linf,
+        "mean_l2_pix_by_gamma": mean_l2_by_gamma,
+        "mean_linf_pix_by_gamma": mean_linf_by_gamma,
         "icnn_args": icnn_args,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "adv_source_misclassified": adv_source_misclassified,
@@ -639,6 +691,10 @@ def run_attack(args: argparse.Namespace) -> None:
         "adv_common_misclassified_rate_overall": {
             name: overlap / total_used for name, overlap in adv_overlap_counts.items()
         },
+        "adv_common_disagree_counts": adv_disagree_counts,
+        "adv_common_counts_recomputed": adv_common_both,
+        "gamma_values": gamma_values,
+        "reference_gamma": reference_gamma,
     }
 
     if not args.no_save:
@@ -646,6 +702,8 @@ def run_attack(args: argparse.Namespace) -> None:
             "clean": torch.cat(saved_clean, dim=0),
             "adv": torch.cat(saved_adv, dim=0),
             "labels": torch.cat(saved_labels, dim=0),
+            "clean_preds": {k: v for k, v in clean_preds_cat.items()},
+            "adv_preds": {k: v for k, v in adv_preds_cat.items()},
             "metrics": metrics,
         }
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -657,12 +715,19 @@ def run_attack(args: argparse.Namespace) -> None:
 
     print("\n=== Transfer Results ===")
     print(f"Samples processed (raw): {total_seen_raw} | analyzed after clean-source filter: {total_used}")
-    print(f"Mean ||delta||_2 (pixel): {mean_l2:.4f} | Mean ||delta||_inf (pixel): {mean_linf:.4f}")
-    for name in models:
+    print(f"Reference gamma: {reference_gamma}")
+    for gamma in gamma_values:
         print(
-            f"{name}: clean acc {clean_acc[name]*100:.2f}% -> adv acc {adv_acc[name]*100:.2f}% "
-            f"(drop { (clean_acc[name]-adv_acc[name])*100:.2f}%)"
+            f"\n-- gamma={gamma:.3f} -- Mean ||delta||_2 (pixel): {mean_l2_by_gamma[gamma]:.4f} | "
+            f"Mean ||delta||_inf (pixel): {mean_linf_by_gamma[gamma]:.4f}"
         )
+        for name in models:
+            adv_acc_gamma = adv_acc_by_gamma[gamma][name] * 100
+            drop = (clean_acc[name] - adv_acc_by_gamma[gamma][name]) * 100
+            print(
+                f"{name}: clean acc {clean_acc[name]*100:.2f}% -> adv acc {adv_acc_gamma:.2f}% "
+                f"(drop {drop:.2f}%)"
+            )
     print(f"\nAdversarial samples misclassified by source ({source_name}): {adv_source_misclassified}")
     for name, overlap in adv_overlap_counts.items():
         cond_rate = (overlap / adv_source_misclassified) if adv_source_misclassified > 0 else 0.0
@@ -671,6 +736,8 @@ def run_attack(args: argparse.Namespace) -> None:
             f"{name}: overlap with source misclassifications {overlap} "
             f"({cond_rate*100:.2f}% of source errors, {overall_rate*100:.2f}% of all samples)"
         )
+        disagree = adv_disagree_counts.get(name, 0)
+        print(f"    -> of those overlaps, {disagree} had different predicted labels between {source_name} and {name}")
 
 
 if __name__ == "__main__":
