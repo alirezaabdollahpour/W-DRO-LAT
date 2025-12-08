@@ -32,3 +32,5 @@ cifar10w
 cifar10w/*
 plots/
 plots/*
+tmp_viz/
+tmp_viz/*

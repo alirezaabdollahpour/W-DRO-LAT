@@ -51,7 +51,7 @@ LOG_FIELDNAMES = [
 # ---------------------------------------------------------------------------
 
 def cross_entropy_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(logits, labels, reduction="none")
+    return F.cross_entropy(logits, labels, reduction="sum")
 
 
 def accuracy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -232,7 +232,7 @@ class BBArmijoState:
         return BBArmijoState(alpha_min=self.alpha_min, alpha_max=self.alpha_max, alpha_prev=alpha_clamped, ls_c=self.ls_c, ls_shrink=self.ls_shrink, ls_max_steps=self.ls_max_steps, prev_params_vec=params_vec.detach(), prev_grad_vec=grad_vec.detach())
 
 
-def bb_armijo_ascent_x(x0: torch.Tensor, f, num_steps: int, bb_state: Optional[BBArmijoState] = None) -> torch.Tensor:
+def bb_armijo_ascent_x(x0: torch.Tensor, f, num_steps: int, bb_state: Optional[BBArmijoState] = None, normalize_grad: bool = True, clamp: Optional[Tuple[float, float]] = (0.0, 1.0)) -> torch.Tensor:
     if x0.numel() == 0 or num_steps == 0:
         return x0
     if bb_state is None:
@@ -242,24 +242,32 @@ def bb_armijo_ascent_x(x0: torch.Tensor, f, num_steps: int, bb_state: Optional[B
     for _ in range(num_steps):
         x_req = x.detach().requires_grad_(True)
         fx = f(x_req)
-        g = torch.autograd.grad(fx, x_req, create_graph=False)[0]
-        g_vec = g.reshape(g.size(0), -1)
-        g_flat = g_vec.reshape(-1)
+        g_raw = torch.autograd.grad(fx, x_req, create_graph=False)[0]
+        direction = g_raw
+        if normalize_grad:
+            g_flat_b = g_raw.view(g_raw.size(0), -1)
+            g_norm = g_flat_b.norm(dim=1, keepdim=True)
+            direction = g_raw / (g_norm.view(-1, *([1] * (g_raw.dim() - 1))) + 1e-12)
+        dir_flat = direction.reshape(-1)
+        g_flat_raw = g_raw.reshape(-1)
         x_vec = x_req.reshape(-1)
-        alpha = state.propose(x_vec, g_flat)
-        g_dot_g = float(torch.dot(g_flat, g_flat).item())
-        if g_dot_g == 0.0:
+        alpha = state.propose(x_vec, g_flat_raw)
+        g_dot_dir = float(torch.dot(g_flat_raw, dir_flat).item())
+        if not math.isfinite(g_dot_dir) or g_dot_dir <= 0.0:
             break
         alpha_k = alpha
         for _ in range(state.ls_max_steps):
-            x_trial = x_req + alpha_k * g
+            x_trial = x_req + alpha_k * direction
             f_trial = f(x_trial).item()
-            if f_trial >= fx.item() + state.ls_c * alpha_k * g_dot_g:
+            if f_trial >= fx.item() + state.ls_c * alpha_k * g_dot_dir:
                 break
             alpha_k *= state.ls_shrink
-        x_new = (x_req + alpha_k * g).detach()
-        g_new = torch.autograd.grad(f(x_new.requires_grad_(True)), x_new, create_graph=False)[0]
-        state = state.update_history(x_new.reshape(-1), g_new.reshape(-1), alpha_k)
+        x_new = (x_req + alpha_k * direction).detach()
+        if clamp is not None:
+            lo, hi = clamp
+            x_new = x_new.clamp(lo, hi)
+        g_new_raw = torch.autograd.grad(f(x_new.requires_grad_(True)), x_new, create_graph=False)[0]
+        state = state.update_history(x_new.reshape(-1), g_new_raw.reshape(-1), alpha_k)
         x = x_new
     return x.detach()
 
@@ -311,6 +319,49 @@ def bb_armijo_step_params(vec: torch.Tensor, meta, f_params, bb_state: BBArmijoS
     return v_new.detach(), new_bb_state, f_val_f
 
 # ---------------------------------------------------------------------------
+#  Adaptive ascent for adversary (Algorithm 1)
+# ---------------------------------------------------------------------------
+
+def adam_ascent_x(
+    x0: torch.Tensor,
+    f,
+    num_steps: int,
+    lr: float = 1e-1,
+    betas: Tuple[float, float] = (0.9, 0.999),
+    eps: float = 1e-8,
+    normalize_grad: bool = True,
+    clamp: Optional[Tuple[float, float]] = (0.0, 1.0),
+) -> torch.Tensor:
+    """
+    Performs projected gradient ascent with Adam on x (maximization of f).
+    Gradient is optionally per-sample L2-normalized to keep scale aligned
+    with other adversaries.
+    """
+    if num_steps == 0:
+        return x0.detach()
+    start = x0.detach()
+    adv = nn.Parameter(start.clone())
+    opt = torch.optim.Adam([adv], lr=lr, betas=betas, eps=eps)
+    for _ in range(num_steps):
+        opt.zero_grad()
+        value = f(adv)
+        loss = -value  # maximize f
+        loss.backward()
+        if normalize_grad and adv.grad is not None:
+            with torch.no_grad():
+                g = adv.grad
+                g_flat = g.view(g.size(0), -1)
+                g_norm = g_flat.norm(dim=1, keepdim=True)
+                reshape = (-1,) + (1,) * (g.dim() - 1)
+                g.div_(g_norm.view(reshape) + 1e-12)
+        opt.step()
+        with torch.no_grad():
+            if clamp is not None:
+                lo, hi = clamp
+                adv.clamp_(lo, hi)
+    return adv.detach()
+
+# ---------------------------------------------------------------------------
 #  Config and states
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -318,7 +369,7 @@ class TrainConfig:
     batch_size: int = 256
     num_epochs: int = 3
     lr_cls: float = 1e-3
-    lambda_reg: float = 0.5
+    lambda_reg: float = 100
     log_every: int = 100
     max_steps_algo1: Optional[int] = None
     max_steps_algo2: Optional[int] = None
@@ -326,7 +377,7 @@ class TrainConfig:
     use_margin_adv_algo2: bool = False
     inner_steps_algo1: int = 5
     inner_steps_algo2: int = 5
-    bb_alpha0_x: float = 1e-1
+    inner_lr_algo1: float = 1e-1
     bb_alpha0_icnn: float = 1e-2
     icnn_hidden_sizes: Sequence[int] = (64, 64, 64, 64)
     seed: int = 0
@@ -441,10 +492,18 @@ def train_step_algo1(state: TrainState, batch, cfg: TrainConfig, device: torch.d
     def adv_obj(z: torch.Tensor) -> torch.Tensor:
         logits = model(z)
         adv_loss = adversary_loss(logits, y, cfg.use_margin_adv_algo1)
-        sq_dist = ((z - x) ** 2).sum(dim=(1, 2, 3)).mean()
+        # Use per-pixel MSE so lambda_reg is scale-free w.r.t. image dimension
+        sq_dist = ((z - x) ** 2).mean(dim=(1, 2, 3)).mean()
         return adv_loss - cfg.lambda_reg * sq_dist
 
-    adv_x = bb_armijo_ascent_x(x, adv_obj, cfg.inner_steps_algo1, BBArmijoState.create(alpha0=cfg.bb_alpha0_x)).detach()
+    adv_x = adam_ascent_x(
+        x,
+        adv_obj,
+        cfg.inner_steps_algo1,
+        lr=cfg.inner_lr_algo1,
+        normalize_grad=True,
+        clamp=(0.0, 1.0),
+    ).detach()
     adv_x_stop = adv_x.detach()
 
     # Outer minimization: unfreeze classifier weights
@@ -461,7 +520,7 @@ def train_step_algo1(state: TrainState, batch, cfg: TrainConfig, device: torch.d
         logits_clean = model(x)
         acc_clean = accuracy(logits_clean, y)
         acc_adv = accuracy(logits_adv, y)
-        w2_proxy = ((adv_x_stop - x) ** 2).sum(dim=(1, 2, 3)).mean()
+        w2_proxy = ((adv_x_stop - x) ** 2).mean(dim=(1, 2, 3)).mean()
     metrics = {"loss_adv": loss.detach(), "acc_clean": acc_clean, "acc_adv": acc_adv, "w2_proxy": w2_proxy}
     return state, metrics
 
@@ -491,9 +550,10 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
         params_dict = unflatten_vector(vec, meta)
         adv_flat = icnn_gradient(icnn_model, params_dict, x_flat, create_graph=True)
         adv_x = adv_flat.view_as(x)
+        adv_x = adv_x.clamp(0.0, 1.0)
         logits = model(adv_x)
         adv_loss = adversary_loss(logits, y, cfg.use_margin_adv_algo2)
-        w2 = ((adv_flat - x_flat) ** 2).sum(dim=1).mean()
+        w2 = ((adv_x - x) ** 2).mean(dim=(1, 2, 3)).mean()
         return adv_loss - cfg.lambda_reg * w2
 
     adv_loss_val = torch.tensor(0.0, device=device)
@@ -510,7 +570,7 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
 
     params_dict_final = unflatten_vector(icnn_state.params_vec.to(device), meta)
     adv_flat = icnn_gradient(icnn_model, params_dict_final, x_flat).detach()
-    adv_x = adv_flat.view_as(x)
+    adv_x = adv_flat.view_as(x).clamp(0.0, 1.0)
 
     logits_adv = model(adv_x)
     cls_loss = cross_entropy_loss(logits_adv, y).mean()
@@ -522,7 +582,7 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
         logits_clean = model(x)
         acc_clean = accuracy(logits_clean, y)
         acc_adv = accuracy(logits_adv, y)
-        w2_proxy = ((adv_flat - x_flat) ** 2).sum(dim=1).mean()
+        w2_proxy = ((adv_x - x) ** 2).mean(dim=(1, 2, 3)).mean()
     metrics = {"adv_loss": adv_loss_val.detach(), "cls_loss": cls_loss.detach(), "acc_clean": acc_clean, "acc_adv": acc_adv, "w2_proxy": w2_proxy}
     return state, icnn_state, metrics
 
@@ -532,7 +592,7 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
 
 def create_classifier_state(cfg: TrainConfig, device: torch.device) -> TrainState:
     model = LeNet().to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr_cls)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr_cls, weight_decay=1e-4)
     return TrainState(model=model, opt=opt)
 
 
@@ -612,17 +672,17 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = TrainConfig(
         batch_size=512,
-        num_epochs=1,
+        num_epochs=50,
         lr_cls=1e-3,
-        lambda_reg=0.5,
+        lambda_reg=10000000000.0,
         log_every=100,
         max_steps_algo1=None,
         max_steps_algo2=None,
-        use_margin_adv_algo1=False,
+        use_margin_adv_algo1=True,
         use_margin_adv_algo2=False,
-        inner_steps_algo1=5,
-        inner_steps_algo2=5,
-        bb_alpha0_x=1e-1,
+        inner_steps_algo1=10,
+        inner_steps_algo2=10,
+        inner_lr_algo1=1e-3,
         bb_alpha0_icnn=1e-2,
         icnn_hidden_sizes=(512, 512, 256, 128),
         seed=0,

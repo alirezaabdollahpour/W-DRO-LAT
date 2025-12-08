@@ -2,7 +2,13 @@
 set -euo pipefail
 
 # Arguments used for OOD evaluation (kept as vars so we can embed them in the save-json path)
-CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/R2_INPUT_icnn_lambda_30_epochs_adv_5_l2_PGD_without_amortization.pth
+# CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/R2_INPUT_icnn_lambda_30_epochs_adv_5_l2_PGD_without_amortization.pth
+# CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/R2_INPUT_icnn_lambda_30_epochs_adv_5_l2_PGD.pth
+# CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/R2_INPUT_icnn_lambda_10_epochs_adv_5_l2_PGD.pth
+# CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/R2_INPUT_icnn_lambda_5_epochs_adv_5_l2_PGD.pth
+# CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/R2_INPUT_icnn_lambda_30_epochs_adv_30_l2_PGD_without_amortization_epoch_icnn_2_without_margin_loss.pth
+# CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/ResNet_checkpoints/R2.pth
+CKPT=/mnt/lts4/scratch/students/aabdolla/LAT/R2_INPUT_icnn_lambda_30_epochs_adv_30_l2_PGD_1024_512_512_256_128_64.pth
 INP_P=2
 INP_EPS=0.5
 INP_STEPS=20
@@ -17,7 +23,7 @@ CIFAR10C_SEVERITIES=(1 2 3 4 5)
 
 CKPT_NAME="$(basename "${CKPT%.*}")"
 ATTACKS_TAG=$(IFS=-; echo "${AA_ATTACKS[*]}")
-SAVE_JSON="results/ood_${CKPT_NAME}_inpP-${INP_P}_eps-${INP_EPS}_steps-${INP_STEPS}_restarts-${INP_RESTARTS}_aa-${AA_VERSION}-${ATTACKS_TAG}_norm-${AA_NORM}_aaeps-${AA_EPS}_bs-${AA_BS}.json"
+SAVE_JSON="OOD_${CKPT_NAME}_eps-${INP_EPS}.json"
 mkdir -p "$(dirname "$SAVE_JSON")"
 
 python evaluate_wrm_lat_cifar10_variants.py \

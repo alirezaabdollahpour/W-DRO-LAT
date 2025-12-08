@@ -279,11 +279,22 @@ def dataloader_seed(base_seed: int, offset: int = 0) -> Tuple[torch.Generator, C
 
 def _cifar10_transform(train: bool, augment_train: bool):
     import torchvision.transforms as T
+    from PIL import Image
+
+    def pil_to_float_tensor(pic: Image.Image) -> torch.Tensor:
+        if not isinstance(pic, Image.Image):
+            raise TypeError(f"Expected PIL.Image.Image, got {type(pic)}")
+        # Convert via raw bytes to avoid numpy <-> torch dtype issues.
+        buf = torch.tensor(bytearray(pic.tobytes()), dtype=torch.uint8)
+        nchannel = len(pic.getbands())
+        img = buf.view(pic.height, pic.width, nchannel)
+        img = img.permute(2, 0, 1).contiguous()
+        return img.float().div(255.0)
 
     transforms = []
     if train and augment_train:
         transforms.extend([T.RandomCrop(32, padding=4), T.RandomHorizontalFlip()])
-    transforms.append(T.ToTensor())
+    transforms.append(T.Lambda(pil_to_float_tensor))
     transforms.append(T.Normalize(CIFAR10_MEAN, CIFAR10_STD))
     return T.Compose(transforms)
 

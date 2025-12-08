@@ -382,6 +382,34 @@ def _move_normalization_buffers(module: nn.Module, device: torch.device) -> None
 
 
 # -----------------------------
+# Checkpoint helpers
+# -----------------------------
+def _extract_state_dict(ckpt: dict) -> Tuple[dict, Optional[str]]:
+    """
+    Best-effort extraction of a model state_dict from assorted checkpoint formats.
+
+    Returns: (state_dict, source_key)
+    """
+    if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+        return ckpt["state_dict"], "state_dict"
+
+    # Common natural-model checkpoints bundled with multiple versions
+    for key in ("best", "swa_best", "swa_last", "last", "model", "net"):
+        if key in ckpt and isinstance(ckpt[key], dict):
+            payload = ckpt[key]
+            if "state_dict" in payload and isinstance(payload["state_dict"], dict):
+                return payload["state_dict"], f"{key}.state_dict"
+            if any(torch.is_tensor(v) for v in payload.values()):
+                return payload, key
+
+    # If the entire checkpoint looks like a state dict (tensor-valued)
+    if ckpt and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+        return ckpt, "top_level"
+
+    raise KeyError("No state_dict-like payload found in checkpoint.")
+
+
+# -----------------------------
 # Checkpoint loader (matches your WRM-LAT save format)
 # -----------------------------
 def load_backbone_from_ckpt(path: str, device: torch.device):
@@ -451,7 +479,13 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
         }
         return model, meta
 
-    arch = ckpt.get("arch", "PreActResNet18")
+    # Generic backbone checkpoint (natural models, WRM baselines, etc.)
+    try:
+        state_dict, sd_key = _extract_state_dict(ckpt)
+    except KeyError as err:
+        raise KeyError(f"Checkpoint at {path} does not contain a loadable state_dict.") from err
+
+    arch = ckpt.get("arch") or _infer_arch_from_state_dict(state_dict)
     arch_init = ckpt.get(
         "arch_init",
         {"n_cls": 10, "model_width": 64, "normalize_features": False, "normalize_logits": False},
@@ -469,7 +503,7 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
         print(f"[load] Unknown arch '{arch}', falling back to PreActResNet18 with arch_init={arch_init}")
         base = PreActResNet18(**arch_init)
 
-    missing, unexpected = base.load_state_dict(ckpt["state_dict"], strict=False)
+    missing, unexpected = base.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
         print(f"[load] non-strict load => missing={missing}, unexpected={unexpected}")
 
@@ -484,6 +518,7 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
         "pytorch": ckpt.get("pytorch", None),
         "arch": arch,
         "arch_init": arch_init,
+        "state_dict_key": sd_key,
     }
     return base, meta
 
