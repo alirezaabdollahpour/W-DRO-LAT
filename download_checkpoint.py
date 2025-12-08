@@ -386,8 +386,9 @@ def main():
     """Main function to run the checkpoint downloader."""
     
     # Configuration
-    DRIVE_URL = "https://drive.google.com/drive/folders/1dwfb2Iqw6BTMi57SeG44aDebuu-TBzo5?usp=drive_link"
-    DOWNLOAD_PATH = "/mnt/lts4/scratch/students/aabdolla/LAT/ResNet_checkpoints"
+    # DRIVE_URL = "https://drive.google.com/drive/folders/1dwfb2Iqw6BTMi57SeG44aDebuu-TBzo5?usp=drive_link"
+    DRIVE_URL = "https://drive.google.com/drive/folders/1hX0Wj2jW5tGuWNQXJlDoON5Y832qSXPx?usp=drive_link"
+    DOWNLOAD_PATH = "/mnt/lts4/scratch/students/aabdolla/LAT/ViT_checkpoints"
     
     # Option 1: Auto-discover files in the folder (recommended)
     downloader = PyTorchCheckpointDownloader(
