@@ -119,6 +119,14 @@ def parse_args() -> argparse.Namespace:
         help="Interpolation weights gamma in [0,1] for T(x,gamma)=(1-gamma)*x + gamma*T(x). "
         "Include 1.0 to reproduce the original adversarial evaluation.",
     )
+    parser.add_argument(
+        "--alpha-values",
+        type=float,
+        nargs="*",
+        default=[1.0],
+        help="ICNN weight-space interpolation coefficients alpha in [0,1] between "
+        "initial ICNN parameters (alpha=0) and trained parameters (alpha=1).",
+    )
     return parser.parse_args()
 
 
@@ -156,7 +164,7 @@ def load_icnn_from_checkpoint(
     icnn_path: str,
     example_input: torch.Tensor,
     device: torch.device,
-) -> Tuple[InputConvexPotential, Dict]:
+) -> Tuple[InputConvexPotential, Dict, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Recreate InputConvexPotential with training-time hyperparameters and load weights."""
     checkpoint = torch.load(icnn_path, map_location=device)
     args_dict = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
@@ -185,9 +193,11 @@ def load_icnn_from_checkpoint(
         use_convs=use_conv,
         conv_kernel_size=kernel_size,
     ).to(device)
+    init_state = {k: v.detach().clone() for k, v in icnn.state_dict().items()}
     icnn.load_state_dict(icnn_sd, strict=True)
     icnn.eval()
-    return icnn, args_dict
+    trained_state = {k: v.detach().clone() for k, v in icnn.state_dict().items()}
+    return icnn, args_dict, init_state, trained_state
 
 
 def _checkpoint_looks_like_html(path: Path) -> bool:
@@ -510,6 +520,11 @@ def run_attack(args: argparse.Namespace) -> None:
         if g < 0.0 or g > 1.0:
             raise ValueError(f"Gamma values must be in [0,1]; got {gamma_values}")
     reference_gamma = 1.0 if 1.0 in gamma_values else gamma_values[-1]
+    alpha_values = [float(a) for a in (args.alpha_values or [1.0])]
+    for a in alpha_values:
+        if a < 0.0 or a > 1.0:
+            raise ValueError(f"Alpha values must be in [0,1]; got {alpha_values}")
+    reference_alpha = 1.0 if 1.0 in alpha_values else alpha_values[-1]
 
     loader, _ = get_cifar10_loader(
         split=args.split,
@@ -524,20 +539,35 @@ def run_attack(args: argparse.Namespace) -> None:
     )
     example_batch = next(iter(loader))[0][:1].to(device)
 
-    icnn, icnn_args = load_icnn_from_checkpoint(args.icnn_checkpoint, example_batch, device)
+    icnn, icnn_args, icnn_init_state, icnn_trained_state = load_icnn_from_checkpoint(
+        args.icnn_checkpoint, example_batch, device
+    )
     models = build_models(args.source_model, args.target_models, device)
     source_name = next(iter(models.keys()))
 
+    def _interp_state(alpha: float) -> Dict[str, torch.Tensor]:
+        blended: Dict[str, torch.Tensor] = {}
+        for k in icnn_trained_state:
+            w0 = icnn_init_state[k].to(device)
+            w1 = icnn_trained_state[k].to(device)
+            blended[k] = (1.0 - alpha) * w0 + alpha * w1
+        return blended
+
     clean_correct = {name: 0 for name in models}
-    adv_correct_by_gamma = {
-        gamma: {name: 0 for name in models} for gamma in gamma_values
+    adv_correct_by_alpha_gamma = {
+        alpha: {gamma: {name: 0 for name in models} for gamma in gamma_values}
+        for alpha in alpha_values
     }
     adv_overlap_counts = {name: 0 for name in models if name != source_name}
     adv_source_misclassified = 0
     total_seen_raw = 0
     total_used = 0
-    l2_sum_by_gamma = {gamma: 0.0 for gamma in gamma_values}
-    linf_sum_by_gamma = {gamma: 0.0 for gamma in gamma_values}
+    l2_sum_by_alpha_gamma = {
+        alpha: {gamma: 0.0 for gamma in gamma_values} for alpha in alpha_values
+    }
+    linf_sum_by_alpha_gamma = {
+        alpha: {gamma: 0.0 for gamma in gamma_values} for alpha in alpha_values
+    }
 
     saved_clean: List[torch.Tensor] = []
     saved_adv: List[torch.Tensor] = []
@@ -577,47 +607,51 @@ def run_attack(args: argparse.Namespace) -> None:
             clean_correct[name] += int((masked_preds == y).sum().item())
             saved_clean_preds[name].append(masked_preds.cpu())
 
-        # Adversarial pushforward T(x) = ∇φ(x); clamp to stay in normalized pixel bounds.
-        z_adv_base, _ = adversarial_pushforward(icnn, x, detach_for_model=True)
-        z_adv_base = clamp_normalized(z_adv_base).detach()
-        
-
         with torch.no_grad():
             z_ref: torch.Tensor | None = None
-            for gamma in gamma_values:
-                z_gamma = clamp_normalized((1.0 - gamma) * x + gamma * z_adv_base)
+            ref_z_adv_base: torch.Tensor | None = None
+            for alpha in alpha_values:
+                icnn.load_state_dict(_interp_state(alpha), strict=True)
+                z_adv_base, _ = adversarial_pushforward(icnn, x, detach_for_model=True)
+                z_adv_base = clamp_normalized(z_adv_base).detach()
+                if alpha == reference_alpha:
+                    ref_z_adv_base = z_adv_base
 
-                adv_pix = to_pixel(z_gamma)
-                clean_pix = to_pixel(x)
-                delta_pix = adv_pix - clean_pix
-                flat = delta_pix.view(delta_pix.size(0), -1)
-                l2_sum_by_gamma[gamma] += flat.norm(p=2, dim=1).sum().item()
-                linf_sum_by_gamma[gamma] += flat.abs().max(dim=1).values.sum().item()
+                for gamma in gamma_values:
+                    z_gamma = clamp_normalized((1.0 - gamma) * x + gamma * z_adv_base)
 
-                batch_miscls = {}
-                for name, model in models.items():
-                    logits = model(z_gamma)
-                    preds = logits.argmax(dim=1)
-                    correct = preds == y
-                    adv_correct_by_gamma[gamma][name] += int(correct.sum().item())
-                    batch_miscls[name] = ~correct
-                    if gamma == reference_gamma:
-                        saved_adv_preds[name].append(preds.cpu())
+                    adv_pix = to_pixel(z_gamma)
+                    clean_pix = to_pixel(x)
+                    delta_pix = adv_pix - clean_pix
+                    flat = delta_pix.view(delta_pix.size(0), -1)
+                    l2_sum_by_alpha_gamma[alpha][gamma] += flat.norm(p=2, dim=1).sum().item()
+                    linf_sum_by_alpha_gamma[alpha][gamma] += flat.abs().max(dim=1).values.sum().item()
 
-                if gamma == reference_gamma:
-                    z_ref = z_gamma
-                    source_miscls_mask = batch_miscls[source_name]
-                    source_miscls_count = int(source_miscls_mask.sum().item())
-                    adv_source_misclassified += source_miscls_count
-                    if source_miscls_count > 0:
-                        for name, mask in batch_miscls.items():
-                            if name == source_name:
-                                continue
-                            overlap = int((mask & source_miscls_mask).sum().item())
-                            adv_overlap_counts[name] += overlap
+                    batch_miscls = {}
+                    for name, model in models.items():
+                        logits = model(z_gamma)
+                        preds = logits.argmax(dim=1)
+                        correct = preds == y
+                        adv_correct_by_alpha_gamma[alpha][gamma][name] += int(correct.sum().item())
+                        batch_miscls[name] = ~correct
+                        if alpha == reference_alpha and gamma == reference_gamma:
+                            saved_adv_preds[name].append(preds.cpu())
+
+                    if alpha == reference_alpha and gamma == reference_gamma:
+                        z_ref = z_gamma
+                        source_miscls_mask = batch_miscls[source_name]
+                        source_miscls_count = int(source_miscls_mask.sum().item())
+                        adv_source_misclassified += source_miscls_count
+                        if source_miscls_count > 0:
+                            for name, mask in batch_miscls.items():
+                                if name == source_name:
+                                    continue
+                                overlap = int((mask & source_miscls_mask).sum().item())
+                                adv_overlap_counts[name] += overlap
 
             if z_ref is None:
-                z_ref = z_adv_base
+                base = ref_z_adv_base if ref_z_adv_base is not None else z_adv_base
+                z_ref = clamp_normalized((1.0 - reference_gamma) * x + reference_gamma * base)
 
         saved_clean.append(x.cpu())
         saved_adv.append(z_ref.cpu())
@@ -631,13 +665,25 @@ def run_attack(args: argparse.Namespace) -> None:
         )
 
     clean_acc = {k: v / total_used for k, v in clean_correct.items()}
-    adv_acc_by_gamma = {
-        gamma: {k: v / total_used for k, v in counts.items()}
-        for gamma, counts in adv_correct_by_gamma.items()
+    adv_acc_by_alpha_gamma = {
+        alpha: {
+            gamma: {k: v / total_used for k, v in counts.items()}
+            for gamma, counts in gamma_dict.items()
+        }
+        for alpha, gamma_dict in adv_correct_by_alpha_gamma.items()
     }
+    adv_acc_by_gamma = adv_acc_by_alpha_gamma[reference_alpha]
     adv_acc = adv_acc_by_gamma[reference_gamma]
-    mean_l2_by_gamma = {gamma: l2 / total_used for gamma, l2 in l2_sum_by_gamma.items()}
-    mean_linf_by_gamma = {gamma: li / total_used for gamma, li in linf_sum_by_gamma.items()}
+    mean_l2_by_alpha_gamma = {
+        alpha: {gamma: l2 / total_used for gamma, l2 in gamma_dict.items()}
+        for alpha, gamma_dict in l2_sum_by_alpha_gamma.items()
+    }
+    mean_linf_by_alpha_gamma = {
+        alpha: {gamma: li / total_used for gamma, li in gamma_dict.items()}
+        for alpha, gamma_dict in linf_sum_by_alpha_gamma.items()
+    }
+    mean_l2_by_gamma = mean_l2_by_alpha_gamma[reference_alpha]
+    mean_linf_by_gamma = mean_linf_by_alpha_gamma[reference_alpha]
     mean_l2 = mean_l2_by_gamma[reference_gamma]
     mean_linf = mean_linf_by_gamma[reference_gamma]
 
@@ -680,6 +726,9 @@ def run_attack(args: argparse.Namespace) -> None:
         "mean_linf_pix": mean_linf,
         "mean_l2_pix_by_gamma": mean_l2_by_gamma,
         "mean_linf_pix_by_gamma": mean_linf_by_gamma,
+        "adv_acc_by_alpha_gamma": adv_acc_by_alpha_gamma,
+        "mean_l2_pix_by_alpha_gamma": mean_l2_by_alpha_gamma,
+        "mean_linf_pix_by_alpha_gamma": mean_linf_by_alpha_gamma,
         "icnn_args": icnn_args,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "adv_source_misclassified": adv_source_misclassified,
@@ -695,6 +744,8 @@ def run_attack(args: argparse.Namespace) -> None:
         "adv_common_counts_recomputed": adv_common_both,
         "gamma_values": gamma_values,
         "reference_gamma": reference_gamma,
+        "alpha_values": alpha_values,
+        "reference_alpha": reference_alpha,
     }
 
     if not args.no_save:
@@ -715,19 +766,23 @@ def run_attack(args: argparse.Namespace) -> None:
 
     print("\n=== Transfer Results ===")
     print(f"Samples processed (raw): {total_seen_raw} | analyzed after clean-source filter: {total_used}")
-    print(f"Reference gamma: {reference_gamma}")
-    for gamma in gamma_values:
-        print(
-            f"\n-- gamma={gamma:.3f} -- Mean ||delta||_2 (pixel): {mean_l2_by_gamma[gamma]:.4f} | "
-            f"Mean ||delta||_inf (pixel): {mean_linf_by_gamma[gamma]:.4f}"
-        )
-        for name in models:
-            adv_acc_gamma = adv_acc_by_gamma[gamma][name] * 100
-            drop = (clean_acc[name] - adv_acc_by_gamma[gamma][name]) * 100
+    print(f"Reference alpha: {reference_alpha} | Reference gamma: {reference_gamma}")
+    for alpha in alpha_values:
+        print(f"\n== alpha={alpha:.3f} ==")
+        for gamma in gamma_values:
+            ml2 = mean_l2_by_alpha_gamma[alpha][gamma]
+            mlinf = mean_linf_by_alpha_gamma[alpha][gamma]
             print(
-                f"{name}: clean acc {clean_acc[name]*100:.2f}% -> adv acc {adv_acc_gamma:.2f}% "
-                f"(drop {drop:.2f}%)"
+                f"-- gamma={gamma:.3f} -- Mean ||delta||_2 (pixel): {ml2:.4f} | "
+                f"Mean ||delta||_inf (pixel): {mlinf:.4f}"
             )
+            for name in models:
+                adv_acc_gamma = adv_acc_by_alpha_gamma[alpha][gamma][name] * 100
+                drop = (clean_acc[name] - adv_acc_by_alpha_gamma[alpha][gamma][name]) * 100
+                print(
+                    f"{name}: clean acc {clean_acc[name]*100:.2f}% -> adv acc {adv_acc_gamma:.2f}% "
+                    f"(drop {drop:.2f}%)"
+                )
     print(f"\nAdversarial samples misclassified by source ({source_name}): {adv_source_misclassified}")
     for name, overlap in adv_overlap_counts.items():
         cond_rate = (overlap / adv_source_misclassified) if adv_source_misclassified > 0 else 0.0
