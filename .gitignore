@@ -35,3 +35,6 @@ plots/*
 tmp_viz/
 tmp_viz/*
 .pdf
+.png
+.jpg
+.jpeg
