@@ -10,6 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import datasets
+from scipy.optimize import linear_sum_assignment
+
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+# torch.cuda.manual_seed_all(cfg.seed)
 
 # ---------------------------------------------------------------------------
 #  Logging
@@ -46,6 +52,7 @@ LOG_FIELDNAMES = [
     "acc_adv",
     "w2_proxy",
     "inner_grad_norm",
+    "delta_gap",
 ]
 
 # ---------------------------------------------------------------------------
@@ -358,6 +365,270 @@ def wrm_ascent_x(
             z = z.clamp(lo, hi)
     return z.detach()
 
+
+def wrm_ascent_x_anchored(
+    z0: torch.Tensor,
+    x_anchor: torch.Tensor,
+    model: nn.Module,
+    y: torch.Tensor,
+    lambda_reg: float,
+    num_steps: int,
+    lr: float = 0.01,
+    clamp: Optional[Tuple[float, float]] = (0.0, 1.0),
+) -> torch.Tensor:
+    """WRM gradient ascent starting from z0 with penalty anchored at x_anchor.
+
+    Unlike wrm_ascent_x where start == anchor, here the starting point z0
+    can differ from the anchor x_anchor.  This is needed after Brenier
+    projection: the projected point z_proj is the new start, but the
+    quadratic penalty is still measured from the original nominal x.
+
+    Maximises  CE(z, y) - lambda ||z - x_anchor||^2  w.r.t. z,
+    starting from z = z0.
+    """
+    if num_steps == 0:
+        return z0.detach()
+    x_anc = x_anchor.detach()
+    z = z0.detach().clone()
+    for _ in range(num_steps):
+        z.requires_grad_(True)
+        per_sample_ce = F.cross_entropy(model(z), y, reduction="none")
+        grads = torch.autograd.grad(per_sample_ce.sum(), z, create_graph=False)[0]
+        z = z.detach() + lr * (grads - 2.0 * lambda_reg * (z.detach() - x_anc))
+        if clamp is not None:
+            lo, hi = clamp
+            z = z.clamp(lo, hi)
+    return z.detach()
+
+
+# ---------------------------------------------------------------------------
+#  Brenier Projection (optimal assignment for PPA)
+# ---------------------------------------------------------------------------
+
+def brenier_projection(
+    z: torch.Tensor,
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    r"""Brenier projection: optimally reassign adversarial points to nominals.
+
+    Solves the linear assignment problem (LAP):
+        sigma* = argmin_{sigma in S_N}  sum_i  ||z_{sigma(i)} - x_i||^2
+
+    This is the discrete optimal transport problem between two uniform
+    empirical distributions with squared-Euclidean ground cost.  We reduce
+    it to the standard rectangular LAP and solve via the Jonker-Volgenant
+    algorithm (scipy.optimize.linear_sum_assignment), which runs in O(N^3).
+
+    The cost matrix is  C[i, j] = ||z_j - x_i||_2^2  (size N x N).
+    After solving, row i is assigned to column sigma*(i), meaning nominal
+    x_i is paired with adversarial z_{sigma*(i)}.
+
+    Labels are permuted together with z so that the loss sum remains
+    invariant:  sum_i l(f(z_{sigma(i)}), y_{sigma(i)}) = sum_i l(f(z_i), y_i)
+    (bijective re-indexing).  Only the transport cost changes:
+        C_ot = (1/N) sum_i ||z_{sigma*(i)} - x_i||^2  <=  C_id.
+
+    Parameters
+    ----------
+    z : Tensor [N, C, H, W]  -- adversarial points
+    x : Tensor [N, C, H, W]  -- nominal points
+    y : Tensor [N]            -- labels (permuted alongside z)
+
+    Returns
+    -------
+    z_proj  : Tensor [N, C, H, W]  -- z[sigma*(i)] for each i
+    y_proj  : Tensor [N]            -- y[sigma*(i)] for each i
+    delta   : float                 -- wasted-transport gap  Delta = C_id - C_ot >= 0
+    C_id    : float                 -- identity transport cost
+    C_ot    : float                 -- optimal transport cost
+    """
+    N = z.size(0)
+    if N <= 1:
+        C_id = float(((z - x) ** 2).sum().item()) / max(N, 1)
+        return z.clone(), y.clone(), 0.0, C_id, C_id
+
+    z_flat = z.detach().view(N, -1)   # [N, d]
+    x_flat = x.detach().view(N, -1)   # [N, d]
+
+    # Cost matrix  C[i, j] = ||x_i - z_j||^2  via expansion:
+    #   = ||x_i||^2 + ||z_j||^2 - 2 x_i^T z_j
+    # torch.cdist computes L2 distances; squaring gives the cost.
+    cost = torch.cdist(x_flat, z_flat, p=2).pow(2)  # [N, N]
+
+    # Solve LAP on CPU (Jonker-Volgenant, O(N^3))
+    _row_ind, col_ind = linear_sum_assignment(cost.cpu().numpy())
+    perm = torch.tensor(col_ind, device=z.device, dtype=torch.long)
+
+    # Apply permutation
+    z_proj = z[perm]
+    y_proj = y[perm]
+
+    # Compute metrics
+    C_id = float(((z - x) ** 2).view(N, -1).sum(dim=1).mean().item())
+    C_ot = float(((z_proj - x) ** 2).view(N, -1).sum(dim=1).mean().item())
+    delta = max(C_id - C_ot, 0.0)
+
+    return z_proj, y_proj, delta, C_id, C_ot
+
+
+# ---------------------------------------------------------------------------
+#  Cyclical Monotonicity Diagnostic (for Algorithm 1 / WRM)
+# ---------------------------------------------------------------------------
+
+def check_cyclical_monotonicity(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    cycle_lengths: Sequence[int] = (2, 3, 4, 5, 6, 8, 10),
+    num_samples: int = 500,
+) -> Dict[int, Dict[str, Any]]:
+    r"""Check cyclical monotonicity (CM) violations of the identity coupling.
+
+    Background (Rockafellar 1966; Villani 2009, Thm 5.10):
+    -------------------------------------------------------
+    A coupling (x_i, z_i) is induced by the gradient of a convex potential
+    psi (i.e. z_i = nabla psi(x_i)) **if and only if** it is cyclically
+    monotone: for every k >= 2 and every k-tuple of indices (i_1, ..., i_k),
+
+        sum_{j=1}^{k}  <z_{i_j},  x_{i_j} - x_{i_{j+1}}>  >=  0
+                                                   (indices mod k)
+
+    Equivalently, for the squared-Euclidean cost c(a,b) = ||a-b||^2, the
+    identity assignment must be at least as cheap as any cyclic reassignment:
+
+        C_id  :=  sum_j  ||z_{i_j} - x_{i_j}||^2
+                  <=  sum_j  ||z_{sigma(i_j)} - x_{i_j}||^2  =: C_cyc
+
+    for every cyclic permutation sigma of the selected indices.
+
+    The *violation* V_k = C_id - C_cyc > 0 when the identity coupling is
+    sub-optimal for that cycle, meaning transport "crosses" and the coupling
+    cannot be the gradient of any convex function.
+
+    Checking only k=2 (pairwise swaps) tests ordinary monotonicity but
+    misses violations that only appear at longer cycle lengths.  A coupling
+    can be 2-monotone yet fail k-monotonicity for k >= 3.
+
+    Normalization across cycle lengths:
+    ------------------------------------
+    Raw violations scale linearly with k (more edges in the cycle), making
+    direct comparison misleading.  We report two normalizations:
+
+    1. **Per-edge**:  V_k / k
+       Converts the extensive violation sum into an intensive (per-edge)
+       quantity.  Comparable across cycle lengths under the null hypothesis
+       that violations are i.i.d. along edges.
+
+    2. **Relative**:  V_k / C_id
+       Dimensionless ratio giving the fraction of identity-coupling cost
+       that is "wasted" (could be saved by cyclic reassignment).  Scale-
+       invariant: unaffected by the magnitude of perturbations.
+
+    Parameters
+    ----------
+    x : [N, C, H, W]  nominal samples
+    z : [N, C, H, W]  adversarial samples (WRM output)
+    cycle_lengths : tuple of k values to probe
+    num_samples   : number of random k-cycles to sample per k
+
+    Returns
+    -------
+    dict  keyed by cycle length k, each value a dict of statistics.
+    """
+    N = x.size(0)
+    x_flat = x.detach().view(N, -1)
+    z_flat = z.detach().view(N, -1)
+
+    # Pre-compute per-sample identity costs  ||z_i - x_i||^2
+    id_costs = (z_flat - x_flat).pow(2).sum(dim=1)          # [N]
+
+    results: Dict[int, Dict[str, Any]] = {}
+
+    for k in cycle_lengths:
+        if k > N:
+            continue
+
+        violations_raw = []
+        violations_per_edge = []
+        violations_relative = []
+
+        for _ in range(num_samples):
+            # Sample k distinct indices uniformly
+            idx = torch.randperm(N, device=x.device)[:k]
+
+            # Identity cost for this cycle
+            c_id = id_costs[idx].sum().item()
+
+            # Cyclic-permutation cost: pair x_{i_j} with z_{i_{j+1 mod k}}
+            idx_shifted = idx.roll(-1)
+            c_cyc = (z_flat[idx_shifted] - x_flat[idx]).pow(2).sum().item()
+
+            raw = c_id - c_cyc                             # > 0 ⟹ CM violated
+            violations_raw.append(raw)
+            violations_per_edge.append(raw / k)
+            violations_relative.append(raw / max(c_id, 1e-12))
+
+        raw_t = torch.tensor(violations_raw)
+        pe_t  = torch.tensor(violations_per_edge)
+        rel_t = torch.tensor(violations_relative)
+
+        results[k] = {
+            "cycle_length":      k,
+            "mean_raw":          float(raw_t.mean()),
+            "std_raw":           float(raw_t.std()),
+            "mean_per_edge":     float(pe_t.mean()),
+            "std_per_edge":      float(pe_t.std()),
+            "mean_relative":     float(rel_t.mean()),
+            "std_relative":      float(rel_t.std()),
+            "frac_violated":     float((raw_t > 0).float().mean()),
+            "max_raw":           float(raw_t.max()),
+            "max_per_edge":      float(pe_t.max()),
+            "max_relative":      float(rel_t.max()),
+            "num_samples":       num_samples,
+        }
+
+    return results
+
+
+def aggregate_cm_results(
+    batch_results: Sequence[Dict[int, Dict[str, Any]]],
+) -> Dict[int, Dict[str, Any]]:
+    """Average CM diagnostics collected across multiple mini-batches.
+
+    For quantities that are means (mean_raw, mean_per_edge, mean_relative,
+    frac_violated), we take the mean-of-means.  For maxima (max_raw, …)
+    we take the max-of-maxes.  For standard deviations, we average them
+    (providing a rough pooled estimate without needing the raw samples).
+    """
+    if len(batch_results) == 0:
+        return {}
+
+    # Collect all cycle lengths seen
+    all_k = sorted({k for res in batch_results for k in res})
+    agg: Dict[int, Dict[str, Any]] = {}
+
+    for k in all_k:
+        entries = [res[k] for res in batch_results if k in res]
+        if len(entries) == 0:
+            continue
+        n = len(entries)
+        agg[k] = {
+            "cycle_length":   k,
+            "mean_raw":       sum(e["mean_raw"]      for e in entries) / n,
+            "std_raw":        sum(e["std_raw"]        for e in entries) / n,
+            "mean_per_edge":  sum(e["mean_per_edge"]  for e in entries) / n,
+            "std_per_edge":   sum(e["std_per_edge"]   for e in entries) / n,
+            "mean_relative":  sum(e["mean_relative"]  for e in entries) / n,
+            "std_relative":   sum(e["std_relative"]   for e in entries) / n,
+            "frac_violated":  sum(e["frac_violated"]  for e in entries) / n,
+            "max_raw":        max(e["max_raw"]        for e in entries),
+            "max_per_edge":   max(e["max_per_edge"]   for e in entries),
+            "max_relative":   max(e["max_relative"]   for e in entries),
+            "num_batches":    n,
+        }
+    return agg
+
+
 # ---------------------------------------------------------------------------
 #  Config and states
 # ---------------------------------------------------------------------------
@@ -377,6 +648,11 @@ class TrainConfig:
     inner_lr_algo1: float = 1e-2
     bb_alpha0_icnn: float = 5e-4
     icnn_hidden_sizes: Sequence[int] = (64, 64, 64, 64)
+    # PPA (Projected Particle Ascent) parameters
+    inner_steps_ppa: int = 5
+    inner_lr_ppa: float = 1e-2
+    ppa_num_rounds: int = 3        # number of (ascent → project) cycles
+    max_steps_ppa: Optional[int] = None
     seed: int = 0
 
 
@@ -683,6 +959,12 @@ def train_step_algo1(state: TrainState, batch, cfg: TrainConfig, device: torch.d
         acc_adv = accuracy(logits_adv_post, y)
         w2_proxy = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
     metrics = {"loss_adv": loss.detach(), "acc_clean": acc_clean, "acc_adv": acc_adv, "w2_proxy": w2_proxy}
+
+    # --- Cyclical monotonicity diagnostic (no grad, pure analysis) ---
+    with torch.no_grad():
+        cm = check_cyclical_monotonicity(x, adv_x)
+    metrics["cm_diagnostics"] = cm
+
     return state, metrics
 
 
@@ -779,6 +1061,92 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
     }
     return state, icnn_state, metrics
 
+
+def train_step_ppa(state: TrainState, batch, cfg: TrainConfig, device: torch.device) -> Tuple[TrainState, Dict[str, torch.Tensor]]:
+    """PPA (Projected Particle Ascent) training step.
+
+    Algorithm:  for each round r = 1, ..., R:
+        1. WRM gradient ascent from current z (anchored at original x)
+        2. Brenier projection: solve LAP to optimally reassign z's to x's
+        3. Use projected z as starting point for next round
+
+    After all rounds, train the classifier on the final adversarial points.
+
+    The key invariant (Lemma in the paper):
+        L(theta, Pi(z)) = L(theta, z) + lambda * Delta(z)
+    where Delta(z) = C_id(z) - C_ot(z) >= 0 is the wasted-transport gap.
+    Each projection step strictly improves the adversary whenever Delta > 0.
+    """
+    model = state.model
+    opt = state.opt
+    x, y = batch
+    x = x.to(device)
+    y = y.to(device)
+    if x.size(0) == 0:
+        zero = torch.tensor(0.0, device=device)
+        metrics = {"loss_adv": zero, "acc_clean": zero, "acc_adv": zero,
+                   "w2_proxy": zero, "delta_gap": zero}
+        return state, metrics
+
+    # Inner maximization: freeze classifier
+    set_requires_grad(model, False)
+    model.eval()
+
+    # Iterative ascent-project loop
+    z = x.detach().clone()
+    y_current = y.clone()
+    total_delta = 0.0
+
+    for round_idx in range(cfg.ppa_num_rounds):
+        if round_idx == 0:
+            # First round: start from x (same as standard WRM)
+            z = wrm_ascent_x(
+                x, model, y_current, cfg.lambda_reg,
+                cfg.inner_steps_ppa, lr=cfg.inner_lr_ppa,
+                clamp=(0.0, 1.0),
+            )
+        else:
+            # Subsequent rounds: start from projected z, anchor at original x
+            z = wrm_ascent_x_anchored(
+                z, x, model, y_current, cfg.lambda_reg,
+                cfg.inner_steps_ppa, lr=cfg.inner_lr_ppa,
+                clamp=(0.0, 1.0),
+            )
+
+        # Brenier projection: solve optimal assignment
+        z, y_current, delta, _C_id, _C_ot = brenier_projection(z, x, y_current)
+        total_delta += delta
+
+    adv_x = z.detach()
+
+    # Outer minimization: unfreeze classifier, train
+    set_requires_grad(model, True)
+    model.train()
+
+    logits_adv = model(adv_x)
+    # Use permuted labels y_current (labels follow adversarial points)
+    loss = cross_entropy_loss(logits_adv, y_current)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    # Post-update metrics (both from same model)
+    with torch.no_grad():
+        logits_clean = model(x)
+        logits_adv_post = model(adv_x)
+        acc_clean = accuracy(logits_clean, y)
+        acc_adv = accuracy(logits_adv_post, y_current)
+        w2_proxy = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
+    metrics = {
+        "loss_adv": loss.detach(),
+        "acc_clean": acc_clean,
+        "acc_adv": acc_adv,
+        "w2_proxy": w2_proxy,
+        "delta_gap": torch.tensor(total_delta, device=device),
+    }
+    return state, metrics
+
+
 # ---------------------------------------------------------------------------
 #  Training loops
 # ---------------------------------------------------------------------------
@@ -825,6 +1193,7 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
     state = create_classifier_state(cfg, device)
     logger = CSVLogger(DEFAULT_LOG_PATH, LOG_FIELDNAMES)
     training_logs = []
+    cm_epochs = []   # Cyclical monotonicity diagnostics per adversarial epoch
     for epoch in range(cfg.num_epochs):
         is_clean = epoch < cfg.epoch_clean
         num_steps = 0
@@ -849,6 +1218,7 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
             epoch_acc_clean = 0.0
             epoch_acc_adv = 0.0
             epoch_w2_proxy = 0.0
+            epoch_cm_batch_results = []
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_algo1 is not None and step >= cfg.max_steps_algo1:
                     break
@@ -857,22 +1227,62 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                 epoch_acc_clean += float(metrics['acc_clean'])
                 epoch_acc_adv += float(metrics['acc_adv'])
                 epoch_w2_proxy += float(metrics['w2_proxy'])
+                epoch_cm_batch_results.append(metrics['cm_diagnostics'])
                 num_steps += 1
             if num_steps > 0:
                 avg_loss_adv = epoch_loss_adv / num_steps
                 avg_acc_clean = epoch_acc_clean / num_steps
                 avg_acc_adv = epoch_acc_adv / num_steps
                 avg_w2_proxy = epoch_w2_proxy / num_steps
+                # Aggregate CM diagnostics across batches for this epoch
+                epoch_cm_agg = aggregate_cm_results(epoch_cm_batch_results)
+                cm_epochs.append({"epoch": epoch, "cm": {str(k): v for k, v in epoch_cm_agg.items()}})
+                # Build compact CM summary string
+                cm_parts = []
+                for k in sorted(epoch_cm_agg.keys()):
+                    s = epoch_cm_agg[k]
+                    cm_parts.append(
+                        f"k={k}: viol={s['frac_violated']:.1%} "
+                        f"pe={s['mean_per_edge']:.4f} "
+                        f"rel={s['mean_relative']:.4f}"
+                    )
+                cm_summary = " | ".join(cm_parts)
                 print(f"[Algo1] Epoch {epoch} (adv) loss_adv={avg_loss_adv:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f}")
+                print(f"        CM diagnostic: {cm_summary}")
                 logger.log(algorithm="algo1", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=avg_loss_adv, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy)
                 training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "loss_adv": avg_loss_adv, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy})
     test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
     print("[Algo1] Test:", test_metrics)
     logger.log(algorithm="algo1", phase="test", epoch=cfg.num_epochs, step=None, loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=None, acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
-    results = {"algorithm": "algo1_wrm", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics}
+
+    # ---- Print aggregate CM summary across all adversarial epochs --------
+    if cm_epochs:
+        all_batch_cm = [e["cm"] for e in cm_epochs]
+        # Re-aggregate: collect all per-epoch aggregated results
+        all_k = sorted({int(k) for d in all_batch_cm for k in d})
+        print("\n" + "=" * 72)
+        print("[Algo1] Cyclical Monotonicity Summary (averaged over adv epochs)")
+        print("=" * 72)
+        print(f"  {'k':>4s}  {'Frac Violated':>14s}  {'Mean/Edge':>10s}  {'Std/Edge':>10s}  {'Mean Rel':>10s}  {'Max Rel':>10s}")
+        print("-" * 72)
+        for k in all_k:
+            entries = [d[str(k)] for d in all_batch_cm if str(k) in d]
+            n = len(entries)
+            fv = sum(e["frac_violated"]  for e in entries) / n
+            mpe = sum(e["mean_per_edge"] for e in entries) / n
+            spe = sum(e["std_per_edge"]  for e in entries) / n
+            mrl = sum(e["mean_relative"] for e in entries) / n
+            xrl = max(e["max_relative"]  for e in entries)
+            print(f"  {k:4d}  {fv:14.2%}  {mpe:10.6f}  {spe:10.6f}  {mrl:10.6f}  {xrl:10.6f}")
+        print("=" * 72 + "\n")
+
+    results = {"algorithm": "algo1_wrm", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics, "cyclical_monotonicity": cm_epochs}
     os.makedirs("MNIST", exist_ok=True)
     with open(os.path.join("MNIST", "algo1_wrm_results.json"), "w") as f:
         json.dump(results, f, indent=2)
+    # Also save a dedicated CM JSON for easy post-hoc analysis
+    with open(os.path.join("MNIST", "algo1_cm_diagnostics.json"), "w") as f:
+        json.dump({"algorithm": "algo1_wrm", "cm_per_epoch": cm_epochs}, f, indent=2)
     return state, {"test": test_metrics}
 
 
@@ -941,6 +1351,75 @@ def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
         json.dump(results, f, indent=2)
     return state, icnn_state, {"test": test_metrics}
 
+
+def train_algorithm_ppa(cfg: TrainConfig, device: torch.device) -> Tuple[TrainState, Dict[str, Any]]:
+    """Algorithm 3: Projected Particle Ascent (PPA).
+
+    Same outer structure as Algo1, but the inner adversary uses iterative
+    (WRM ascent → Brenier projection) cycles.  Each projection eliminates
+    wasted transport (Delta >= 0), yielding a provably stronger adversary
+    per Lemma (proj_gain) in the paper.
+    """
+    torch.manual_seed(cfg.seed)
+    train_ds, test_ds = load_mnist()
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    state = create_classifier_state(cfg, device)
+    logger = CSVLogger(DEFAULT_LOG_PATH, LOG_FIELDNAMES)
+    training_logs = []
+    for epoch in range(cfg.num_epochs):
+        is_clean = epoch < cfg.epoch_clean
+        num_steps = 0
+        if is_clean:
+            epoch_loss = 0.0
+            epoch_acc_clean = 0.0
+            for step, (x, y) in enumerate(train_loader):
+                if cfg.max_steps_ppa is not None and step >= cfg.max_steps_ppa:
+                    break
+                state, metrics = train_step_clean(state, (x, y), device)
+                epoch_loss += float(metrics['loss'])
+                epoch_acc_clean += float(metrics['acc_clean'])
+                num_steps += 1
+            if num_steps > 0:
+                avg_loss = epoch_loss / num_steps
+                avg_acc_clean = epoch_acc_clean / num_steps
+                print(f"[PPA] Epoch {epoch} (clean) loss={avg_loss:.4f} acc_clean={avg_acc_clean:.4f}")
+                logger.log(algorithm="ppa", phase="train_clean", epoch=epoch, step=num_steps, loss_adv=avg_loss, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=None, w2_proxy=None)
+                training_logs.append({"epoch": epoch, "phase": "clean", "steps": num_steps, "loss": avg_loss, "acc_clean": avg_acc_clean})
+        else:
+            epoch_loss_adv = 0.0
+            epoch_acc_clean = 0.0
+            epoch_acc_adv = 0.0
+            epoch_w2_proxy = 0.0
+            epoch_delta_gap = 0.0
+            for step, (x, y) in enumerate(train_loader):
+                if cfg.max_steps_ppa is not None and step >= cfg.max_steps_ppa:
+                    break
+                state, metrics = train_step_ppa(state, (x, y), cfg, device)
+                epoch_loss_adv += float(metrics['loss_adv'])
+                epoch_acc_clean += float(metrics['acc_clean'])
+                epoch_acc_adv += float(metrics['acc_adv'])
+                epoch_w2_proxy += float(metrics['w2_proxy'])
+                epoch_delta_gap += float(metrics['delta_gap'])
+                num_steps += 1
+            if num_steps > 0:
+                avg_loss_adv = epoch_loss_adv / num_steps
+                avg_acc_clean = epoch_acc_clean / num_steps
+                avg_acc_adv = epoch_acc_adv / num_steps
+                avg_w2_proxy = epoch_w2_proxy / num_steps
+                avg_delta_gap = epoch_delta_gap / num_steps
+                print(f"[PPA] Epoch {epoch} (adv) loss_adv={avg_loss_adv:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f} Δ={avg_delta_gap:.4f}")
+                logger.log(algorithm="ppa", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=avg_loss_adv, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy, delta_gap=avg_delta_gap)
+                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "loss_adv": avg_loss_adv, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy, "delta_gap": avg_delta_gap})
+    test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
+    print("[PPA] Test:", test_metrics)
+    logger.log(algorithm="ppa", phase="test", epoch=cfg.num_epochs, step=None, loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=None, acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
+    results = {"algorithm": "ppa_projected_wrm", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics}
+    os.makedirs("MNIST", exist_ok=True)
+    with open(os.path.join("MNIST", "ppa_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    return state, {"test": test_metrics}
+
+
 # ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
@@ -960,7 +1439,12 @@ if __name__ == "__main__":
         inner_steps_algo2=20,    
         inner_lr_algo1=1e-2,
         bb_alpha0_icnn=1e-2,    
-        icnn_hidden_sizes=(128, 64, 64),
+        icnn_hidden_sizes=(32, 32, 32),
+        # PPA parameters
+        inner_steps_ppa=5,       # WRM steps per ascent-project round
+        inner_lr_ppa=1e-2,
+        ppa_num_rounds=4,        # number of (ascent → project) cycles
+        max_steps_ppa=None,
         seed=0,
     )
     print("Training Algorithm 2 (ICNN transport with BB+Armijo)...")
@@ -969,6 +1453,8 @@ if __name__ == "__main__":
     print("Training Algorithm 1 (WRM adversarial training)...")
     state_algo1, logs_algo1 = train_algorithm_1(cfg, device)
 
+    print("\nTraining Algorithm 3 (PPA — Projected Particle Ascent)...")
+    state_ppa, logs_ppa = train_algorithm_ppa(cfg, device)
 
 
     _, test_ds = load_mnist()
@@ -980,18 +1466,22 @@ if __name__ == "__main__":
     pgd_algo2 = evaluate_pgd(state_algo2, test_ds, **pgd_kwargs)
     print(f"[Algo2] PGD acc={pgd_algo2['acc']*100:.2f}% L2={pgd_algo2['avg_l2']:.4f} Linf={pgd_algo2['avg_linf']:.4f}")
 
+    pgd_ppa = evaluate_pgd(state_ppa, test_ds, **pgd_kwargs)
+    print(f"[PPA]   PGD acc={pgd_ppa['acc']*100:.2f}% L2={pgd_ppa['avg_l2']:.4f} Linf={pgd_ppa['avg_linf']:.4f}")
+
     pgd_results = {
         "hyperparameters": asdict(cfg),
         "pgd_config": {"eps": pgd_kwargs["eps"], "num_steps": pgd_kwargs["num_steps"]},
         "algo1_wrm_pgd": pgd_algo1,
         "algo2_icnn_pgd": pgd_algo2,
+        "ppa_pgd": pgd_ppa,
     }
     os.makedirs("MNIST", exist_ok=True)
     with open(os.path.join("MNIST", "pgd_evaluation_results.json"), "w") as f:
         json.dump(pgd_results, f, indent=2)
 
     # ------------------------------------------------------------------
-    #  PGD-L2 sweep evaluation (eps 1.5 to 2.0, proper restarts & projection)
+    #  PGD-L2 sweep evaluation (proper restarts & projection)
     # ------------------------------------------------------------------
     pgd_eval_cfg = PGDEvalConfig(
         epsilons=(0.1, 0.3, 0.5, 0.7, 0.9, 1.0, 1.3, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0),
@@ -1000,11 +1490,14 @@ if __name__ == "__main__":
         restarts=5,
     )
 
-    print("\n[Algo1] PGD-L2 sweep evaluation (eps 1.5 to 2.0, restarts=5)...")
+    print("\n[Algo1] PGD-L2 sweep evaluation...")
     pgd_sweep_algo1 = evaluate_pgd_l2_sweep(state_algo1, test_ds, pgd_eval_cfg, cfg.batch_size, device)
 
-    print("\n[Algo2] PGD-L2 sweep evaluation (eps 1.5 to 2.0, restarts=5)...")
+    print("\n[Algo2] PGD-L2 sweep evaluation...")
     pgd_sweep_algo2 = evaluate_pgd_l2_sweep(state_algo2, test_ds, pgd_eval_cfg, cfg.batch_size, device)
+
+    print("\n[PPA] PGD-L2 sweep evaluation...")
+    pgd_sweep_ppa = evaluate_pgd_l2_sweep(state_ppa, test_ds, pgd_eval_cfg, cfg.batch_size, device)
 
     # Update algo1 JSON with PGD sweep results
     algo1_json_path = os.path.join("MNIST", "algo1_wrm_results.json")
@@ -1024,9 +1517,19 @@ if __name__ == "__main__":
     with open(algo2_json_path, "w") as f:
         json.dump(algo2_data, f, indent=2)
 
+    # Update PPA JSON with PGD sweep results
+    ppa_json_path = os.path.join("MNIST", "ppa_results.json")
+    with open(ppa_json_path, "r") as f:
+        ppa_data = json.load(f)
+    ppa_data["pgd_l2_sweep"] = pgd_sweep_ppa
+    ppa_data["pgd_eval_config"] = asdict(pgd_eval_cfg)
+    with open(ppa_json_path, "w") as f:
+        json.dump(ppa_data, f, indent=2)
+
     # Update PGD evaluation JSON with sweep results
     pgd_results["pgd_l2_sweep_config"] = asdict(pgd_eval_cfg)
     pgd_results["algo1_wrm_pgd_sweep"] = pgd_sweep_algo1
     pgd_results["algo2_icnn_pgd_sweep"] = pgd_sweep_algo2
+    pgd_results["ppa_pgd_sweep"] = pgd_sweep_ppa
     with open(os.path.join("MNIST", "pgd_evaluation_results.json"), "w") as f:
         json.dump(pgd_results, f, indent=2)
