@@ -45,6 +45,7 @@ LOG_FIELDNAMES = [
     "acc_clean",
     "acc_adv",
     "w2_proxy",
+    "inner_grad_norm",
 ]
 
 # ---------------------------------------------------------------------------
@@ -674,10 +675,12 @@ def train_step_algo1(state: TrainState, batch, cfg: TrainConfig, device: torch.d
     loss.backward()
     opt.step()
 
+    # FIX Bug1: recompute BOTH logits from the SAME (post-update) model
     with torch.no_grad():
         logits_clean = model(x)
+        logits_adv_post = model(adv_x)
         acc_clean = accuracy(logits_clean, y)
-        acc_adv = accuracy(logits_adv, y)
+        acc_adv = accuracy(logits_adv_post, y)
         w2_proxy = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
     metrics = {"loss_adv": loss.detach(), "acc_clean": acc_clean, "acc_adv": acc_adv, "w2_proxy": w2_proxy}
     return state, metrics
@@ -691,7 +694,7 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
     y = y.to(device)
     if x.size(0) == 0:
         zero = torch.tensor(0.0, device=device)
-        metrics = {"adv_loss": zero, "cls_loss": zero, "acc_clean": zero, "acc_adv": zero, "w2_proxy": zero}
+        metrics = {"adv_loss": zero, "cls_loss": zero, "acc_clean": zero, "acc_adv": zero, "w2_proxy": zero, "inner_grad_norm": zero}
         return state, icnn_state, metrics
 
     x_flat = x.view(x.size(0), -1)
@@ -700,6 +703,9 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
     bb_state = icnn_state.bb_state
     meta = icnn_state.meta
 
+    # FIX Bug3: ensure ICNN parameters have requires_grad=True before inner loop
+    set_requires_grad(icnn_model, True)
+
     # Inner maximization over ICNN params: freeze classifier weights
     set_requires_grad(model, False)
     model.eval()
@@ -707,23 +713,44 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
     def adv_obj_params(vec: torch.Tensor, create_graph: bool) -> torch.Tensor:
         params_dict = unflatten_vector(vec, meta)
         adv_flat = icnn_gradient(icnn_model, params_dict, x_flat, create_graph=create_graph)
-        adv_x = adv_flat.view_as(x)
+        # FIX Bug4: clamp to [0,1] inside inner objective (match outer step)
+        adv_x = adv_flat.view_as(x).clamp(0.0, 1.0)
         logits = model(adv_x)
         adv_loss = adversary_loss(logits, y, cfg.use_margin_adv_algo2)
         w2 = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
         return adv_loss - cfg.lambda_reg * w2
 
+    # FIX Bug2: use Adam on ICNN parameters for robust inner optimization
+    # BB+Armijo with tiny alpha0 on a near-flat landscape (identity init)
+    # yields negligible updates.  Adam with momentum handles the small-gradient
+    # regime far more reliably.
+    inner_param = params_vec.detach().clone().requires_grad_(True)
+    inner_opt = torch.optim.AdamW([inner_param], lr=cfg.bb_alpha0_icnn, weight_decay=1e-5)
     adv_loss_val = torch.tensor(0.0, device=device)
-    for _ in range(cfg.inner_steps_algo2):
-        params_vec, bb_state, adv_loss_scalar = bb_armijo_step_params(params_vec, meta, adv_obj_params, bb_state)
-        adv_loss_val = torch.tensor(adv_loss_scalar, device=device)
+    inner_grad_norm = 0.0
 
-    icnn_state = ICNNState(model=icnn_model, params_vec=params_vec.detach(), meta=meta, bb_state=bb_state)
+    for _ in range(cfg.inner_steps_algo2):
+        inner_opt.zero_grad()
+        obj = adv_obj_params(inner_param, True)
+        # Gradient ascent: negate for Adam (which minimizes)
+        neg_obj = -obj
+        neg_obj.backward()
+        # FIX Bug5: diagnostic — track gradient norm
+        if inner_param.grad is not None:
+            inner_grad_norm = float(inner_param.grad.norm().item())
+        inner_opt.step()
+        adv_loss_val = obj.detach()
+
+    params_vec = inner_param.detach()
+    # BB state is kept for continuity but no longer drives the step size
+    icnn_state = ICNNState(model=icnn_model, params_vec=params_vec, meta=meta, bb_state=bb_state)
 
     # Outer minimization: update classifier only
     set_requires_grad(model, True)
     model.train()
-    set_requires_grad(icnn_model, False)
+    # FIX Bug3: don't mutate icnn_model requires_grad during outer step —
+    # we use functional_call with params_dict, so module params are irrelevant
+    # (no set_requires_grad(icnn_model, False) here)
 
     params_dict_final = unflatten_vector(icnn_state.params_vec.to(device), meta)
     adv_flat = icnn_gradient(icnn_model, params_dict_final, x_flat).detach()
@@ -735,12 +762,21 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
     cls_loss.backward()
     opt.step()
 
+    # FIX Bug1: recompute BOTH logits from the SAME (post-update) model
     with torch.no_grad():
         logits_clean = model(x)
+        logits_adv_post = model(adv_x)
         acc_clean = accuracy(logits_clean, y)
-        acc_adv = accuracy(logits_adv, y)
+        acc_adv = accuracy(logits_adv_post, y)
         w2_proxy = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
-    metrics = {"adv_loss": adv_loss_val.detach(), "cls_loss": cls_loss.detach(), "acc_clean": acc_clean, "acc_adv": acc_adv, "w2_proxy": w2_proxy}
+    metrics = {
+        "adv_loss": adv_loss_val.detach(),
+        "cls_loss": cls_loss.detach(),
+        "acc_clean": acc_clean,
+        "acc_adv": acc_adv,
+        "w2_proxy": w2_proxy,
+        "inner_grad_norm": torch.tensor(inner_grad_norm, device=device),  # Bug5: diagnostic
+    }
     return state, icnn_state, metrics
 
 # ---------------------------------------------------------------------------
@@ -874,6 +910,7 @@ def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
             epoch_acc_clean = 0.0
             epoch_acc_adv = 0.0
             epoch_w2_proxy = 0.0
+            epoch_inner_grad_norm = 0.0
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_algo2 is not None and step >= cfg.max_steps_algo2:
                     break
@@ -883,6 +920,7 @@ def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                 epoch_acc_clean += float(metrics['acc_clean'])
                 epoch_acc_adv += float(metrics['acc_adv'])
                 epoch_w2_proxy += float(metrics['w2_proxy'])
+                epoch_inner_grad_norm += float(metrics['inner_grad_norm'])
                 num_steps += 1
             if num_steps > 0:
                 avg_adv_loss = epoch_adv_loss / num_steps
@@ -890,9 +928,10 @@ def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                 avg_acc_clean = epoch_acc_clean / num_steps
                 avg_acc_adv = epoch_acc_adv / num_steps
                 avg_w2_proxy = epoch_w2_proxy / num_steps
-                print(f"[Algo2] Epoch {epoch} (adv) adv_loss={avg_adv_loss:.4f} cls_loss={avg_cls_loss:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f}")
-                logger.log(algorithm="algo2", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=None, adv_loss=avg_adv_loss, cls_loss=avg_cls_loss, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy)
-                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "adv_loss": avg_adv_loss, "cls_loss": avg_cls_loss, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy})
+                avg_inner_grad_norm = epoch_inner_grad_norm / num_steps
+                print(f"[Algo2] Epoch {epoch} (adv) adv_loss={avg_adv_loss:.4f} cls_loss={avg_cls_loss:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f} |∇θ|={avg_inner_grad_norm:.6f}")
+                logger.log(algorithm="algo2", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=None, adv_loss=avg_adv_loss, cls_loss=avg_cls_loss, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy, inner_grad_norm=avg_inner_grad_norm)
+                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "adv_loss": avg_adv_loss, "cls_loss": avg_cls_loss, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy, "inner_grad_norm": avg_inner_grad_norm})
     test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
     print("[Algo2] Test:", test_metrics)
     logger.log(algorithm="algo2", phase="test", epoch=cfg.num_epochs, step=None, loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=float(test_metrics["loss"]), acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
@@ -917,11 +956,11 @@ if __name__ == "__main__":
         max_steps_algo2=None,
         use_margin_adv_algo1=False,
         use_margin_adv_algo2=False,
-        inner_steps_algo1=5,
-        inner_steps_algo2=5,
+        inner_steps_algo1=20,
+        inner_steps_algo2=20,    
         inner_lr_algo1=1e-2,
-        bb_alpha0_icnn=5e-4,
-        icnn_hidden_sizes=(32, 32),
+        bb_alpha0_icnn=1e-2,    
+        icnn_hidden_sizes=(128, 64, 64),
         seed=0,
     )
     print("Training Algorithm 2 (ICNN transport with BB+Armijo)...")
@@ -955,7 +994,7 @@ if __name__ == "__main__":
     #  PGD-L2 sweep evaluation (eps 1.5 to 2.0, proper restarts & projection)
     # ------------------------------------------------------------------
     pgd_eval_cfg = PGDEvalConfig(
-        epsilons=(1.5, 1.6, 1.7, 1.8, 1.9, 2.0),
+        epsilons=(0.1, 0.3, 0.5, 0.7, 0.9, 1.0, 1.3, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0),
         num_steps=40,
         step_size=None,  # auto = 2*eps/steps
         restarts=5,
