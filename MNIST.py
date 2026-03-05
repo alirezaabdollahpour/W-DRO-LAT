@@ -221,22 +221,29 @@ class InputConvexPotential(nn.Module):
         return out.squeeze(1)
 
 
-class LeNet(nn.Module):
+class CarliniWagnerMNIST(nn.Module):
     def __init__(self, num_classes: int = 10):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=5, stride=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=1)
-        self.fc1 = nn.Linear(64 * 4 * 4, 256)
-        self.fc2 = nn.Linear(256, num_classes)
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=0)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=0)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=0)
+        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0)
+        # 28->26->24->MaxPool(12)->10->8->MaxPool(4) => 64 * 4 * 4 = 1024
+        self.fc1 = nn.Linear(64 * 4 * 4, 200)
+        self.fc2 = nn.Linear(200, 200)
+        self.fc3 = nn.Linear(200, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.conv1(x))
-        x = F.max_pool2d(x, 2)
         x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, 2)
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
         x = F.max_pool2d(x, 2)
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
 
 # ---------------------------------------------------------------------------
 #  ICNN gradient (functional)
@@ -713,6 +720,8 @@ class TrainConfig:
     batch_size: int = 256
     num_epochs: int = 3
     lr_cls: float = 1e-3
+    lr_cls_drop_epoch: int = 30       # epoch at which lr drops by 10x
+    lr_cls_drop_factor: float = 0.1   # multiplicative factor applied at drop epoch
     lambda_reg: float = 100
     epoch_clean: int = 0
     max_steps_algo1: Optional[int] = None
@@ -744,7 +753,7 @@ class TrainConfig:
     #   improvement in the validation score before training terminates early.
     #   Setting this to 0 disables early termination; the best checkpoint is
     #   still restored at the end.
-    es_patience: int = 5
+    es_patience: int = 0
     # es_pgd_eps / es_pgd_steps / es_pgd_restarts — PGD-L2 attack parameters
     #   used to score each checkpoint on the validation split.  Intentionally
     #   cheaper than the final evaluation (20 steps / 3 restarts vs 40 / 5)
@@ -779,6 +788,7 @@ class PGDEvalConfig:
 class TrainState:
     model: nn.Module
     opt: torch.optim.Optimizer
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
 
 
 @dataclass
@@ -1554,9 +1564,12 @@ def train_step_ppa(state: TrainState, batch, cfg: TrainConfig, device: torch.dev
 # ---------------------------------------------------------------------------
 
 def create_classifier_state(cfg: TrainConfig, device: torch.device) -> TrainState:
-    model = LeNet().to(device)
+    model = CarliniWagnerMNIST().to(device)
     opt = torch.optim.SGD(model.parameters(), lr=cfg.lr_cls, momentum=0.9, nesterov=True, weight_decay=1e-4)
-    return TrainState(model=model, opt=opt)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        opt, milestones=[cfg.lr_cls_drop_epoch], gamma=cfg.lr_cls_drop_factor
+    )
+    return TrainState(model=model, opt=opt, scheduler=scheduler)
 
 
 def create_icnn_state(cfg: TrainConfig, input_dim: int, device: torch.device) -> ICNNState:
@@ -1701,6 +1714,7 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                     best_epoch    = epoch
                     best_model_sd = copy.deepcopy(state.model.state_dict())
                     best_opt_sd   = copy.deepcopy(state.opt.state_dict())
+            state.scheduler.step()
 
         else:
             # Fix 6: accumulate sample-weighted sums.
@@ -1761,6 +1775,8 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                     patience_count = 0
                 else:
                     patience_count += 1
+
+                state.scheduler.step()
 
                 # Fix 1: break when patience is exhausted.
                 if cfg.es_patience > 0 and patience_count >= cfg.es_patience:
@@ -1891,6 +1907,7 @@ def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                     (best_model_sd, best_opt_sd, best_icnn_sd,
                      best_icnn_params_vec, best_icnn_inner_param,
                      best_icnn_inner_opt_sd) = _save_best()
+            state.scheduler.step()
 
         else:
             # Fix 6: sample-weighted sums.
@@ -1949,6 +1966,8 @@ def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                     patience_count = 0
                 else:
                     patience_count += 1
+
+                state.scheduler.step()
 
                 # Fix 1: actual early stopping.
                 if cfg.es_patience > 0 and patience_count >= cfg.es_patience:
@@ -2045,6 +2064,7 @@ def train_algorithm_ppa(cfg: TrainConfig, device: torch.device) -> Tuple[TrainSt
                     best_epoch    = epoch
                     best_model_sd = copy.deepcopy(state.model.state_dict())
                     best_opt_sd   = copy.deepcopy(state.opt.state_dict())
+            state.scheduler.step()
 
         else:
             # Fix 6: sample-weighted sums.
@@ -2097,6 +2117,8 @@ def train_algorithm_ppa(cfg: TrainConfig, device: torch.device) -> Tuple[TrainSt
                     patience_count = 0
                 else:
                     patience_count += 1
+
+                state.scheduler.step()
 
                 # Fix 1: actual early stopping.
                 if cfg.es_patience > 0 and patience_count >= cfg.es_patience:
@@ -2199,7 +2221,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = TrainConfig(
         batch_size=512,
-        num_epochs=30,
+        num_epochs=50,
         lr_cls=1e-2,
         lambda_reg=0.33,
         epoch_clean=0,
@@ -2211,7 +2233,7 @@ if __name__ == "__main__":
         inner_steps_algo2=20,    
         inner_lr_algo1=1e-2,
         bb_alpha0_icnn=1e-2,    
-        icnn_hidden_sizes=(32, 32, 32),
+        icnn_hidden_sizes=(128, 128, 64, 64, 32),
         # PPA parameters
         inner_steps_ppa=5,       # WRM steps per ascent-project round
         inner_lr_ppa=1e-2,
