@@ -1,10 +1,16 @@
 import os
+# Must be set before any CUDA kernel is launched.
+# :4096:8  → 32 KB workspace (safe for all matmul sizes)
+# :16:8    → 128 B workspace (may fail on large matmuls)
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import math
 import csv
 import json
+import argparse
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,10 +18,25 @@ from torch.utils.data import DataLoader, TensorDataset
 from torchvision import datasets
 from scipy.optimize import linear_sum_assignment
 
+from MNIST_C_utils import MNISTCDataset, CORRUPTIONS, ensure_mnist_c_downloaded
+
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-# torch.cuda.manual_seed_all(cfg.seed)
+# warn_only=True avoids hard errors on ops that have no deterministic kernel;
+# set to False if you need strict guarantees and are willing to accept NotImplementedError.
+torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def seed_everything(seed: int) -> None:
+    """Seed all RNG sources for full reproducibility.
+
+    Covers: Python hash seed (not set here — pass PYTHONHASHSEED=<seed>),
+    PyTorch CPU RNG, PyTorch CUDA RNG on all devices, and NumPy.
+    """
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
 # ---------------------------------------------------------------------------
 #  Logging
@@ -345,21 +366,33 @@ def wrm_ascent_x(
     num_steps: int,
     lr: float = 0.01,
     clamp: Optional[Tuple[float, float]] = (0.0, 1.0),
+    step_offset: int = 0,
 ) -> torch.Tensor:
     """WRM inner maximization (Sinha et al.).
 
     Gradient ascent on CE(z, y) - lambda ||z - x||^2 w.r.t. z.
-    Update rule: z <- z + lr * (grad_z CE(z, y) - 2 * lambda * (z - x)).
+    Update rule: z <- z + (lr/sqrt(s)) * (grad_z CE(z,y) - 2*lambda*(z-x)).
+
+    Parameters
+    ----------
+    step_offset : global step index of the first internal step.
+                  Bug 9 fix: PPA calls this function across multiple rounds;
+                  passing step_offset = round_idx * inner_steps_ppa ensures
+                  the diminishing schedule lr/sqrt(s) is monotonically
+                  decreasing across rounds rather than resetting to lr each
+                  round.  Default 0 preserves the original single-round
+                  behaviour.
     """
     if num_steps == 0:
         return x0.detach()
     x_orig = x0.detach()
     z = x_orig.clone()
-    for _ in range(num_steps):
+    for s in range(1 + step_offset, num_steps + 1 + step_offset):
         z.requires_grad_(True)
         per_sample_ce = F.cross_entropy(model(z), y, reduction="none")
         grads = torch.autograd.grad(per_sample_ce.sum(), z, create_graph=False)[0]
-        z = z.detach() + lr * (grads - 2.0 * lambda_reg * (z.detach() - x_orig))
+        eta_s = lr / math.sqrt(s)
+        z = z.detach() + eta_s * (grads - 2.0 * lambda_reg * (z.detach() - x_orig))
         if clamp is not None:
             lo, hi = clamp
             z = z.clamp(lo, hi)
@@ -375,6 +408,7 @@ def wrm_ascent_x_anchored(
     num_steps: int,
     lr: float = 0.01,
     clamp: Optional[Tuple[float, float]] = (0.0, 1.0),
+    step_offset: int = 0,
 ) -> torch.Tensor:
     """WRM gradient ascent starting from z0 with penalty anchored at x_anchor.
 
@@ -385,16 +419,22 @@ def wrm_ascent_x_anchored(
 
     Maximises  CE(z, y) - lambda ||z - x_anchor||^2  w.r.t. z,
     starting from z = z0.
+
+    Parameters
+    ----------
+    step_offset : see wrm_ascent_x.  In PPA, pass round_idx * inner_steps
+                  so the step-size schedule continues across rounds.
     """
     if num_steps == 0:
         return z0.detach()
     x_anc = x_anchor.detach()
     z = z0.detach().clone()
-    for _ in range(num_steps):
+    for s in range(1 + step_offset, num_steps + 1 + step_offset):
         z.requires_grad_(True)
         per_sample_ce = F.cross_entropy(model(z), y, reduction="none")
         grads = torch.autograd.grad(per_sample_ce.sum(), z, create_graph=False)[0]
-        z = z.detach() + lr * (grads - 2.0 * lambda_reg * (z.detach() - x_anc))
+        eta_s = lr / math.sqrt(s)
+        z = z.detach() + eta_s * (grads - 2.0 * lambda_reg * (z.detach() - x_anc))
         if clamp is not None:
             lo, hi = clamp
             z = z.clamp(lo, hi)
@@ -451,14 +491,42 @@ def brenier_projection(
     z_flat = z.detach().view(N, -1)   # [N, d]
     x_flat = x.detach().view(N, -1)   # [N, d]
 
-    # Cost matrix  C[i, j] = ||x_i - z_j||^2  via expansion:
-    #   = ||x_i||^2 + ||z_j||^2 - 2 x_i^T z_j
-    # torch.cdist computes L2 distances; squaring gives the cost.
-    cost = torch.cdist(x_flat, z_flat, p=2).pow(2)  # [N, N]
+    # Fix 3.1: compute the cost matrix entirely on CPU.
+    #
+    # The previous implementation used x_flat.mm(z_flat.t()) on the GPU tensor,
+    # which dispatches to a cuBLAS GEMM.  That is subject to non-determinism
+    # whenever warn_only=True in torch.use_deterministic_algorithms — the op
+    # fires a warning but executes non-deterministically.  Moving all arithmetic
+    # to CPU float32 guarantees determinism: CPU mm uses MKL/OpenBLAS, which
+    # produces bit-identical results for the same inputs.  The cost matrix is
+    # sent to NumPy immediately afterwards anyway, so no extra device transfer
+    # is introduced.
+    #
+    # Expansion (all on CPU):
+    #   cost[i, j] = ||x_i - z_j||^2 = ||x_i||^2 + ||z_j||^2 - 2 x_i^T z_j
+    x_cpu = x_flat.cpu().float()                           # [N, d]
+    z_cpu = z_flat.cpu().float()                           # [N, d]
+    x_sq  = (x_cpu ** 2).sum(dim=1, keepdim=True)         # [N, 1]
+    z_sq  = (z_cpu ** 2).sum(dim=1, keepdim=True)         # [N, 1]
+    cross = x_cpu.mm(z_cpu.t())                           # [N, N], CPU GEMM — deterministic
+    cost_cpu = (x_sq + z_sq.t() - 2.0 * cross).clamp(min=0.0)  # [N, N]
+    cost_np  = cost_cpu.numpy()                           # pass directly to scipy
 
     # Solve LAP on CPU (Jonker-Volgenant, O(N^3))
-    _row_ind, col_ind = linear_sum_assignment(cost.cpu().numpy())
-    perm = torch.tensor(col_ind, device=z.device, dtype=torch.long)
+    row_ind, col_ind = linear_sum_assignment(cost_np)
+
+    # Fix 3.2: build the permutation from both row_ind and col_ind.
+    #
+    # The previous code did perm = tensor(col_ind), which is only correct when
+    # row_ind == [0, 1, ..., N-1].  For a square cost matrix scipy always
+    # returns a sorted row_ind, but that is an implementation detail rather than
+    # an API guarantee.  The correct, contract-compliant construction is:
+    #   perm[row_ind[k]] = col_ind[k]
+    # meaning "nominal x_{row_ind[k]} is matched to adversarial z_{col_ind[k]}",
+    # so z_proj[i] = z[perm[i]] is the adversarial point assigned to nominal x_i.
+    perm_np       = np.empty(N, dtype=np.int64)
+    perm_np[row_ind] = col_ind
+    perm = torch.tensor(perm_np, device=z.device, dtype=torch.long)
 
     # Apply permutation
     z_proj = z[perm]
@@ -481,6 +549,7 @@ def check_cyclical_monotonicity(
     z: torch.Tensor,
     cycle_lengths: Sequence[int] = (2, 3, 4, 5, 6, 8, 10),
     num_samples: int = 500,
+    generator: Optional[torch.Generator] = None,
 ) -> Dict[int, Dict[str, Any]]:
     r"""Check cyclical monotonicity (CM) violations of the identity coupling.
 
@@ -530,6 +599,12 @@ def check_cyclical_monotonicity(
     z : [N, C, H, W]  adversarial samples (WRM output)
     cycle_lengths : tuple of k values to probe
     num_samples   : number of random k-cycles to sample per k
+    generator     : optional torch.Generator for reproducible sampling.
+                    Bug 7 fix: without an explicit generator, torch.randperm
+                    consumes the global RNG, making CM statistics dependent on
+                    the exact sequence of preceding RNG calls (batch index,
+                    epoch, etc.).  Pass a seeded generator to make the CM
+                    diagnostic fully reproducible independently of context.
 
     Returns
     -------
@@ -553,8 +628,8 @@ def check_cyclical_monotonicity(
         violations_relative = []
 
         for _ in range(num_samples):
-            # Sample k distinct indices uniformly
-            idx = torch.randperm(N, device=x.device)[:k]
+            # Bug 7 fix: pass generator so sampling is reproducible.
+            idx = torch.randperm(N, device=x.device, generator=generator)[:k]
 
             # Identity cost for this cycle
             c_id = id_costs[idx].sum().item()
@@ -653,6 +728,8 @@ class TrainConfig:
     inner_lr_ppa: float = 1e-2
     ppa_num_rounds: int = 3        # number of (ascent → project) cycles
     max_steps_ppa: Optional[int] = None
+    # Diagnostics
+    cm_diagnostics: bool = False   # cyclical monotonicity diagnostic for Algo1
     seed: int = 0
 
 
@@ -677,6 +754,13 @@ class ICNNState:
     params_vec: torch.Tensor
     meta: Tuple[Tuple[str, Tuple[int, ...], int], ...]
     bb_state: BBArmijoState
+    # FIX Bug 4: persistent leaf tensor and AdamW instance so that the
+    # first-moment (m̂_t) and second-moment (v̂_t) accumulators survive across
+    # mini-batches, giving Adam its full momentum benefit.  Recreating the
+    # optimizer every step discards these accumulators, degrading Adam to a
+    # bias-corrected SGD step with constant scaling.
+    inner_param: torch.Tensor                # persistent leaf, updated in-place
+    inner_opt: torch.optim.Optimizer         # AdamW bound to inner_param
 
 # ---------------------------------------------------------------------------
 #  Data
@@ -699,90 +783,139 @@ def load_mnist():
 # ---------------------------------------------------------------------------
 
 def project_l2(x: torch.Tensor, x_orig: torch.Tensor, eps: float) -> torch.Tensor:
+    """Project x onto the L2 ball of radius eps centred at x_orig.
+
+    For each sample i:
+        x_proj[i] = x_orig[i] + (x[i] - x_orig[i]) * min(1, eps / ||x[i]-x_orig[i]||_2)
+
+    The +1e-12 guard prevents division by zero when x == x_orig without
+    introducing meaningful error (||diff|| > 1e-12 for any non-trivial step).
+    """
     diff = x - x_orig
     flat = diff.view(diff.size(0), -1)
-    norm = torch.norm(flat, dim=1, keepdim=True)
-    factor = torch.clamp(eps / (norm + 1e-12), max=1.0)
+    norm = flat.norm(p=2, dim=1, keepdim=True)
+    factor = (eps / (norm + 1e-12)).clamp(max=1.0)
     factor = factor.view(-1, *([1] * (x.dim() - 1)))
     return x_orig + diff * factor
 
 
-def pgd_l2_attack(model: nn.Module, x: torch.Tensor, y: torch.Tensor, eps: float, num_steps: int, step_size: Optional[float] = None) -> torch.Tensor:
-    if step_size is None:
-        step_size = float(eps) / float(max(num_steps, 1))
-    elif step_size <= 0:
-        raise ValueError("pgd_l2_attack step_size must be positive.")
-    model.eval()
-    adv = x.detach()
-    for _ in range(num_steps):
-        adv_req = adv.clone().detach().requires_grad_(True)
-        logits = model(adv_req)
-        loss = cross_entropy_loss(logits, y)
-        grad = torch.autograd.grad(loss, adv_req, create_graph=False)[0]
-        grad_flat = grad.view(grad.size(0), -1)
-        grad_norm = grad_flat.norm(dim=1, keepdim=True)
-        scaled = grad / (grad_norm.view(-1, *([1] * (grad.dim() - 1))) + 1e-12)
-        adv = adv_req + step_size * scaled
-        adv = project_l2(adv, x, eps)
-        adv = adv.clamp(0.0, 1.0).detach()
-    return adv.detach()
+def _per_sample_l2_normalize(t: torch.Tensor, floor: float = 1e-12) -> torch.Tensor:
+    """Normalise each sample in a batch to unit L2 norm.
 
-
-def evaluate_pgd(state: TrainState, dataset, batch_size: int, eps: float = 0.3, step_size: Optional[float] = None, num_steps: int = 40, device: Optional[torch.device] = None) -> Dict[str, float]:
-    device = device or next(state.model.parameters()).device
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    total_acc = total_n = 0
-    total_l2 = total_linf = 0.0
-    state.model.eval()
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
-        if x.size(0) == 0:
-            continue
-        adv_x = pgd_l2_attack(state.model, x, y, eps, num_steps, step_size)
-        with torch.no_grad():
-            logits = state.model(adv_x)
-            acc = accuracy(logits, y).item()
-        n = x.size(0)
-        total_acc += acc * n
-        total_n += n
-        diff = adv_x - x
-        flat = diff.view(diff.size(0), -1)
-        total_l2 += float(flat.norm(dim=1).mean().item()) * n
-        total_linf += float(diff.abs().view(diff.size(0), -1).max(dim=1)[0].mean().item()) * n
-    return {"acc": total_acc / total_n, "avg_l2": total_l2 / total_n, "avg_linf": total_linf / total_n}
-
-# ---------------------------------------------------------------------------
-#  Proper PGD-L2 attack (random restarts, correct step size & projection)
-#  Follows the pattern from utils.evaluate_under_input_pgd
-# ---------------------------------------------------------------------------
-
-def _per_sample_l2_normalize(t: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Normalize each sample in a batch to unit L2 norm."""
+    Returns t / ||t[i]||_2 for each sample i, with a floor to avoid NaN when
+    the gradient is exactly zero (degenerate case; zero-gradient samples take
+    a zero step, which is the correct behaviour).
+    """
     B = t.size(0)
     flat = t.view(B, -1)
-    norms = flat.norm(p=2, dim=1).clamp(min=eps)
-    reshape = (B,) + (1,) * (t.dim() - 1)
-    return t / norms.view(reshape)
+    norms = flat.norm(p=2, dim=1).clamp(min=floor)
+    return t / norms.view(B, *([1] * (t.dim() - 1)))
 
 
-def _random_start_l2_ball(x0: torch.Tensor, eps: float) -> torch.Tensor:
-    """Sample a random starting point inside an L2 ball around x0."""
+def _sphere_start_l2(x0: torch.Tensor, eps: float) -> torch.Tensor:
+    """Sample a random starting point for PGD on the L2 sphere of radius eps,
+    respecting the box constraint [0, 1]^d.
+
+    Bug 6 fix — why the naive clamp(x0 + z*eps, 0, 1) is wrong
+    ------------------------------------------------------------
+    A random unit direction z has roughly half its components pointing into the
+    box boundary (negative for pixels near 0, positive for pixels near 1).
+    After clamping, the effective perturbation is
+
+        delta_eff = clamp(x0 + z*eps, 0, 1) - x0
+
+    whose L2 norm satisfies  E[||delta_eff||_2] ≈ eps/sqrt(2) ≈ 0.707*eps
+    for a typical MNIST image (half-white, half-black background).  PGD does
+    NOT re-expand the iterate: _project_onto_l2_ball clips *within* the eps-
+    ball but does not expand toward the boundary.  So the clamp permanently
+    wastes ~30% of the perturbation budget on the very first restart.
+
+    Correct approach: project-then-normalise
+    ----------------------------------------
+    1. Draw z ~ N(0, I_d) and normalise to the unit sphere.
+    2. Form the unconstrained proposal  p = x0 + eps * z.
+    3. Project p onto the box: p_box = clamp(p, 0, 1).
+    4. Compute the actual delta: d = p_box - x0.
+    5. If ||d||_2 > 0, re-normalise d to exactly eps so the start sits on the
+       sphere of the *feasible* perturbation set (intersection of L2 ball and
+       box).  If ||d||_2 == 0 (degenerate, extremely rare), fall back to x0.
+
+    After step 5 the iterate satisfies ||start - x0||_2 = eps exactly *and*
+    start in [0,1]^d, so no budget is wasted.  The distribution over feasible
+    directions is not perfectly uniform, but it is unbiased with respect to the
+    eps boundary of the feasible set, which is what matters for PGD restarts.
+    """
     z = torch.randn_like(x0)
-    z = _per_sample_l2_normalize(z)
-    batch = x0.size(0)
-    r = torch.rand(batch, device=x0.device).view(batch, *([1] * (x0.dim() - 1)))
-    delta = z * (r * eps)
-    return (x0 + delta).clamp(0.0, 1.0)
+    z = _per_sample_l2_normalize(z)           # unit direction on R^d sphere
+    p = x0 + eps * z                          # unconstrained sphere point
+    p_box = p.clamp(0.0, 1.0)                 # project onto box
+    d = p_box - x0                            # feasible delta (may be < eps in norm)
+    B = x0.size(0)
+    d_flat = d.view(B, -1)
+    norms = d_flat.norm(p=2, dim=1)           # [B]
+    # Re-normalise to eps; fall back to x0 for the degenerate zero-norm case.
+    safe_norms = norms.clamp(min=1e-12)
+    scale = (eps / safe_norms)                # [B]
+    scale = scale.view(B, *([1] * (x0.dim() - 1)))
+    d_scaled = d * scale                      # ||d_scaled[i]||_2 = eps for all i
+    # For any sample where the original norm was effectively 0, use zero delta.
+    zero_mask = (norms < 1e-12).view(B, *([1] * (x0.dim() - 1)))
+    d_final = torch.where(zero_mask, torch.zeros_like(d_scaled), d_scaled)
+    return (x0 + d_final).clamp(0.0, 1.0)
 
 
 def _project_onto_l2_ball(delta: torch.Tensor, eps: float) -> torch.Tensor:
-    """Project perturbation onto an L2 ball of radius eps."""
+    """Project a perturbation tensor onto the L2 ball of radius eps.
+
+    Operates per-sample:  delta[i] <- delta[i] * min(1, eps / ||delta[i]||_2).
+    Returns a tensor of the same shape as delta.
+    """
     flat = delta.view(delta.size(0), -1)
     norms = flat.norm(p=2, dim=1, keepdim=True).clamp(min=1e-12)
     factors = (eps / norms).clamp(max=1.0)
-    flat = flat * factors
-    return flat.view_as(delta)
+    return (flat * factors).view_as(delta)
+
+
+def pgd_l2_attack(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float,
+    num_steps: int,
+    step_size: Optional[float] = None,
+) -> torch.Tensor:
+    """Single-start PGD-L2 from x (no random restart).
+
+    Intended for training-time adversarial example generation where a cheap,
+    deterministic attack suffices.  For evaluation use
+    ``pgd_l2_attack_restarts`` which includes random restarts and is
+    therefore a strictly stronger attack.
+
+    Step size convention: 2*eps/T (standard; allows the iterate to traverse
+    the full ball diameter 2*eps in T perfectly-aligned steps).
+    """
+    if step_size is None:
+        step_size = 2.0 * float(eps) / float(max(num_steps, 1))
+    elif step_size <= 0:
+        raise ValueError(f"step_size must be positive, got {step_size!r}.")
+
+    was_training = model.training
+    model.eval()
+    try:
+        adv = x.detach().clone()
+        for _ in range(num_steps):
+            adv = adv.detach().requires_grad_(True)
+            logits = model(adv)
+            # Use sum reduction so grad[i] = ∂L_i/∂x_i exactly (no 1/B factor).
+            loss = F.cross_entropy(logits, y, reduction="sum")
+            grad = torch.autograd.grad(loss, adv, create_graph=False)[0]
+            with torch.no_grad():
+                adv = adv + step_size * _per_sample_l2_normalize(grad)
+                adv = project_l2(adv, x, eps)
+                adv = adv.clamp(0.0, 1.0)
+        return adv.detach()
+    finally:
+        model.train(was_training)
 
 
 def pgd_l2_attack_restarts(
@@ -794,101 +927,208 @@ def pgd_l2_attack_restarts(
     step_size: float,
     restarts: int,
 ) -> torch.Tensor:
-    """PGD-L2 attack with random restarts and proper projection.
+    r"""PGD-L2 attack with a deterministic first restart and random subsequent restarts.
 
-    - Step size default: 2*eps/steps (following utils.auto_pgd_step_size).
-    - Random initialization inside L2 ball (following utils.random_start_input_ball_pix).
-    - Per-restart best-loss tracking (following utils.evaluate_under_input_pgd).
+    Algorithm
+    ---------
+    For r = 0, 1, ..., restarts-1:
+        x_adv^(r,0) = x                              if r == 0   (deterministic)
+                    = sphere_start(x, eps)           if r >= 1   (random)
+        for t = 1, ..., T:
+            g_t = nabla_{x} CE(f(x_adv^(r,t-1)), y)
+            x_adv^(r,t) = Pi_{B(x,eps)} ( x_adv^(r,t-1) + alpha * g_t / ||g_t||_2 )
+            x_adv^(r,t) = clamp(x_adv^(r,t), 0, 1)
+        keep x_adv^(r,T) if CE(f(x_adv^(r,T)), y) > current best (per sample)
+
+    The deterministic r=0 restart ensures the attack is always at least as
+    strong as single-start PGD from x.  Random restarts r≥1 escape local
+    maxima.
+
+    Gradient convention
+    -------------------
+    Using ``reduction="sum"`` means grad[i] = ∂L_i/∂x_i without any 1/B
+    scaling factor.  After ``_per_sample_l2_normalize`` the direction is
+    identical to the reduction="mean" case, but the computation graph is
+    cleaner and per-sample gradients are never implicitly divided by B.
+
+    Parameters
+    ----------
+    restarts : total number of restarts (including the deterministic one).
+               Must be >= 1; values < 1 are treated as 1.
     """
+    was_training = model.training
     model.eval()
-    x0 = x.detach()
-    best_delta = torch.zeros_like(x0)
-    best_loss = torch.full((x0.size(0),), -1e9, device=x0.device)
+    try:
+        x0 = x.detach()
+        best_delta = torch.zeros_like(x0)
+        best_loss  = torch.full((x0.size(0),), -float("inf"), device=x0.device)
 
-    for _ in range(max(1, restarts)):
-        x_adv = _random_start_l2_ball(x0, eps).detach().requires_grad_(True)
-        for _ in range(num_steps):
-            logits = model(x_adv)
-            loss = F.cross_entropy(logits, y, reduction="mean")
-            grad = torch.autograd.grad(loss, x_adv, create_graph=False)[0]
+        for r in range(max(1, restarts)):
+            # Restart 0: deterministic start from x (clean PGD baseline).
+            # Restarts ≥ 1: random start on the sphere boundary.
+            if r == 0:
+                x_adv = x0.clone().requires_grad_(True)
+            else:
+                x_adv = _sphere_start_l2(x0, eps).detach().requires_grad_(True)
+
+            for _ in range(num_steps):
+                logits = model(x_adv)
+                # sum reduction: grad[i] = ∂L_i/∂x_i, no implicit 1/B scaling.
+                loss = F.cross_entropy(logits, y, reduction="sum")
+                grad = torch.autograd.grad(loss, x_adv, create_graph=False)[0]
+                with torch.no_grad():
+                    x_adv = x_adv + step_size * _per_sample_l2_normalize(grad)
+                    delta  = _project_onto_l2_ball(x_adv - x0, eps)
+                    x_adv  = (x0 + delta).clamp(0.0, 1.0)
+                x_adv = x_adv.detach().requires_grad_(True)
+
+            # Track the best adversarial example per sample.
             with torch.no_grad():
-                step = step_size * _per_sample_l2_normalize(grad)
-                x_adv = x_adv + step
-                delta = x_adv - x0
-                delta = _project_onto_l2_ball(delta, eps)
-                x_adv = (x0 + delta).clamp(0.0, 1.0)
-                x_adv.requires_grad_(True)
+                logits = model(x_adv)
+                per_sample_loss = F.cross_entropy(logits, y, reduction="none")
+                delta = (x_adv - x0).detach()
+                improved = per_sample_loss > best_loss
+                best_loss[improved]  = per_sample_loss[improved]
+                best_delta[improved] = delta[improved]
 
-        with torch.no_grad():
-            logits = model(x_adv)
-            losses = F.cross_entropy(logits, y, reduction="none")
-            delta = (x_adv - x0).detach()
-            mask = losses > best_loss
-            if mask.any():
-                best_loss[mask] = losses[mask]
-                best_delta[mask] = delta[mask]
+        return (x0 + best_delta).clamp(0.0, 1.0).detach()
+    finally:
+        model.train(was_training)
 
-    return (x0 + best_delta).clamp(0.0, 1.0).detach()
+
+def evaluate_pgd(
+    state: TrainState,
+    dataset: torch.utils.data.Dataset,
+    batch_size: int,
+    eps: float = 0.3,
+    step_size: Optional[float] = None,
+    num_steps: int = 40,
+    restarts: int = 5,
+    device: Optional[torch.device] = None,
+) -> Dict[str, float]:
+    """Evaluate adversarial accuracy under PGD-L2 with random restarts.
+
+    Uses the same attack (``pgd_l2_attack_restarts``) and the same default
+    step size (``2*eps/num_steps``) as ``evaluate_pgd_l2_sweep`` so the two
+    functions are directly comparable at the same epsilon.
+
+    Metrics are sample-weighted means (not batch-count means), so the
+    result is unbiased when the last batch is smaller than batch_size.
+    """
+    device = device or next(state.model.parameters()).device
+    _step = step_size if (step_size is not None and step_size > 0) \
+            else 2.0 * eps / max(num_steps, 1)
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    total_correct = 0
+    total_l2 = total_linf = 0.0
+    total_n = 0
+
+    was_training = state.model.training
+    state.model.eval()
+    try:
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            if x.size(0) == 0:
+                continue
+            adv_x = pgd_l2_attack_restarts(
+                state.model, x, y, eps, num_steps, _step, restarts
+            )
+            with torch.no_grad():
+                logits = state.model(adv_x)
+                total_correct += (logits.argmax(dim=1) == y).sum().item()
+            n = x.size(0)
+            total_n += n
+            diff = (adv_x - x).detach().view(n, -1)
+            total_l2   += diff.norm(p=2, dim=1).sum().item()
+            total_linf += diff.abs().max(dim=1).values.sum().item()
+    finally:
+        state.model.train(was_training)
+
+    return {
+        "acc":      total_correct / max(1, total_n),
+        "avg_l2":   total_l2     / max(1, total_n),
+        "avg_linf": total_linf   / max(1, total_n),
+    }
 
 
 def evaluate_pgd_l2_sweep(
     state: TrainState,
-    dataset,
+    dataset: torch.utils.data.Dataset,
     pgd_cfg: PGDEvalConfig,
     batch_size: int,
     device: torch.device,
 ) -> Dict[str, Any]:
-    """Evaluate model under PGD-L2 attack for multiple epsilon values."""
+    """Evaluate model robustness under PGD-L2 for each epsilon in pgd_cfg.
+
+    Uses ``pgd_l2_attack_restarts`` with random restarts and step size
+    ``2*eps/num_steps`` (unless overridden in pgd_cfg).  Both accuracy and
+    distortion metrics are true sample-means (not batch-count means).
+
+    Notes
+    -----
+    The DataLoader is created once and reused across epsilon values; since
+    ``shuffle=False`` this yields identical batches on every pass.
+    """
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    was_training = state.model.training
     state.model.eval()
     results: Dict[str, Any] = {}
 
-    for eps in pgd_cfg.epsilons:
-        step_size = (
-            pgd_cfg.step_size
-            if pgd_cfg.step_size is not None and pgd_cfg.step_size > 0
-            else 2.0 * eps / max(pgd_cfg.num_steps, 1)
-        )
-        total_correct = 0
-        total_n = 0
-        total_l2 = 0.0
-        total_linf = 0.0
-        n_batches = 0
-
-        for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            if xb.size(0) == 0:
-                continue
-            adv_x = pgd_l2_attack_restarts(
-                state.model, xb, yb, eps,
-                pgd_cfg.num_steps, step_size, pgd_cfg.restarts,
+    try:
+        for eps in pgd_cfg.epsilons:
+            step_size = (
+                pgd_cfg.step_size
+                if pgd_cfg.step_size is not None and pgd_cfg.step_size > 0
+                else 2.0 * eps / max(pgd_cfg.num_steps, 1)
             )
-            with torch.no_grad():
-                logits = state.model(adv_x)
-                total_correct += (logits.argmax(dim=1) == yb).sum().item()
-                total_n += xb.size(0)
-                delta = adv_x - xb
-                total_l2 += delta.view(delta.size(0), -1).norm(p=2, dim=1).mean().item()
-                total_linf += delta.abs().view(delta.size(0), -1).max(dim=1)[0].mean().item()
-                n_batches += 1
 
-        acc = total_correct / max(1, total_n)
-        avg_l2 = total_l2 / max(1, n_batches)
-        avg_linf = total_linf / max(1, n_batches)
+            total_correct = 0
+            total_n       = 0
+            total_l2      = 0.0
+            total_linf    = 0.0
 
-        eps_key = f"eps_{eps:.1f}"
-        results[eps_key] = {
-            "epsilon": eps,
-            "step_size": step_size,
-            "num_steps": pgd_cfg.num_steps,
-            "restarts": pgd_cfg.restarts,
-            "acc_pct": round(acc * 100, 2),
-            "avg_l2": round(avg_l2, 4),
-            "avg_linf": round(avg_linf, 4),
-            "samples": total_n,
-        }
-        print(f"    eps={eps:.1f}: acc={acc*100:.2f}% avg_L2={avg_l2:.4f} avg_Linf={avg_linf:.4f}")
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                if xb.size(0) == 0:
+                    continue
+                adv_x = pgd_l2_attack_restarts(
+                    state.model, xb, yb, eps,
+                    pgd_cfg.num_steps, step_size, pgd_cfg.restarts,
+                )
+                with torch.no_grad():
+                    logits = state.model(adv_x)
+                    total_correct += (logits.argmax(dim=1) == yb).sum().item()
+                    n = xb.size(0)
+                    total_n += n
+                    delta = (adv_x - xb).detach().view(n, -1)
+                    # Sample-weighted accumulation (Bug 5 fix: .sum() not .mean())
+                    total_l2   += delta.norm(p=2, dim=1).sum().item()
+                    total_linf += delta.abs().max(dim=1).values.sum().item()
+
+            acc       = total_correct / max(1, total_n)
+            avg_l2    = total_l2      / max(1, total_n)
+            avg_linf  = total_linf    / max(1, total_n)
+
+            # Use :.4g so 1.6, 1.60, 2.0, 0.1 all produce exact, collision-free keys.
+            eps_key = f"eps_{eps:.4g}"
+            results[eps_key] = {
+                "epsilon":   eps,
+                "step_size": step_size,
+                "num_steps": pgd_cfg.num_steps,
+                "restarts":  pgd_cfg.restarts,
+                "acc_pct":   round(acc * 100, 2),
+                "avg_l2":    round(avg_l2,    4),
+                "avg_linf":  round(avg_linf,  4),
+                "samples":   total_n,
+            }
+            print(
+                f"    eps={eps:.4g}: acc={acc*100:.2f}%"
+                f" avg_L2={avg_l2:.4f} avg_Linf={avg_linf:.4f}"
+            )
+    finally:
+        state.model.train(was_training)
 
     return results
 
@@ -914,8 +1154,12 @@ def train_step_clean(state: TrainState, batch, device: torch.device) -> Tuple[Tr
     loss.backward()
     opt.step()
 
+    # Bug 1 fix: recompute logits from the post-update model so that
+    # acc_clean reflects the weights that will be used going forward,
+    # consistent with train_step_algo1 and train_step_algo2.
     with torch.no_grad():
-        acc = accuracy(logits, y)
+        logits_post = model(x)
+        acc = accuracy(logits_post, y)
     return state, {"loss": loss.detach(), "acc_clean": acc}
 
 
@@ -961,9 +1205,14 @@ def train_step_algo1(state: TrainState, batch, cfg: TrainConfig, device: torch.d
     metrics = {"loss_adv": loss.detach(), "acc_clean": acc_clean, "acc_adv": acc_adv, "w2_proxy": w2_proxy}
 
     # --- Cyclical monotonicity diagnostic (no grad, pure analysis) ---
-    with torch.no_grad():
-        cm = check_cyclical_monotonicity(x, adv_x)
-    metrics["cm_diagnostics"] = cm
+    if cfg.cm_diagnostics:
+        with torch.no_grad():
+            # Bug 7 fix: use a seeded generator so CM statistics are
+            # reproducible regardless of global RNG state at call time.
+            cm_gen = torch.Generator(device=x.device)
+            cm_gen.manual_seed(0)
+            cm = check_cyclical_monotonicity(x, adv_x, generator=cm_gen)
+        metrics["cm_diagnostics"] = cm
 
     return state, metrics
 
@@ -995,19 +1244,38 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
     def adv_obj_params(vec: torch.Tensor, create_graph: bool) -> torch.Tensor:
         params_dict = unflatten_vector(vec, meta)
         adv_flat = icnn_gradient(icnn_model, params_dict, x_flat, create_graph=create_graph)
-        # FIX Bug4: clamp to [0,1] inside inner objective (match outer step)
-        adv_x = adv_flat.view_as(x).clamp(0.0, 1.0)
-        logits = model(adv_x)
+        # Bug 4 fix: do NOT clamp adv_flat inside the inner objective.
+        #
+        # Two problems with clamping here:
+        # (4a) Gradient truncation: clamp has zero derivative outside [0,1], so
+        #      any pixel where the transport map overshoots the box receives zero
+        #      gradient signal back to the ICNN parameters theta.  As the map
+        #      grows stronger and more pixels saturate, the effective gradient
+        #      vanishes — causing the inner loss to plateau prematurely.
+        #
+        # (4b) Biased W2 proxy: the WRM objective penalises
+        #          ||nabla_theta psi(x) - x||^2
+        #      Replacing nabla_theta psi(x) with clamp(nabla_theta psi(x))
+        #      understates the transport cost for out-of-range components,
+        #      letting the optimizer push pixels outside [0,1] for free.
+        #
+        # The correct place for the clamp is at the outer minimization step
+        # (already present at line ~1221), which is a post-processing step on
+        # the final adversarial point and does not participate in ICNN training.
+        adv_x_inner = adv_flat.view_as(x)
+        logits = model(adv_x_inner)
         adv_loss = adversary_loss(logits, y, cfg.use_margin_adv_algo2)
-        w2 = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
+        w2 = ((adv_x_inner - x) ** 2).sum(dim=(1, 2, 3)).mean()
         return adv_loss - cfg.lambda_reg * w2
 
-    # FIX Bug2: use Adam on ICNN parameters for robust inner optimization
-    # BB+Armijo with tiny alpha0 on a near-flat landscape (identity init)
-    # yields negligible updates.  Adam with momentum handles the small-gradient
-    # regime far more reliably.
-    inner_param = params_vec.detach().clone().requires_grad_(True)
-    inner_opt = torch.optim.AdamW([inner_param], lr=cfg.bb_alpha0_icnn, weight_decay=1e-5)
+    # FIX Bug 4: reuse the persistent inner_param / inner_opt stored in
+    # icnn_state so that Adam's first- and second-moment buffers accumulate
+    # across mini-batches.  We sync inner_param.data to the current params_vec
+    # (they are the same tensor after the first step, but this is safe).
+    inner_param = icnn_state.inner_param
+    inner_opt = icnn_state.inner_opt
+    with torch.no_grad():
+        inner_param.data.copy_(icnn_state.params_vec.to(device))
     adv_loss_val = torch.tensor(0.0, device=device)
     inner_grad_norm = 0.0
 
@@ -1023,9 +1291,10 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
         inner_opt.step()
         adv_loss_val = obj.detach()
 
-    params_vec = inner_param.detach()
+    params_vec = inner_param.detach().clone()
     # BB state is kept for continuity but no longer drives the step size
-    icnn_state = ICNNState(model=icnn_model, params_vec=params_vec, meta=meta, bb_state=bb_state)
+    icnn_state = ICNNState(model=icnn_model, params_vec=params_vec, meta=meta,
+                           bb_state=bb_state, inner_param=inner_param, inner_opt=inner_opt)
 
     # Outer minimization: update classifier only
     set_requires_grad(model, True)
@@ -1098,19 +1367,26 @@ def train_step_ppa(state: TrainState, batch, cfg: TrainConfig, device: torch.dev
     total_delta = 0.0
 
     for round_idx in range(cfg.ppa_num_rounds):
+        # Bug 9 fix: pass step_offset = round_idx * inner_steps_ppa so that
+        # the diminishing step size lr/sqrt(s) is monotonically decreasing
+        # across all rounds rather than resetting to lr at the start of each
+        # round.  Without this, round r begins with step size lr/sqrt(1) = lr,
+        # potentially overshooting the local maximum found by the previous round
+        # and partially undoing the gain from the Brenier projection.
+        step_offset = round_idx * cfg.inner_steps_ppa
         if round_idx == 0:
             # First round: start from x (same as standard WRM)
             z = wrm_ascent_x(
                 x, model, y_current, cfg.lambda_reg,
                 cfg.inner_steps_ppa, lr=cfg.inner_lr_ppa,
-                clamp=(0.0, 1.0),
+                clamp=(0.0, 1.0), step_offset=step_offset,
             )
         else:
             # Subsequent rounds: start from projected z, anchor at original x
             z = wrm_ascent_x_anchored(
                 z, x, model, y_current, cfg.lambda_reg,
                 cfg.inner_steps_ppa, lr=cfg.inner_lr_ppa,
-                clamp=(0.0, 1.0),
+                clamp=(0.0, 1.0), step_offset=step_offset,
             )
 
         # Brenier projection: solve optimal assignment
@@ -1161,33 +1437,75 @@ def create_icnn_state(cfg: TrainConfig, input_dim: int, device: torch.device) ->
     icnn_model = InputConvexPotential(input_dim=input_dim, hidden_sizes=cfg.icnn_hidden_sizes, activation="softplus", strong_convexity=1.0, nonneg_init="principled").to(device)
     icnn_model.init_as_identity()
     params_vec, meta = flatten_params(icnn_model)
+    params_vec = params_vec.to(device)
     bb_state = BBArmijoState.create(alpha0=cfg.bb_alpha0_icnn)
-    return ICNNState(model=icnn_model, params_vec=params_vec.to(device), meta=meta, bb_state=bb_state)
+    # FIX Bug 4: create the persistent leaf tensor and bind Adam to it once.
+    # train_step_algo2 will copy the latest params_vec into inner_param.data
+    # before each inner loop, then read the result back — preserving Adam state.
+    inner_param = params_vec.detach().clone().requires_grad_(True)
+    inner_opt = torch.optim.Adam([inner_param], lr=cfg.bb_alpha0_icnn)
+    return ICNNState(model=icnn_model, params_vec=params_vec, meta=meta,
+                     bb_state=bb_state, inner_param=inner_param, inner_opt=inner_opt)
 
 
 def evaluate_clean(state: TrainState, dataset, batch_size: int, device: torch.device) -> Dict[str, float]:
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     model = state.model
+    # Bug 2 fix: save and restore training mode so that a mid-epoch call does
+    # not silently leave the model in eval mode for the rest of training.
+    was_training = model.training
     model.eval()
     total_loss = total_acc = total_n = 0.0
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            if x.size(0) == 0:
-                continue
-            logits = model(x)
-            loss = cross_entropy_loss(logits, y).item()
-            acc = accuracy(logits, y).item()
-            n = x.size(0)
-            total_loss += loss * n
-            total_acc += acc * n
-            total_n += n
+    try:
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(device)
+                y = y.to(device)
+                if x.size(0) == 0:
+                    continue
+                logits = model(x)
+                loss = cross_entropy_loss(logits, y).item()
+                acc = accuracy(logits, y).item()
+                n = x.size(0)
+                total_loss += loss * n
+                total_acc += acc * n
+                total_n += n
+    finally:
+        model.train(was_training)
     return {"loss": total_loss / total_n, "acc": total_acc / total_n}
 
 
+def evaluate_mnist_c(model: nn.Module, device: torch.device, root: str = "./data", batch_size: int = 256) -> Dict[str, Any]:
+    """Evaluate a model on every MNIST-C corruption and return per-corruption accuracy."""
+    ensure_mnist_c_downloaded(root)
+    # Bug 2 fix: save and restore training mode.
+    was_training = model.training
+    model.eval()
+    results: Dict[str, float] = {}
+
+    try:
+        with torch.no_grad():
+            for corruption in CORRUPTIONS:
+                dataset = MNISTCDataset(root=root, corruption=corruption, train=False)
+                loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+                correct = 0
+                total = 0
+                for data, target in loader:
+                    data, target = data.to(device), target.to(device)
+                    logits = model(data)
+                    correct += (logits.argmax(dim=1) == target).sum().item()
+                    total += target.size(0)
+                results[corruption] = round(100.0 * correct / total, 2)
+    finally:
+        model.train(was_training)
+
+    ood_accs = [acc for corr, acc in results.items() if corr != 'identity']
+    results["avg_ood"] = round(sum(ood_accs) / len(ood_accs), 2)
+    return results
+
+
 def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainState, Dict[str, Any]]:
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed)
     train_ds, test_ds = load_mnist()
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     state = create_classifier_state(cfg, device)
@@ -1227,28 +1545,29 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
                 epoch_acc_clean += float(metrics['acc_clean'])
                 epoch_acc_adv += float(metrics['acc_adv'])
                 epoch_w2_proxy += float(metrics['w2_proxy'])
-                epoch_cm_batch_results.append(metrics['cm_diagnostics'])
+                if cfg.cm_diagnostics and 'cm_diagnostics' in metrics:
+                    epoch_cm_batch_results.append(metrics['cm_diagnostics'])
                 num_steps += 1
             if num_steps > 0:
                 avg_loss_adv = epoch_loss_adv / num_steps
                 avg_acc_clean = epoch_acc_clean / num_steps
                 avg_acc_adv = epoch_acc_adv / num_steps
                 avg_w2_proxy = epoch_w2_proxy / num_steps
-                # Aggregate CM diagnostics across batches for this epoch
-                epoch_cm_agg = aggregate_cm_results(epoch_cm_batch_results)
-                cm_epochs.append({"epoch": epoch, "cm": {str(k): v for k, v in epoch_cm_agg.items()}})
-                # Build compact CM summary string
-                cm_parts = []
-                for k in sorted(epoch_cm_agg.keys()):
-                    s = epoch_cm_agg[k]
-                    cm_parts.append(
-                        f"k={k}: viol={s['frac_violated']:.1%} "
-                        f"pe={s['mean_per_edge']:.4f} "
-                        f"rel={s['mean_relative']:.4f}"
-                    )
-                cm_summary = " | ".join(cm_parts)
                 print(f"[Algo1] Epoch {epoch} (adv) loss_adv={avg_loss_adv:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f}")
-                print(f"        CM diagnostic: {cm_summary}")
+                # Aggregate CM diagnostics across batches for this epoch
+                if cfg.cm_diagnostics and epoch_cm_batch_results:
+                    epoch_cm_agg = aggregate_cm_results(epoch_cm_batch_results)
+                    cm_epochs.append({"epoch": epoch, "cm": {str(k): v for k, v in epoch_cm_agg.items()}})
+                    cm_parts = []
+                    for k in sorted(epoch_cm_agg.keys()):
+                        s = epoch_cm_agg[k]
+                        cm_parts.append(
+                            f"k={k}: viol={s['frac_violated']:.1%} "
+                            f"pe={s['mean_per_edge']:.4f} "
+                            f"rel={s['mean_relative']:.4f}"
+                        )
+                    cm_summary = " | ".join(cm_parts)
+                    print(f"        CM diagnostic: {cm_summary}")
                 logger.log(algorithm="algo1", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=avg_loss_adv, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy)
                 training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "loss_adv": avg_loss_adv, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy})
     test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
@@ -1276,18 +1595,21 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
             print(f"  {k:4d}  {fv:14.2%}  {mpe:10.6f}  {spe:10.6f}  {mrl:10.6f}  {xrl:10.6f}")
         print("=" * 72 + "\n")
 
-    results = {"algorithm": "algo1_wrm", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics, "cyclical_monotonicity": cm_epochs}
+    results = {"algorithm": "algo1_wrm", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics}
+    if cm_epochs:
+        results["cyclical_monotonicity"] = cm_epochs
     os.makedirs("MNIST", exist_ok=True)
     with open(os.path.join("MNIST", "algo1_wrm_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    # Also save a dedicated CM JSON for easy post-hoc analysis
-    with open(os.path.join("MNIST", "algo1_cm_diagnostics.json"), "w") as f:
-        json.dump({"algorithm": "algo1_wrm", "cm_per_epoch": cm_epochs}, f, indent=2)
+    # Save a dedicated CM JSON only when diagnostics were collected
+    if cm_epochs:
+        with open(os.path.join("MNIST", "algo1_cm_diagnostics.json"), "w") as f:
+            json.dump({"algorithm": "algo1_wrm", "cm_per_epoch": cm_epochs}, f, indent=2)
     return state, {"test": test_metrics}
 
 
 def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainState, ICNNState, Dict[str, Any]]:
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed)
     train_ds, test_ds = load_mnist()
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     state = create_classifier_state(cfg, device)
@@ -1360,7 +1682,7 @@ def train_algorithm_ppa(cfg: TrainConfig, device: torch.device) -> Tuple[TrainSt
     wasted transport (Delta >= 0), yielding a provably stronger adversary
     per Lemma (proj_gain) in the paper.
     """
-    torch.manual_seed(cfg.seed)
+    seed_everything(cfg.seed)
     train_ds, test_ds = load_mnist()
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     state = create_classifier_state(cfg, device)
@@ -1421,16 +1743,86 @@ def train_algorithm_ppa(cfg: TrainConfig, device: torch.device) -> Tuple[TrainSt
 
 
 # ---------------------------------------------------------------------------
+#  Checkpoint saving
+# ---------------------------------------------------------------------------
+CHECKPOINT_DIR = os.path.join("MNIST_checkpoint")
+
+
+def _lambda_str(lam: float) -> str:
+    """Format lambda for filenames: 5.0 -> '5.0', 0.01 -> '0.01'."""
+    return f"{lam:g}"
+
+
+def save_checkpoint_algo1(state: TrainState, cfg: TrainConfig) -> str:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    fname = f"algo1_wrm_lambda{_lambda_str(cfg.lambda_reg)}.pt"
+    path = os.path.join(CHECKPOINT_DIR, fname)
+    torch.save({
+        "algorithm": "algo1_wrm",
+        "model_state_dict": state.model.state_dict(),
+        "optimizer_state_dict": state.opt.state_dict(),
+        "lambda_reg": cfg.lambda_reg,
+        "hyperparameters": asdict(cfg),
+    }, path)
+    print(f"[Algo1] Checkpoint saved to {path}")
+    return path
+
+
+def save_checkpoint_algo2(state: TrainState, icnn_state: ICNNState, cfg: TrainConfig) -> str:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    hidden_str = "_".join(str(h) for h in cfg.icnn_hidden_sizes)
+    fname = f"algo2_icnn_lambda{_lambda_str(cfg.lambda_reg)}_hidden{hidden_str}.pt"
+    path = os.path.join(CHECKPOINT_DIR, fname)
+    torch.save({
+        "algorithm": "algo2_icnn",
+        "model_state_dict": state.model.state_dict(),
+        "optimizer_state_dict": state.opt.state_dict(),
+        "icnn_model_state_dict": icnn_state.model.state_dict(),
+        "icnn_params_vec": icnn_state.params_vec,
+        # Bug 3 fix: persist Adam's moment buffers (m̂_t, v̂_t) and the
+        # persistent leaf tensor so that resumption continues from the
+        # correct optimizer state rather than resetting to t=0.
+        "icnn_inner_param": icnn_state.inner_param.detach().clone(),
+        "icnn_inner_opt_state_dict": icnn_state.inner_opt.state_dict(),
+        "lambda_reg": cfg.lambda_reg,
+        "icnn_hidden_sizes": list(cfg.icnn_hidden_sizes),
+        "hyperparameters": asdict(cfg),
+    }, path)
+    print(f"[Algo2] Checkpoint saved to {path}")
+    return path
+
+
+def save_checkpoint_ppa(state: TrainState, cfg: TrainConfig) -> str:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    fname = f"ppa_lambda{_lambda_str(cfg.lambda_reg)}.pt"
+    path = os.path.join(CHECKPOINT_DIR, fname)
+    torch.save({
+        "algorithm": "ppa_projected_wrm",
+        "model_state_dict": state.model.state_dict(),
+        "optimizer_state_dict": state.opt.state_dict(),
+        "lambda_reg": cfg.lambda_reg,
+        "hyperparameters": asdict(cfg),
+    }, path)
+    print(f"[PPA]   Checkpoint saved to {path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MNIST WRM/ICNN/PPA adversarial training")
+    parser.add_argument("--cm-diagnostics", action="store_true",
+                        help="Enable cyclical monotonicity diagnostics for Algorithm 1")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = TrainConfig(
         batch_size=512,
         num_epochs=30,
         lr_cls=1e-2,
-        lambda_reg=0.05,
-        epoch_clean=10,
+        lambda_reg=0.33,
+        epoch_clean=0,
         max_steps_algo1=None,
         max_steps_algo2=None,
         use_margin_adv_algo1=False,
@@ -1445,20 +1837,38 @@ if __name__ == "__main__":
         inner_lr_ppa=1e-2,
         ppa_num_rounds=4,        # number of (ascent → project) cycles
         max_steps_ppa=None,
+        cm_diagnostics=args.cm_diagnostics,
         seed=0,
     )
     print("Training Algorithm 2 (ICNN transport with BB+Armijo)...")
     state_algo2, icnn_state_algo2, logs_algo2 = train_algorithm_2(cfg, device)
-    
+    save_checkpoint_algo2(state_algo2, icnn_state_algo2, cfg)
+
     print("Training Algorithm 1 (WRM adversarial training)...")
     state_algo1, logs_algo1 = train_algorithm_1(cfg, device)
+    save_checkpoint_algo1(state_algo1, cfg)
 
     print("\nTraining Algorithm 3 (PPA — Projected Particle Ascent)...")
     state_ppa, logs_ppa = train_algorithm_ppa(cfg, device)
+    save_checkpoint_ppa(state_ppa, cfg)
 
 
     _, test_ds = load_mnist()
-    pgd_kwargs = dict(batch_size=cfg.batch_size, eps=2.5, num_steps=20, device=device)
+
+    # FIX Bug 2: reseed all RNGs before evaluation so that the random starts
+    # inside pgd_l2_attack_restarts (torch.randn_like, torch.rand) are identical
+    # across runs.  Without this, the RNG state at eval time is the cumulative
+    # result of all stochastic operations during the three training runs, which
+    # varies with hardware, batch ordering, and any GPU non-determinism.
+    seed_everything(cfg.seed)
+
+    pgd_kwargs = dict(batch_size=cfg.batch_size, eps=2.0, num_steps=40, restarts=5, device=device)
+    # Bug 5 fix: eps=2.0 and num_steps=40 now match the top of the sweep range
+    # (max sweep eps = 2.0, sweep num_steps = 40), making the single-epsilon
+    # report directly comparable to the corresponding sweep entry.
+    # The previous eps=2.5 / num_steps=20 was outside the sweep range and used
+    # a different step size (2*2.5/20=0.25 vs 2*2.0/40=0.1), producing numbers
+    # that could not be compared to any sweep result.
 
     pgd_algo1 = evaluate_pgd(state_algo1, test_ds, **pgd_kwargs)
     print(f"[Algo1] PGD acc={pgd_algo1['acc']*100:.2f}% L2={pgd_algo1['avg_l2']:.4f} Linf={pgd_algo1['avg_linf']:.4f}")
@@ -1533,3 +1943,37 @@ if __name__ == "__main__":
     pgd_results["ppa_pgd_sweep"] = pgd_sweep_ppa
     with open(os.path.join("MNIST", "pgd_evaluation_results.json"), "w") as f:
         json.dump(pgd_results, f, indent=2)
+
+    # ------------------------------------------------------------------
+    #  MNIST-C corruption robustness evaluation
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 72)
+    print("  MNIST-C Corruption Robustness Evaluation")
+    print("=" * 72)
+
+    mnist_c_results = {}
+    for name, st in [("Algo1 (WRM)", state_algo1), ("Algo2 (ICNN)", state_algo2), ("PPA", state_ppa)]:
+        print(f"\n[{name}] Evaluating on MNIST-C corruptions...")
+        res = evaluate_mnist_c(st.model, device, root="data", batch_size=cfg.batch_size)
+        mnist_c_results[name] = res
+
+    # Print comparison table
+    header_corruptions = CORRUPTIONS + ["avg_ood"]
+    algo_names = list(mnist_c_results.keys())
+    print("\n" + "-" * 72)
+    print(f"  {'Corruption':<20}", end="")
+    for aname in algo_names:
+        print(f" | {aname:>14}", end="")
+    print("\n" + "-" * 72)
+    for corr in header_corruptions:
+        label = corr if corr != "avg_ood" else "Avg (OOD only)"
+        print(f"  {label:<20}", end="")
+        for aname in algo_names:
+            val = mnist_c_results[aname].get(corr, 0.0)
+            print(f" | {val:>13.2f}%", end="")
+        print()
+    print("-" * 72)
+
+    # Save MNIST-C results to JSON
+    with open(os.path.join("MNIST", "mnist_c_results.json"), "w") as f:
+        json.dump(mnist_c_results, f, indent=2)
