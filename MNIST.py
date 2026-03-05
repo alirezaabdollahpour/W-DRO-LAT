@@ -2223,7 +2223,7 @@ if __name__ == "__main__":
         batch_size=512,
         num_epochs=50,
         lr_cls=1e-2,
-        lambda_reg=0.33,
+        lambda_reg=0.05,
         epoch_clean=0,
         max_steps_algo1=None,
         max_steps_algo2=None,
@@ -2233,7 +2233,7 @@ if __name__ == "__main__":
         inner_steps_algo2=20,    
         inner_lr_algo1=1e-2,
         bb_alpha0_icnn=1e-2,    
-        icnn_hidden_sizes=(128, 128, 64, 64, 32),
+        icnn_hidden_sizes=(512, 512, 256, 256, 128),
         # PPA parameters
         inner_steps_ppa=5,       # WRM steps per ascent-project round
         inner_lr_ppa=1e-2,
