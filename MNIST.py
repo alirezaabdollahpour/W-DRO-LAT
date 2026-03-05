@@ -3,6 +3,7 @@ import os
 # :4096:8  → 32 KB workspace (safe for all matmul sizes)
 # :16:8    → 128 B workspace (may fail on large matmuls)
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+import copy
 import math
 import csv
 import json
@@ -731,6 +732,38 @@ class TrainConfig:
     # Diagnostics
     cm_diagnostics: bool = False   # cyclical monotonicity diagnostic for Algo1
     seed: int = 0
+    # -----------------------------------------------------------------------
+    # Checkpoint-selection / early-stopping parameters
+    # -----------------------------------------------------------------------
+    # es_val_frac  — fraction of the 60 000-sample MNIST training set held out
+    #   as a validation split.  The split is created once per training run with
+    #   a fixed generator seeded by cfg.seed and is never exposed to gradient
+    #   updates.  0.0833 ≈ 5 000 samples.
+    es_val_frac: float = 0.0833
+    # es_patience  — number of consecutive adversarial epochs with no
+    #   improvement in the validation score before training terminates early.
+    #   Setting this to 0 disables early termination; the best checkpoint is
+    #   still restored at the end.
+    es_patience: int = 5
+    # es_pgd_eps / es_pgd_steps / es_pgd_restarts — PGD-L2 attack parameters
+    #   used to score each checkpoint on the validation split.  Intentionally
+    #   cheaper than the final evaluation (20 steps / 3 restarts vs 40 / 5)
+    #   to keep per-epoch overhead manageable.
+    es_pgd_eps: float = 2.0
+    es_pgd_steps: int = 20
+    es_pgd_restarts: int = 3
+    # es_clean_weight — α in  score = α·val_clean_acc + (1−α)·val_pgd_acc.
+    #
+    #   α = 0.0  (default): select purely on adversarial robustness.  This is
+    #     the theoretically motivated choice: the WRM / ICNN / PPA training
+    #     objectives minimise worst-case risk; the checkpoint criterion should
+    #     be consistent with that objective.  Tsipras et al. (2019) and the
+    #     TRADES bound show that clean and robust accuracy are in tension, so
+    #     their unweighted sum (α = 0.5) has no theoretical grounding and
+    #     systematically over-selects models near the clean-accuracy ceiling.
+    #   α ∈ (0, 1): blended criterion for applications where clean accuracy
+    #     matters; set α to reflect the application's clean/robust trade-off.
+    es_clean_weight: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -777,6 +810,99 @@ def load_mnist():
         return TensorDataset(x, y)
 
     return to_tensor_dataset(train_raw), to_tensor_dataset(test_raw)
+
+
+def split_train_val(
+    dataset: torch.utils.data.Dataset,
+    val_frac: float,
+    seed: int,
+) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
+    """Deterministically split *dataset* into a training and validation subset.
+
+    The split uses a generator seeded independently of the global RNG so it
+    is stable across different training configurations.  MNIST classes are
+    balanced (6 000 samples per class), so unstratified random splitting
+    produces a validation set with class proportions within 1–2% of uniform.
+
+    Parameters
+    ----------
+    val_frac : fraction of samples assigned to the validation set.
+    seed     : seed for the splitting generator.
+
+    Returns
+    -------
+    train_subset, val_subset  — two non-overlapping Subsets of *dataset*.
+    """
+    if not (0.0 < val_frac < 1.0):
+        raise ValueError(f"val_frac must be in (0, 1); got {val_frac}")
+    n       = len(dataset)
+    n_val   = max(1, int(n * val_frac))
+    n_train = n - n_val
+    gen = torch.Generator().manual_seed(seed)
+    return torch.utils.data.random_split(dataset, [n_train, n_val], generator=gen)
+
+
+def compute_val_score(
+    state: "TrainState",
+    val_ds: torch.utils.data.Dataset,
+    cfg: "TrainConfig",
+    device: torch.device,
+    is_clean_phase: bool,
+) -> Tuple[float, float, float]:
+    r"""Score a checkpoint on the held-out validation split.
+
+    During clean warm-up (*is_clean_phase=True*) the model has never been
+    trained adversarially, so PGD accuracy is undefined as a robustness
+    signal.  In that phase the score equals the clean validation accuracy,
+    which is the natural criterion for warm-up checkpointing.
+
+    During adversarial epochs the score is:
+
+        score = α · val_clean_acc + (1 − α) · val_pgd_acc
+
+    where α = cfg.es_clean_weight.
+
+    Choosing α = 0 (the default) selects purely on robustness.  This is
+    consistent with the WRM / ICNN / PPA training objectives which minimise
+    worst-case risk.  The original code used
+
+        score = train_acc_clean + train_adv_acc   (α = 0.5 on *training* data)
+
+    which is wrong for three independent reasons:
+      (a) Evaluated on training data  → optimistic bias; not a generalisation
+          signal.
+      (b) "train_adv_acc" is accuracy against the *training* adversary (WRM
+          gradient ascent / ICNN transport), not against PGD.  The two metrics
+          can diverge substantially, so the selected checkpoint may be the
+          worst under PGD evaluation.
+      (c) Equal weight 1:1 has no theoretical grounding (Tsipras et al. 2019).
+
+    Parameters
+    ----------
+    is_clean_phase : True if the current epoch is a clean warm-up epoch.
+
+    Returns
+    -------
+    (score, val_clean_acc, val_pgd_acc)
+        val_pgd_acc is 0.0 during clean phase (PGD not run).
+    """
+    clean_m = evaluate_clean(state, val_ds, cfg.batch_size, device)
+    val_clean_acc = clean_m["acc"]
+
+    if is_clean_phase:
+        return val_clean_acc, val_clean_acc, 0.0
+
+    pgd_m = evaluate_pgd(
+        state, val_ds, cfg.batch_size,
+        eps=cfg.es_pgd_eps,
+        num_steps=cfg.es_pgd_steps,
+        restarts=cfg.es_pgd_restarts,
+        device=device,
+    )
+    val_pgd_acc = pgd_m["acc"]
+    alpha = cfg.es_clean_weight
+    score = alpha * val_clean_acc + (1.0 - alpha) * val_pgd_acc
+    return score, val_clean_acc, val_pgd_acc
 
 # ---------------------------------------------------------------------------
 #  PGD
@@ -1505,103 +1631,182 @@ def evaluate_mnist_c(model: nn.Module, device: torch.device, root: str = "./data
 
 
 def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainState, Dict[str, Any]]:
+    """WRM adversarial training (Algorithm 1).
+
+    Checkpoint-selection and early-stopping changes vs. the original:
+      - Fix 2/3: validation split held out; never used for gradient updates.
+      - Fix 3:   checkpoints scored by PGD-L2 on val split, not by the
+                 training adversary on training data.
+      - Fix 4:   score = α·val_clean + (1−α)·val_pgd  (α = cfg.es_clean_weight,
+                 default 0); no longer an ad-hoc unweighted sum.
+      - Fix 5:   clean warm-up checkpoints are also saved.
+      - Fix 6:   per-epoch metrics are sample-weighted (not batch-count means).
+      - Fix 1:   genuine early stopping: training breaks when patience is
+                 exhausted (cfg.es_patience > 0).
+    """
     seed_everything(cfg.seed)
-    train_ds, test_ds = load_mnist()
+    train_raw_ds, test_ds = load_mnist()
+    train_ds, val_ds = split_train_val(train_raw_ds, cfg.es_val_frac, cfg.seed)   # Fix 2
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    state = create_classifier_state(cfg, device)
+
+    state  = create_classifier_state(cfg, device)
     logger = CSVLogger(DEFAULT_LOG_PATH, LOG_FIELDNAMES)
     training_logs = []
-    cm_epochs = []   # Cyclical monotonicity diagnostics per adversarial epoch
+    cm_epochs     = []
+
+    best_score    = -float("inf")
+    best_epoch    = -1
+    best_model_sd = None
+    best_opt_sd   = None
+    patience_count = 0          # Fix 1: patience counter
+    in_adv_phase   = False      # resets patience at the clean→adv transition
+
     for epoch in range(cfg.num_epochs):
-        is_clean = epoch < cfg.epoch_clean
+        is_clean  = epoch < cfg.epoch_clean
         num_steps = 0
+        epoch_n   = 0
+
+        # Detect first adversarial epoch; reset patience cleanly.
+        if not is_clean and not in_adv_phase:
+            in_adv_phase   = True
+            patience_count = 0
+
         if is_clean:
-            epoch_loss = 0.0
-            epoch_acc_clean = 0.0
+            # Fix 6: accumulate sample-weighted sums, not batch-count sums.
+            epoch_loss_sum      = 0.0
+            epoch_acc_clean_sum = 0.0
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_algo1 is not None and step >= cfg.max_steps_algo1:
                     break
+                n = x.size(0)
                 state, metrics = train_step_clean(state, (x, y), device)
-                epoch_loss += float(metrics['loss'])
-                epoch_acc_clean += float(metrics['acc_clean'])
+                epoch_loss_sum      += float(metrics['loss'])      * n
+                epoch_acc_clean_sum += float(metrics['acc_clean']) * n
+                epoch_n   += n
                 num_steps += 1
             if num_steps > 0:
-                avg_loss = epoch_loss / num_steps
-                avg_acc_clean = epoch_acc_clean / num_steps
+                avg_loss      = epoch_loss_sum      / epoch_n
+                avg_acc_clean = epoch_acc_clean_sum / epoch_n
                 print(f"[Algo1] Epoch {epoch} (clean) loss={avg_loss:.4f} acc_clean={avg_acc_clean:.4f}")
-                logger.log(algorithm="algo1", phase="train_clean", epoch=epoch, step=num_steps, loss_adv=avg_loss, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=None, w2_proxy=None)
-                training_logs.append({"epoch": epoch, "phase": "clean", "steps": num_steps, "loss": avg_loss, "acc_clean": avg_acc_clean})
+                logger.log(algorithm="algo1", phase="train_clean", epoch=epoch, step=num_steps,
+                           loss_adv=avg_loss, adv_loss=None, cls_loss=None,
+                           acc_clean=avg_acc_clean, acc_adv=None, w2_proxy=None)
+                training_logs.append({"epoch": epoch, "phase": "clean", "steps": num_steps,
+                                       "loss": avg_loss, "acc_clean": avg_acc_clean})
+                # Fix 5: score clean-phase checkpoints on val clean accuracy.
+                score, val_c, _ = compute_val_score(state, val_ds, cfg, device, is_clean_phase=True)
+                print(f"[Algo1] Epoch {epoch}  val_clean={val_c:.4f}  score={score:.4f}")
+                if score > best_score:
+                    best_score    = score
+                    best_epoch    = epoch
+                    best_model_sd = copy.deepcopy(state.model.state_dict())
+                    best_opt_sd   = copy.deepcopy(state.opt.state_dict())
+
         else:
-            epoch_loss_adv = 0.0
-            epoch_acc_clean = 0.0
-            epoch_acc_adv = 0.0
-            epoch_w2_proxy = 0.0
+            # Fix 6: accumulate sample-weighted sums.
+            epoch_loss_adv_sum  = 0.0
+            epoch_acc_clean_sum = 0.0
+            epoch_acc_adv_sum   = 0.0
+            epoch_w2_sum        = 0.0
             epoch_cm_batch_results = []
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_algo1 is not None and step >= cfg.max_steps_algo1:
                     break
+                n = x.size(0)
                 state, metrics = train_step_algo1(state, (x, y), cfg, device)
-                epoch_loss_adv += float(metrics['loss_adv'])
-                epoch_acc_clean += float(metrics['acc_clean'])
-                epoch_acc_adv += float(metrics['acc_adv'])
-                epoch_w2_proxy += float(metrics['w2_proxy'])
+                epoch_loss_adv_sum  += float(metrics['loss_adv'])  * n
+                epoch_acc_clean_sum += float(metrics['acc_clean']) * n
+                epoch_acc_adv_sum   += float(metrics['acc_adv'])   * n
+                epoch_w2_sum        += float(metrics['w2_proxy'])  * n
                 if cfg.cm_diagnostics and 'cm_diagnostics' in metrics:
                     epoch_cm_batch_results.append(metrics['cm_diagnostics'])
+                epoch_n   += n
                 num_steps += 1
             if num_steps > 0:
-                avg_loss_adv = epoch_loss_adv / num_steps
-                avg_acc_clean = epoch_acc_clean / num_steps
-                avg_acc_adv = epoch_acc_adv / num_steps
-                avg_w2_proxy = epoch_w2_proxy / num_steps
-                print(f"[Algo1] Epoch {epoch} (adv) loss_adv={avg_loss_adv:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f}")
-                # Aggregate CM diagnostics across batches for this epoch
+                avg_loss_adv  = epoch_loss_adv_sum  / epoch_n
+                avg_acc_clean = epoch_acc_clean_sum / epoch_n
+                avg_acc_adv   = epoch_acc_adv_sum   / epoch_n
+                avg_w2_proxy  = epoch_w2_sum        / epoch_n
+                print(f"[Algo1] Epoch {epoch} (adv) loss_adv={avg_loss_adv:.4f}"
+                      f" acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f}"
+                      f" W2≈{avg_w2_proxy:.4f}")
                 if cfg.cm_diagnostics and epoch_cm_batch_results:
                     epoch_cm_agg = aggregate_cm_results(epoch_cm_batch_results)
                     cm_epochs.append({"epoch": epoch, "cm": {str(k): v for k, v in epoch_cm_agg.items()}})
-                    cm_parts = []
-                    for k in sorted(epoch_cm_agg.keys()):
-                        s = epoch_cm_agg[k]
-                        cm_parts.append(
-                            f"k={k}: viol={s['frac_violated']:.1%} "
-                            f"pe={s['mean_per_edge']:.4f} "
-                            f"rel={s['mean_relative']:.4f}"
-                        )
-                    cm_summary = " | ".join(cm_parts)
-                    print(f"        CM diagnostic: {cm_summary}")
-                logger.log(algorithm="algo1", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=avg_loss_adv, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy)
-                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "loss_adv": avg_loss_adv, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy})
+                    cm_parts = [
+                        f"k={k}: viol={epoch_cm_agg[k]['frac_violated']:.1%}"
+                        f" pe={epoch_cm_agg[k]['mean_per_edge']:.4f}"
+                        f" rel={epoch_cm_agg[k]['mean_relative']:.4f}"
+                        for k in sorted(epoch_cm_agg.keys())
+                    ]
+                    print(f"        CM diagnostic: {' | '.join(cm_parts)}")
+                logger.log(algorithm="algo1", phase="train_adv", epoch=epoch, step=num_steps,
+                           loss_adv=avg_loss_adv, adv_loss=None, cls_loss=None,
+                           acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy)
+                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps,
+                                       "loss_adv": avg_loss_adv, "acc_clean": avg_acc_clean,
+                                       "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy})
+
+                # Fix 2/3/4: score on held-out val split using PGD.
+                score, val_c, val_p = compute_val_score(
+                    state, val_ds, cfg, device, is_clean_phase=False)
+                print(f"[Algo1] Epoch {epoch}  val_clean={val_c:.4f}"
+                      f"  val_pgd={val_p:.4f}  score={score:.4f}")
+
+                if score > best_score:
+                    best_score    = score
+                    best_epoch    = epoch
+                    best_model_sd = copy.deepcopy(state.model.state_dict())
+                    best_opt_sd   = copy.deepcopy(state.opt.state_dict())
+                    patience_count = 0
+                else:
+                    patience_count += 1
+
+                # Fix 1: break when patience is exhausted.
+                if cfg.es_patience > 0 and patience_count >= cfg.es_patience:
+                    print(f"[Algo1] Early stopping at epoch {epoch}"
+                          f" ({patience_count} adversarial epochs without improvement).")
+                    break
+
+    if best_model_sd is not None:
+        state.model.load_state_dict(best_model_sd)
+        state.opt.load_state_dict(best_opt_sd)
+        print(f"[Algo1] Restored best epoch {best_epoch} (score={best_score:.4f})")
+
     test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
     print("[Algo1] Test:", test_metrics)
-    logger.log(algorithm="algo1", phase="test", epoch=cfg.num_epochs, step=None, loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=None, acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
+    logger.log(algorithm="algo1", phase="test", epoch=cfg.num_epochs, step=None,
+               loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=None,
+               acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
 
-    # ---- Print aggregate CM summary across all adversarial epochs --------
     if cm_epochs:
         all_batch_cm = [e["cm"] for e in cm_epochs]
-        # Re-aggregate: collect all per-epoch aggregated results
         all_k = sorted({int(k) for d in all_batch_cm for k in d})
         print("\n" + "=" * 72)
         print("[Algo1] Cyclical Monotonicity Summary (averaged over adv epochs)")
         print("=" * 72)
-        print(f"  {'k':>4s}  {'Frac Violated':>14s}  {'Mean/Edge':>10s}  {'Std/Edge':>10s}  {'Mean Rel':>10s}  {'Max Rel':>10s}")
+        print(f"  {'k':>4s}  {'Frac Violated':>14s}  {'Mean/Edge':>10s}"
+              f"  {'Std/Edge':>10s}  {'Mean Rel':>10s}  {'Max Rel':>10s}")
         print("-" * 72)
         for k in all_k:
             entries = [d[str(k)] for d in all_batch_cm if str(k) in d]
-            n = len(entries)
-            fv = sum(e["frac_violated"]  for e in entries) / n
-            mpe = sum(e["mean_per_edge"] for e in entries) / n
-            spe = sum(e["std_per_edge"]  for e in entries) / n
-            mrl = sum(e["mean_relative"] for e in entries) / n
-            xrl = max(e["max_relative"]  for e in entries)
-            print(f"  {k:4d}  {fv:14.2%}  {mpe:10.6f}  {spe:10.6f}  {mrl:10.6f}  {xrl:10.6f}")
+            n   = len(entries)
+            fv  = sum(e["frac_violated"]  for e in entries) / n
+            mpe = sum(e["mean_per_edge"]  for e in entries) / n
+            spe = sum(e["std_per_edge"]   for e in entries) / n
+            mrl = sum(e["mean_relative"]  for e in entries) / n
+            xrl = max(e["max_relative"]   for e in entries)
+            print(f"  {k:4d}  {fv:14.2%}  {mpe:10.6f}  {spe:10.6f}"
+                  f"  {mrl:10.6f}  {xrl:10.6f}")
         print("=" * 72 + "\n")
 
-    results = {"algorithm": "algo1_wrm", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics}
+    results = {"algorithm": "algo1_wrm", "hyperparameters": asdict(cfg),
+               "training_logs": training_logs, "test_metrics": test_metrics}
     if cm_epochs:
         results["cyclical_monotonicity"] = cm_epochs
     os.makedirs("MNIST", exist_ok=True)
     with open(os.path.join("MNIST", "algo1_wrm_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    # Save a dedicated CM JSON only when diagnostics were collected
     if cm_epochs:
         with open(os.path.join("MNIST", "algo1_cm_diagnostics.json"), "w") as f:
             json.dump({"algorithm": "algo1_wrm", "cm_per_epoch": cm_epochs}, f, indent=2)
@@ -1609,65 +1814,165 @@ def train_algorithm_1(cfg: TrainConfig, device: torch.device) -> Tuple[TrainStat
 
 
 def train_algorithm_2(cfg: TrainConfig, device: torch.device) -> Tuple[TrainState, ICNNState, Dict[str, Any]]:
+    """ICNN transport adversarial training (Algorithm 2).
+
+    Checkpoint-selection / early-stopping uses a held-out val split scored
+    by PGD-L2.  See train_algorithm_1 docstring and TrainConfig.es_* fields.
+    """
     seed_everything(cfg.seed)
-    train_ds, test_ds = load_mnist()
+    train_raw_ds, test_ds = load_mnist()
+    train_ds, val_ds = split_train_val(train_raw_ds, cfg.es_val_frac, cfg.seed)   # Fix 2
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    state = create_classifier_state(cfg, device)
-    logger = CSVLogger(DEFAULT_LOG_PATH, LOG_FIELDNAMES)
+
+    state     = create_classifier_state(cfg, device)
+    logger    = CSVLogger(DEFAULT_LOG_PATH, LOG_FIELDNAMES)
     training_logs = []
     input_dim = 28 * 28 * 1
     icnn_state = create_icnn_state(cfg, input_dim, device)
+
+    best_score             = -float("inf")
+    best_epoch             = -1
+    best_model_sd          = None
+    best_opt_sd            = None
+    best_icnn_sd           = None
+    best_icnn_params_vec   = None
+    best_icnn_inner_param  = None
+    best_icnn_inner_opt_sd = None
+    patience_count = 0          # Fix 1
+    in_adv_phase   = False
+
+    def _save_best():
+        return (
+            copy.deepcopy(state.model.state_dict()),
+            copy.deepcopy(state.opt.state_dict()),
+            copy.deepcopy(icnn_state.model.state_dict()),
+            icnn_state.params_vec.detach().clone(),
+            icnn_state.inner_param.detach().clone(),
+            copy.deepcopy(icnn_state.inner_opt.state_dict()),
+        )
+
     for epoch in range(cfg.num_epochs):
-        is_clean = epoch < cfg.epoch_clean
+        is_clean  = epoch < cfg.epoch_clean
         num_steps = 0
+        epoch_n   = 0
+
+        if not is_clean and not in_adv_phase:
+            in_adv_phase   = True
+            patience_count = 0
+
         if is_clean:
-            epoch_loss = 0.0
-            epoch_acc_clean = 0.0
+            # Fix 6: sample-weighted sums.
+            epoch_loss_sum      = 0.0
+            epoch_acc_clean_sum = 0.0
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_algo2 is not None and step >= cfg.max_steps_algo2:
                     break
+                n = x.size(0)
                 state, metrics = train_step_clean(state, (x, y), device)
-                epoch_loss += float(metrics['loss'])
-                epoch_acc_clean += float(metrics['acc_clean'])
+                epoch_loss_sum      += float(metrics['loss'])      * n
+                epoch_acc_clean_sum += float(metrics['acc_clean']) * n
+                epoch_n   += n
                 num_steps += 1
             if num_steps > 0:
-                avg_loss = epoch_loss / num_steps
-                avg_acc_clean = epoch_acc_clean / num_steps
+                avg_loss      = epoch_loss_sum      / epoch_n
+                avg_acc_clean = epoch_acc_clean_sum / epoch_n
                 print(f"[Algo2] Epoch {epoch} (clean) loss={avg_loss:.4f} acc_clean={avg_acc_clean:.4f}")
-                logger.log(algorithm="algo2", phase="train_clean", epoch=epoch, step=num_steps, loss_adv=None, adv_loss=None, cls_loss=avg_loss, acc_clean=avg_acc_clean, acc_adv=None, w2_proxy=None)
-                training_logs.append({"epoch": epoch, "phase": "clean", "steps": num_steps, "loss": avg_loss, "acc_clean": avg_acc_clean})
+                logger.log(algorithm="algo2", phase="train_clean", epoch=epoch, step=num_steps,
+                           loss_adv=None, adv_loss=None, cls_loss=avg_loss,
+                           acc_clean=avg_acc_clean, acc_adv=None, w2_proxy=None)
+                training_logs.append({"epoch": epoch, "phase": "clean", "steps": num_steps,
+                                       "loss": avg_loss, "acc_clean": avg_acc_clean})
+                # Fix 5: checkpoint clean-phase models.
+                score, val_c, _ = compute_val_score(state, val_ds, cfg, device, is_clean_phase=True)
+                print(f"[Algo2] Epoch {epoch}  val_clean={val_c:.4f}  score={score:.4f}")
+                if score > best_score:
+                    best_score = score
+                    best_epoch = epoch
+                    (best_model_sd, best_opt_sd, best_icnn_sd,
+                     best_icnn_params_vec, best_icnn_inner_param,
+                     best_icnn_inner_opt_sd) = _save_best()
+
         else:
-            epoch_adv_loss = 0.0
-            epoch_cls_loss = 0.0
-            epoch_acc_clean = 0.0
-            epoch_acc_adv = 0.0
-            epoch_w2_proxy = 0.0
-            epoch_inner_grad_norm = 0.0
+            # Fix 6: sample-weighted sums.
+            epoch_adv_loss_sum   = 0.0
+            epoch_cls_loss_sum   = 0.0
+            epoch_acc_clean_sum  = 0.0
+            epoch_acc_adv_sum    = 0.0
+            epoch_w2_sum         = 0.0
+            epoch_inner_grad_sum = 0.0
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_algo2 is not None and step >= cfg.max_steps_algo2:
                     break
+                n = x.size(0)
                 state, icnn_state, metrics = train_step_algo2(state, icnn_state, (x, y), cfg, device)
-                epoch_adv_loss += float(metrics['adv_loss'])
-                epoch_cls_loss += float(metrics['cls_loss'])
-                epoch_acc_clean += float(metrics['acc_clean'])
-                epoch_acc_adv += float(metrics['acc_adv'])
-                epoch_w2_proxy += float(metrics['w2_proxy'])
-                epoch_inner_grad_norm += float(metrics['inner_grad_norm'])
+                epoch_adv_loss_sum   += float(metrics['adv_loss'])        * n
+                epoch_cls_loss_sum   += float(metrics['cls_loss'])        * n
+                epoch_acc_clean_sum  += float(metrics['acc_clean'])       * n
+                epoch_acc_adv_sum    += float(metrics['acc_adv'])         * n
+                epoch_w2_sum         += float(metrics['w2_proxy'])        * n
+                epoch_inner_grad_sum += float(metrics['inner_grad_norm']) * n
+                epoch_n   += n
                 num_steps += 1
             if num_steps > 0:
-                avg_adv_loss = epoch_adv_loss / num_steps
-                avg_cls_loss = epoch_cls_loss / num_steps
-                avg_acc_clean = epoch_acc_clean / num_steps
-                avg_acc_adv = epoch_acc_adv / num_steps
-                avg_w2_proxy = epoch_w2_proxy / num_steps
-                avg_inner_grad_norm = epoch_inner_grad_norm / num_steps
-                print(f"[Algo2] Epoch {epoch} (adv) adv_loss={avg_adv_loss:.4f} cls_loss={avg_cls_loss:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f} |∇θ|={avg_inner_grad_norm:.6f}")
-                logger.log(algorithm="algo2", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=None, adv_loss=avg_adv_loss, cls_loss=avg_cls_loss, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy, inner_grad_norm=avg_inner_grad_norm)
-                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "adv_loss": avg_adv_loss, "cls_loss": avg_cls_loss, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy, "inner_grad_norm": avg_inner_grad_norm})
+                avg_adv_loss        = epoch_adv_loss_sum   / epoch_n
+                avg_cls_loss        = epoch_cls_loss_sum   / epoch_n
+                avg_acc_clean       = epoch_acc_clean_sum  / epoch_n
+                avg_acc_adv         = epoch_acc_adv_sum    / epoch_n
+                avg_w2_proxy        = epoch_w2_sum         / epoch_n
+                avg_inner_grad_norm = epoch_inner_grad_sum / epoch_n
+                print(f"[Algo2] Epoch {epoch} (adv) adv_loss={avg_adv_loss:.4f}"
+                      f" cls_loss={avg_cls_loss:.4f} acc_clean={avg_acc_clean:.4f}"
+                      f" acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f}"
+                      f" |∇θ|={avg_inner_grad_norm:.6f}")
+                logger.log(algorithm="algo2", phase="train_adv", epoch=epoch, step=num_steps,
+                           loss_adv=None, adv_loss=avg_adv_loss, cls_loss=avg_cls_loss,
+                           acc_clean=avg_acc_clean, acc_adv=avg_acc_adv,
+                           w2_proxy=avg_w2_proxy, inner_grad_norm=avg_inner_grad_norm)
+                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps,
+                                       "adv_loss": avg_adv_loss, "cls_loss": avg_cls_loss,
+                                       "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv,
+                                       "w2_proxy": avg_w2_proxy,
+                                       "inner_grad_norm": avg_inner_grad_norm})
+
+                # Fix 2/3/4: val PGD score.
+                score, val_c, val_p = compute_val_score(
+                    state, val_ds, cfg, device, is_clean_phase=False)
+                print(f"[Algo2] Epoch {epoch}  val_clean={val_c:.4f}"
+                      f"  val_pgd={val_p:.4f}  score={score:.4f}")
+
+                if score > best_score:
+                    best_score = score
+                    best_epoch = epoch
+                    (best_model_sd, best_opt_sd, best_icnn_sd,
+                     best_icnn_params_vec, best_icnn_inner_param,
+                     best_icnn_inner_opt_sd) = _save_best()
+                    patience_count = 0
+                else:
+                    patience_count += 1
+
+                # Fix 1: actual early stopping.
+                if cfg.es_patience > 0 and patience_count >= cfg.es_patience:
+                    print(f"[Algo2] Early stopping at epoch {epoch}"
+                          f" ({patience_count} adversarial epochs without improvement).")
+                    break
+
+    if best_model_sd is not None:
+        state.model.load_state_dict(best_model_sd)
+        state.opt.load_state_dict(best_opt_sd)
+        icnn_state.model.load_state_dict(best_icnn_sd)
+        icnn_state.params_vec = best_icnn_params_vec
+        icnn_state.inner_param.data.copy_(best_icnn_inner_param)
+        icnn_state.inner_opt.load_state_dict(best_icnn_inner_opt_sd)
+        print(f"[Algo2] Restored best epoch {best_epoch} (score={best_score:.4f})")
+
     test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
     print("[Algo2] Test:", test_metrics)
-    logger.log(algorithm="algo2", phase="test", epoch=cfg.num_epochs, step=None, loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=float(test_metrics["loss"]), acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
-    results = {"algorithm": "algo2_icnn", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics}
+    logger.log(algorithm="algo2", phase="test", epoch=cfg.num_epochs, step=None,
+               loss_adv=float(test_metrics["loss"]), adv_loss=None,
+               cls_loss=float(test_metrics["loss"]),
+               acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
+    results = {"algorithm": "algo2_icnn", "hyperparameters": asdict(cfg),
+               "training_logs": training_logs, "test_metrics": test_metrics}
     os.makedirs("MNIST", exist_ok=True)
     with open(os.path.join("MNIST", "algo2_icnn_results.json"), "w") as f:
         json.dump(results, f, indent=2)
@@ -1681,61 +1986,136 @@ def train_algorithm_ppa(cfg: TrainConfig, device: torch.device) -> Tuple[TrainSt
     (WRM ascent → Brenier projection) cycles.  Each projection eliminates
     wasted transport (Delta >= 0), yielding a provably stronger adversary
     per Lemma (proj_gain) in the paper.
+
+    Checkpoint-selection / early-stopping uses a held-out val split scored
+    by PGD-L2.  See train_algorithm_1 docstring and TrainConfig.es_* fields.
     """
     seed_everything(cfg.seed)
-    train_ds, test_ds = load_mnist()
+    train_raw_ds, test_ds = load_mnist()
+    train_ds, val_ds = split_train_val(train_raw_ds, cfg.es_val_frac, cfg.seed)   # Fix 2
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    state = create_classifier_state(cfg, device)
+
+    state  = create_classifier_state(cfg, device)
     logger = CSVLogger(DEFAULT_LOG_PATH, LOG_FIELDNAMES)
     training_logs = []
+
+    best_score    = -float("inf")
+    best_epoch    = -1
+    best_model_sd = None
+    best_opt_sd   = None
+    patience_count = 0          # Fix 1
+    in_adv_phase   = False
+
     for epoch in range(cfg.num_epochs):
-        is_clean = epoch < cfg.epoch_clean
+        is_clean  = epoch < cfg.epoch_clean
         num_steps = 0
+        epoch_n   = 0
+
+        if not is_clean and not in_adv_phase:
+            in_adv_phase   = True
+            patience_count = 0
+
         if is_clean:
-            epoch_loss = 0.0
-            epoch_acc_clean = 0.0
+            # Fix 6: sample-weighted sums.
+            epoch_loss_sum      = 0.0
+            epoch_acc_clean_sum = 0.0
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_ppa is not None and step >= cfg.max_steps_ppa:
                     break
+                n = x.size(0)
                 state, metrics = train_step_clean(state, (x, y), device)
-                epoch_loss += float(metrics['loss'])
-                epoch_acc_clean += float(metrics['acc_clean'])
+                epoch_loss_sum      += float(metrics['loss'])      * n
+                epoch_acc_clean_sum += float(metrics['acc_clean']) * n
+                epoch_n   += n
                 num_steps += 1
             if num_steps > 0:
-                avg_loss = epoch_loss / num_steps
-                avg_acc_clean = epoch_acc_clean / num_steps
+                avg_loss      = epoch_loss_sum      / epoch_n
+                avg_acc_clean = epoch_acc_clean_sum / epoch_n
                 print(f"[PPA] Epoch {epoch} (clean) loss={avg_loss:.4f} acc_clean={avg_acc_clean:.4f}")
-                logger.log(algorithm="ppa", phase="train_clean", epoch=epoch, step=num_steps, loss_adv=avg_loss, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=None, w2_proxy=None)
-                training_logs.append({"epoch": epoch, "phase": "clean", "steps": num_steps, "loss": avg_loss, "acc_clean": avg_acc_clean})
+                logger.log(algorithm="ppa", phase="train_clean", epoch=epoch, step=num_steps,
+                           loss_adv=avg_loss, adv_loss=None, cls_loss=None,
+                           acc_clean=avg_acc_clean, acc_adv=None, w2_proxy=None)
+                training_logs.append({"epoch": epoch, "phase": "clean", "steps": num_steps,
+                                       "loss": avg_loss, "acc_clean": avg_acc_clean})
+                # Fix 5: checkpoint clean-phase models.
+                score, val_c, _ = compute_val_score(state, val_ds, cfg, device, is_clean_phase=True)
+                print(f"[PPA]   Epoch {epoch}  val_clean={val_c:.4f}  score={score:.4f}")
+                if score > best_score:
+                    best_score    = score
+                    best_epoch    = epoch
+                    best_model_sd = copy.deepcopy(state.model.state_dict())
+                    best_opt_sd   = copy.deepcopy(state.opt.state_dict())
+
         else:
-            epoch_loss_adv = 0.0
-            epoch_acc_clean = 0.0
-            epoch_acc_adv = 0.0
-            epoch_w2_proxy = 0.0
-            epoch_delta_gap = 0.0
+            # Fix 6: sample-weighted sums.
+            epoch_loss_adv_sum  = 0.0
+            epoch_acc_clean_sum = 0.0
+            epoch_acc_adv_sum   = 0.0
+            epoch_w2_sum        = 0.0
+            epoch_delta_sum     = 0.0
             for step, (x, y) in enumerate(train_loader):
                 if cfg.max_steps_ppa is not None and step >= cfg.max_steps_ppa:
                     break
+                n = x.size(0)
                 state, metrics = train_step_ppa(state, (x, y), cfg, device)
-                epoch_loss_adv += float(metrics['loss_adv'])
-                epoch_acc_clean += float(metrics['acc_clean'])
-                epoch_acc_adv += float(metrics['acc_adv'])
-                epoch_w2_proxy += float(metrics['w2_proxy'])
-                epoch_delta_gap += float(metrics['delta_gap'])
+                epoch_loss_adv_sum  += float(metrics['loss_adv'])  * n
+                epoch_acc_clean_sum += float(metrics['acc_clean']) * n
+                epoch_acc_adv_sum   += float(metrics['acc_adv'])   * n
+                epoch_w2_sum        += float(metrics['w2_proxy'])  * n
+                epoch_delta_sum     += float(metrics['delta_gap']) * n
+                epoch_n   += n
                 num_steps += 1
             if num_steps > 0:
-                avg_loss_adv = epoch_loss_adv / num_steps
-                avg_acc_clean = epoch_acc_clean / num_steps
-                avg_acc_adv = epoch_acc_adv / num_steps
-                avg_w2_proxy = epoch_w2_proxy / num_steps
-                avg_delta_gap = epoch_delta_gap / num_steps
-                print(f"[PPA] Epoch {epoch} (adv) loss_adv={avg_loss_adv:.4f} acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f} W2≈{avg_w2_proxy:.4f} Δ={avg_delta_gap:.4f}")
-                logger.log(algorithm="ppa", phase="train_adv", epoch=epoch, step=num_steps, loss_adv=avg_loss_adv, adv_loss=None, cls_loss=None, acc_clean=avg_acc_clean, acc_adv=avg_acc_adv, w2_proxy=avg_w2_proxy, delta_gap=avg_delta_gap)
-                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps, "loss_adv": avg_loss_adv, "acc_clean": avg_acc_clean, "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy, "delta_gap": avg_delta_gap})
+                avg_loss_adv  = epoch_loss_adv_sum  / epoch_n
+                avg_acc_clean = epoch_acc_clean_sum / epoch_n
+                avg_acc_adv   = epoch_acc_adv_sum   / epoch_n
+                avg_w2_proxy  = epoch_w2_sum        / epoch_n
+                avg_delta_gap = epoch_delta_sum     / epoch_n
+                print(f"[PPA] Epoch {epoch} (adv) loss_adv={avg_loss_adv:.4f}"
+                      f" acc_clean={avg_acc_clean:.4f} acc_adv={avg_acc_adv:.4f}"
+                      f" W2≈{avg_w2_proxy:.4f} Δ={avg_delta_gap:.4f}")
+                logger.log(algorithm="ppa", phase="train_adv", epoch=epoch, step=num_steps,
+                           loss_adv=avg_loss_adv, adv_loss=None, cls_loss=None,
+                           acc_clean=avg_acc_clean, acc_adv=avg_acc_adv,
+                           w2_proxy=avg_w2_proxy, delta_gap=avg_delta_gap)
+                training_logs.append({"epoch": epoch, "phase": "adv", "steps": num_steps,
+                                       "loss_adv": avg_loss_adv, "acc_clean": avg_acc_clean,
+                                       "acc_adv": avg_acc_adv, "w2_proxy": avg_w2_proxy,
+                                       "delta_gap": avg_delta_gap})
+
+                # Fix 2/3/4: val PGD score.
+                score, val_c, val_p = compute_val_score(
+                    state, val_ds, cfg, device, is_clean_phase=False)
+                print(f"[PPA]   Epoch {epoch}  val_clean={val_c:.4f}"
+                      f"  val_pgd={val_p:.4f}  score={score:.4f}")
+
+                if score > best_score:
+                    best_score    = score
+                    best_epoch    = epoch
+                    best_model_sd = copy.deepcopy(state.model.state_dict())
+                    best_opt_sd   = copy.deepcopy(state.opt.state_dict())
+                    patience_count = 0
+                else:
+                    patience_count += 1
+
+                # Fix 1: actual early stopping.
+                if cfg.es_patience > 0 and patience_count >= cfg.es_patience:
+                    print(f"[PPA]   Early stopping at epoch {epoch}"
+                          f" ({patience_count} adversarial epochs without improvement).")
+                    break
+
+    if best_model_sd is not None:
+        state.model.load_state_dict(best_model_sd)
+        state.opt.load_state_dict(best_opt_sd)
+        print(f"[PPA] Restored best epoch {best_epoch} (score={best_score:.4f})")
+
     test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
     print("[PPA] Test:", test_metrics)
-    logger.log(algorithm="ppa", phase="test", epoch=cfg.num_epochs, step=None, loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=None, acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
-    results = {"algorithm": "ppa_projected_wrm", "hyperparameters": asdict(cfg), "training_logs": training_logs, "test_metrics": test_metrics}
+    logger.log(algorithm="ppa", phase="test", epoch=cfg.num_epochs, step=None,
+               loss_adv=float(test_metrics["loss"]), adv_loss=None, cls_loss=None,
+               acc_clean=float(test_metrics["acc"]), acc_adv=None, w2_proxy=None)
+    results = {"algorithm": "ppa_projected_wrm", "hyperparameters": asdict(cfg),
+               "training_logs": training_logs, "test_metrics": test_metrics}
     os.makedirs("MNIST", exist_ok=True)
     with open(os.path.join("MNIST", "ppa_results.json"), "w") as f:
         json.dump(results, f, indent=2)
