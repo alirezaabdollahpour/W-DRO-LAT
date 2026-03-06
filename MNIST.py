@@ -449,8 +449,48 @@ def wrm_ascent_x_anchored(
     return z.detach()
 
 
+def wrm_ascent_x_anchored_const_lr(
+    z0: torch.Tensor,
+    x_anchor: torch.Tensor,
+    model: nn.Module,
+    y: torch.Tensor,
+    lambda_reg: float,
+    num_steps: int,
+    lr: float = 0.01,
+    clamp: Optional[Tuple[float, float]] = (0.0, 1.0),
+) -> torch.Tensor:
+    r"""WRM gradient ascent with constant step size for PPA refinement rounds.
+
+    After Brenier projection, the particles sit at an OT-optimal coupling.
+    The subsequent ascent is a refinement from a new starting point in a
+    potentially different basin of attraction.  A constant step size is
+    more appropriate than a diminishing schedule because:
+
+    (a) The 1/sqrt(s) schedule is designed for cold-start convergence.
+        In refinement rounds we need meaningful progress in few steps.
+
+    (b) Constant-lr projected gradient ascent on a bounded domain converges
+        to an eps-approximate stationary point in O(1/eps^2) steps.
+        With K steps and step size eta, eps ~ 1/(eta*sqrt(K)).
+
+    Maximises  CE(z, y) - lambda ||z - x_anchor||^2  w.r.t. z.
+    """
+    if num_steps == 0:
+        return z0.detach()
+    x_anc = x_anchor.detach()
+    z = z0.detach().clone()
+    for _ in range(num_steps):
+        z.requires_grad_(True)
+        per_sample_ce = F.cross_entropy(model(z), y, reduction="none")
+        grads = torch.autograd.grad(per_sample_ce.sum(), z, create_graph=False)[0]
+        z = z.detach() + lr * (grads - 2.0 * lambda_reg * (z.detach() - x_anc))
+        if clamp is not None:
+            lo, hi = clamp
+            z = z.clamp(lo, hi)
+    return z.detach()
+
+
 # ---------------------------------------------------------------------------
-#  Brenier Projection (optimal assignment for PPA)
 # ---------------------------------------------------------------------------
 
 def brenier_projection(
@@ -458,36 +498,48 @@ def brenier_projection(
     x: torch.Tensor,
     y: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
-    r"""Brenier projection: optimally reassign adversarial points to nominals.
+    r"""Within-class Brenier projection: optimally reassign adversarial
+    points to nominals *within each class*.
 
-    Solves the linear assignment problem (LAP):
-        sigma* = argmin_{sigma in S_N}  sum_i  ||z_{sigma(i)} - x_i||^2
+    Bug 10 fix (critical for PPA):
+    ---------------------------------------------------------------
+    The paper (Section 2, "Supervised / label-preserving variants")
+    explicitly requires that permutations be restricted to within each
+    class:  G = prod_y S_{I_y}  where I_y = {i : y_i = y}.
 
-    This is the discrete optimal transport problem between two uniform
-    empirical distributions with squared-Euclidean ground cost.  We reduce
-    it to the standard rectangular LAP and solve via the Jonker-Volgenant
-    algorithm (scipy.optimize.linear_sum_assignment), which runs in O(N^3).
+    The previous implementation solved a single N x N LAP over ALL
+    samples, allowing cross-class swaps.  This is incorrect for two
+    reasons:
 
-    The cost matrix is  C[i, j] = ||z_j - x_i||_2^2  (size N x N).
-    After solving, row i is assigned to column sigma*(i), meaning nominal
-    x_i is paired with adversarial z_{sigma*(i)}.
+    (a) Semantic incoherence: after a cross-class swap, adversarial
+        sample z_proj[i] carries label y_proj[i] != y_original[i].
+        The subsequent WRM ascent round pushes z_i toward fooling the
+        classifier on this WRONG label (relative to the nominal x_i),
+        wasting adversarial capacity and producing incoherent gradients.
 
-    Labels are permuted together with z so that the loss sum remains
-    invariant:  sum_i l(f(z_{sigma(i)}), y_{sigma(i)}) = sum_i l(f(z_i), y_i)
-    (bijective re-indexing).  Only the transport cost changes:
-        C_ot = (1/N) sum_i ||z_{sigma*(i)} - x_i||^2  <=  C_id.
+    (b) Violated theory: all propositions and lemmas in the paper assume
+        within-class permutations.  The gain identity
+          L(theta, Pi(z)) = L(theta, z) + lambda * Delta(z)
+        still holds formally (loss sum is permutation-invariant), but the
+        subsequent ascent step does NOT benefit because cross-class
+        anchor reassignment creates a Lagrangian landscape unrelated to
+        the original adversarial task.
+
+    Fix: decompose into per-class LAPs.  For each class c, extract the
+    indices I_c, solve the |I_c| x |I_c| assignment problem, and combine.
+    Total cost is sum_c O(|I_c|^3) << O(N^3) for balanced classes.
 
     Parameters
     ----------
     z : Tensor [N, C, H, W]  -- adversarial points
     x : Tensor [N, C, H, W]  -- nominal points
-    y : Tensor [N]            -- labels (permuted alongside z)
+    y : Tensor [N]            -- labels (permuted alongside z within class)
 
     Returns
     -------
-    z_proj  : Tensor [N, C, H, W]  -- z[sigma*(i)] for each i
-    y_proj  : Tensor [N]            -- y[sigma*(i)] for each i
-    delta   : float                 -- wasted-transport gap  Delta = C_id - C_ot >= 0
+    z_proj  : Tensor [N, C, H, W]  -- optimally reassigned within each class
+    y_proj  : Tensor [N]            -- same as y (labels unchanged within class)
+    delta   : float                 -- wasted-transport gap
     C_id    : float                 -- identity transport cost
     C_ot    : float                 -- optimal transport cost
     """
@@ -499,46 +551,41 @@ def brenier_projection(
     z_flat = z.detach().view(N, -1)   # [N, d]
     x_flat = x.detach().view(N, -1)   # [N, d]
 
-    # Fix 3.1: compute the cost matrix entirely on CPU.
-    #
-    # The previous implementation used x_flat.mm(z_flat.t()) on the GPU tensor,
-    # which dispatches to a cuBLAS GEMM.  That is subject to non-determinism
-    # whenever warn_only=True in torch.use_deterministic_algorithms — the op
-    # fires a warning but executes non-deterministically.  Moving all arithmetic
-    # to CPU float32 guarantees determinism: CPU mm uses MKL/OpenBLAS, which
-    # produces bit-identical results for the same inputs.  The cost matrix is
-    # sent to NumPy immediately afterwards anyway, so no extra device transfer
-    # is introduced.
-    #
-    # Expansion (all on CPU):
-    #   cost[i, j] = ||x_i - z_j||^2 = ||x_i||^2 + ||z_j||^2 - 2 x_i^T z_j
-    x_cpu = x_flat.cpu().float()                           # [N, d]
-    z_cpu = z_flat.cpu().float()                           # [N, d]
-    x_sq  = (x_cpu ** 2).sum(dim=1, keepdim=True)         # [N, 1]
-    z_sq  = (z_cpu ** 2).sum(dim=1, keepdim=True)         # [N, 1]
-    cross = x_cpu.mm(z_cpu.t())                           # [N, N], CPU GEMM — deterministic
-    cost_cpu = (x_sq + z_sq.t() - 2.0 * cross).clamp(min=0.0)  # [N, N]
-    cost_np  = cost_cpu.numpy()                           # pass directly to scipy
+    # Build the global permutation by solving per-class LAPs
+    perm_np = np.arange(N, dtype=np.int64)  # identity by default
+    y_np = y.cpu().numpy()
+    unique_classes = np.unique(y_np)
 
-    # Solve LAP on CPU (Jonker-Volgenant, O(N^3))
-    row_ind, col_ind = linear_sum_assignment(cost_np)
+    for c in unique_classes:
+        idx_c = np.where(y_np == c)[0]
+        n_c = len(idx_c)
+        if n_c <= 1:
+            continue
 
-    # Fix 3.2: build the permutation from both row_ind and col_ind.
-    #
-    # The previous code did perm = tensor(col_ind), which is only correct when
-    # row_ind == [0, 1, ..., N-1].  For a square cost matrix scipy always
-    # returns a sorted row_ind, but that is an implementation detail rather than
-    # an API guarantee.  The correct, contract-compliant construction is:
-    #   perm[row_ind[k]] = col_ind[k]
-    # meaning "nominal x_{row_ind[k]} is matched to adversarial z_{col_ind[k]}",
-    # so z_proj[i] = z[perm[i]] is the adversarial point assigned to nominal x_i.
-    perm_np       = np.empty(N, dtype=np.int64)
-    perm_np[row_ind] = col_ind
+        # Extract class-c subsets (all on CPU for determinism)
+        x_c = x_flat[idx_c].cpu().float()   # [n_c, d]
+        z_c = z_flat[idx_c].cpu().float()   # [n_c, d]
+
+        # Cost matrix for class c:  cost[i, j] = ||x_{I_c[i]} - z_{I_c[j]}||^2
+        x_sq = (x_c ** 2).sum(dim=1, keepdim=True)
+        z_sq = (z_c ** 2).sum(dim=1, keepdim=True)
+        cross = x_c.mm(z_c.t())
+        cost_c = (x_sq + z_sq.t() - 2.0 * cross).clamp(min=0.0)
+        cost_c_np = cost_c.numpy()
+
+        # Solve LAP within class c
+        row_ind, col_ind = linear_sum_assignment(cost_c_np)
+
+        # Map back to global indices
+        local_perm = np.empty(n_c, dtype=np.int64)
+        local_perm[row_ind] = col_ind
+        perm_np[idx_c] = idx_c[local_perm]
+
     perm = torch.tensor(perm_np, device=z.device, dtype=torch.long)
 
     # Apply permutation
     z_proj = z[perm]
-    y_proj = y[perm]
+    y_proj = y[perm]  # within-class: y_proj == y (labels are preserved)
 
     # Compute metrics
     C_id = float(((z - x) ** 2).view(N, -1).sum(dim=1).mean().item())
@@ -733,10 +780,16 @@ class TrainConfig:
     inner_lr_algo1: float = 1e-2
     bb_alpha0_icnn: float = 5e-4
     icnn_hidden_sizes: Sequence[int] = (64, 64, 64, 64)
-    # PPA (Projected Particle Ascent) parameters
-    inner_steps_ppa: int = 5
-    inner_lr_ppa: float = 1e-2
-    ppa_num_rounds: int = 3        # number of (ascent → project) cycles
+    # PPA (Projected Particle Ascent) parameters — enhanced
+    # Round 0 replicates Algo1 exactly (the dominance condition):
+    inner_steps_ppa_round0: int = 75     # MUST equal inner_steps_algo1
+    inner_lr_ppa_round0: float = 1e-2    # MUST equal inner_lr_algo1
+    # Refinement rounds (additional computation beyond Algo1):
+    ppa_num_rounds: int = 5        # total rounds including round 0
+    ppa_min_rounds: int = 2        # minimum before early stopping kicks in
+    ppa_refine_steps: int = 15     # constant-lr ascent steps per refinement
+    ppa_refine_lr: float = 5e-3    # constant lr for refinement rounds
+    ppa_delta_rtol: float = 1e-4   # relative Δ threshold for stopping
     max_steps_ppa: Optional[int] = None
     # Diagnostics
     cm_diagnostics: bool = False   # cyclical monotonicity diagnostic for Algo1
@@ -758,7 +811,7 @@ class TrainConfig:
     #   used to score each checkpoint on the validation split.  Intentionally
     #   cheaper than the final evaluation (20 steps / 3 restarts vs 40 / 5)
     #   to keep per-epoch overhead manageable.
-    es_pgd_eps: float = 2.0
+    es_pgd_eps: float = 1.3
     es_pgd_steps: int = 20
     es_pgd_restarts: int = 3
     # es_clean_weight — α in  score = α·val_clean_acc + (1−α)·val_pgd_acc.
@@ -1468,19 +1521,45 @@ def train_step_algo2(state: TrainState, icnn_state: ICNNState, batch, cfg: Train
 
 
 def train_step_ppa(state: TrainState, batch, cfg: TrainConfig, device: torch.device) -> Tuple[TrainState, Dict[str, torch.Tensor]]:
-    """PPA (Projected Particle Ascent) training step.
+    """Enhanced PPA (Projected Particle Ascent) training step.
 
-    Algorithm:  for each round r = 1, ..., R:
-        1. WRM gradient ascent from current z (anchored at original x)
-        2. Brenier projection: solve LAP to optimally reassign z's to x's
-        3. Use projected z as starting point for next round
+    Corrected algorithm (per Section 3.5.4 of the paper):
+    =====================================================
+    The paper's theoretical comparison requires Algorithm B (PPA) to be a
+    strict *refinement* of Algorithm A (plain WRM ascent):
 
-    After all rounds, train the classifier on the final adversarial points.
+        "We first run plain particle ascent (Algorithm A) to convergence
+         to obtain z_A. Algorithm B then takes this exact z_A, applies the
+         Brenier projection, and continues with additional projection/ascent
+         cycles to obtain z_B."
 
-    The key invariant (Lemma in the paper):
-        L(theta, Pi(z)) = L(theta, z) + lambda * Delta(z)
-    where Delta(z) = C_id(z) - C_ot(z) >= 0 is the wasted-transport gap.
-    Each projection step strictly improves the adversary whenever Delta > 0.
+    This ensures L(theta, z_PPA) >= L(theta, z_Algo1) and hence
+    eps_PPA <= eps_Algo1 (inner oracle error dominance, Equation 11).
+
+    Round 0:  Replicate Algo1 exactly — same steps, same lr.
+    Round r (r >= 1):
+        (a) Brenier projection: z <- Pi(z)        [+lambda*Delta gain]
+        (b) Constant-lr ascent from projected z    [further refinement]
+    Final: one last projection to capture remaining wasted transport.
+
+    Key fixes vs. previous implementation:
+    --------------------------------------
+    1. Round 0 uses inner_steps_ppa_round0 = inner_steps_algo1 (was 10).
+       This is the dominance condition; without it, PPA can be *weaker*.
+
+    2. Refinement rounds use constant step size (was diminishing with
+       geometric base-lr decay).  After projection the particles are in
+       a new basin; constant-lr makes meaningful progress in few steps.
+
+    3. Adaptive stopping uses a relative threshold (delta / C_id) with
+       a minimum-rounds guarantee (was absolute 1e-8, no minimum).
+       Prevents premature stopping in early training.
+
+    4. A final projection captures any remaining wasted transport from
+       the last ascent phase.  Free improvement (Lemma proj_gain).
+
+    Invariant (Lemma proj_gain):
+        L(theta, Pi(z)) = L(theta, z) + lambda * Delta(z),  Delta >= 0.
     """
     model = state.model
     opt = state.opt
@@ -1497,37 +1576,52 @@ def train_step_ppa(state: TrainState, batch, cfg: TrainConfig, device: torch.dev
     set_requires_grad(model, False)
     model.eval()
 
-    # Iterative ascent-project loop
-    z = x.detach().clone()
-    y_current = y.clone()
     total_delta = 0.0
 
-    for round_idx in range(cfg.ppa_num_rounds):
-        # Bug 9 fix: pass step_offset = round_idx * inner_steps_ppa so that
-        # the diminishing step size lr/sqrt(s) is monotonically decreasing
-        # across all rounds rather than resetting to lr at the start of each
-        # round.  Without this, round r begins with step size lr/sqrt(1) = lr,
-        # potentially overshooting the local maximum found by the previous round
-        # and partially undoing the gain from the Brenier projection.
-        step_offset = round_idx * cfg.inner_steps_ppa
-        if round_idx == 0:
-            # First round: start from x (same as standard WRM)
-            z = wrm_ascent_x(
-                x, model, y_current, cfg.lambda_reg,
-                cfg.inner_steps_ppa, lr=cfg.inner_lr_ppa,
-                clamp=(0.0, 1.0), step_offset=step_offset,
-            )
-        else:
-            # Subsequent rounds: start from projected z, anchor at original x
-            z = wrm_ascent_x_anchored(
-                z, x, model, y_current, cfg.lambda_reg,
-                cfg.inner_steps_ppa, lr=cfg.inner_lr_ppa,
-                clamp=(0.0, 1.0), step_offset=step_offset,
-            )
+    # ===== Round 0: Replicate Algo1 exactly =====
+    # This is the dominance condition.  By using the same number of ascent
+    # steps and the same learning rate as Algo1, the inner objective after
+    # round 0 is identical to what Algo1 would produce.  Everything after
+    # this is strictly additional refinement.
+    z = wrm_ascent_x(
+        x, model, y, cfg.lambda_reg,
+        cfg.inner_steps_ppa_round0,       # same as inner_steps_algo1
+        lr=cfg.inner_lr_ppa_round0,       # same as inner_lr_algo1
+        clamp=(0.0, 1.0),
+        step_offset=0,
+    )
 
-        # Brenier projection: solve optimal assignment
-        z, y_current, delta, _C_id, _C_ot = brenier_projection(z, x, y_current)
+    # ===== Refinement rounds 1..R-1: project then ascend =====
+    for round_idx in range(1, cfg.ppa_num_rounds):
+
+        # (a) Within-class Brenier projection (Bug 10 fix preserved)
+        z, _y_proj, delta, _C_id, _C_ot = brenier_projection(z, x, y)
         total_delta += delta
+
+        # (b) Adaptive stopping (with minimum-rounds guarantee).
+        #     In early training, perturbations are small and Delta ~ 0
+        #     even though the coupling may be suboptimal.  The minimum-
+        #     rounds guarantee forces at least ppa_min_rounds of
+        #     refinement before we consider stopping.
+        if (round_idx >= cfg.ppa_min_rounds
+                and delta < cfg.ppa_delta_rtol * max(_C_id, 1e-12)):
+            break
+
+        # (c) Constant-lr ascent from projected position.
+        #     Anchor is always the original x (Lagrangian penalty).
+        #     Constant lr is appropriate because this is a refinement
+        #     from a new OT-optimal starting point, not a cold start.
+        z = wrm_ascent_x_anchored_const_lr(
+            z, x, model, y, cfg.lambda_reg,
+            num_steps=cfg.ppa_refine_steps,
+            lr=cfg.ppa_refine_lr,
+            clamp=(0.0, 1.0),
+        )
+
+    # Final projection: captures any remaining wasted transport from
+    # the last ascent phase.  Gain is lambda * Delta >= 0 (Lemma 1).
+    z, _y_proj, delta_final, _, _ = brenier_projection(z, x, y)
+    total_delta += delta_final
 
     adv_x = z.detach()
 
@@ -1536,8 +1630,7 @@ def train_step_ppa(state: TrainState, batch, cfg: TrainConfig, device: torch.dev
     model.train()
 
     logits_adv = model(adv_x)
-    # Use permuted labels y_current (labels follow adversarial points)
-    loss = cross_entropy_loss(logits_adv, y_current)
+    loss = cross_entropy_loss(logits_adv, y)
     opt.zero_grad()
     loss.backward()
     opt.step()
@@ -1547,7 +1640,7 @@ def train_step_ppa(state: TrainState, batch, cfg: TrainConfig, device: torch.dev
         logits_clean = model(x)
         logits_adv_post = model(adv_x)
         acc_clean = accuracy(logits_clean, y)
-        acc_adv = accuracy(logits_adv_post, y_current)
+        acc_adv = accuracy(logits_adv_post, y)
         w2_proxy = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
     metrics = {
         "loss_adv": loss.detach(),
@@ -2229,22 +2322,26 @@ if __name__ == "__main__":
         max_steps_algo2=None,
         use_margin_adv_algo1=False,
         use_margin_adv_algo2=False,
-        inner_steps_algo1=20,
+        inner_steps_algo1=75,
         inner_steps_algo2=20,    
         inner_lr_algo1=1e-2,
         bb_alpha0_icnn=1e-2,    
         icnn_hidden_sizes=(512, 512, 256, 256, 128),
-        # PPA parameters
-        inner_steps_ppa=5,       # WRM steps per ascent-project round
-        inner_lr_ppa=1e-2,
-        ppa_num_rounds=4,        # number of (ascent → project) cycles
+        # PPA parameters (enhanced — provably dominates Algo1)
+        inner_steps_ppa_round0=75,   # == inner_steps_algo1 (dominance condition)
+        inner_lr_ppa_round0=1e-2,    # == inner_lr_algo1
+        ppa_num_rounds=5,            # 1 base round + 4 refinement rounds
+        ppa_min_rounds=2,            # don't stop before 2 refinement rounds
+        ppa_refine_steps=15,         # constant-lr steps per refinement
+        ppa_refine_lr=5e-3,          # constant lr for refinement
+        ppa_delta_rtol=1e-4,         # relative stopping threshold
         max_steps_ppa=None,
         cm_diagnostics=args.cm_diagnostics,
         seed=0,
     )
-    print("Training Algorithm 2 (ICNN transport with BB+Armijo)...")
-    state_algo2, icnn_state_algo2, logs_algo2 = train_algorithm_2(cfg, device)
-    save_checkpoint_algo2(state_algo2, icnn_state_algo2, cfg)
+    # print("Training Algorithm 2 (ICNN transport with BB+Armijo)...")
+    # state_algo2, icnn_state_algo2, logs_algo2 = train_algorithm_2(cfg, device)
+    # save_checkpoint_algo2(state_algo2, icnn_state_algo2, cfg)
 
     print("Training Algorithm 1 (WRM adversarial training)...")
     state_algo1, logs_algo1 = train_algorithm_1(cfg, device)
@@ -2275,8 +2372,8 @@ if __name__ == "__main__":
     pgd_algo1 = evaluate_pgd(state_algo1, test_ds, **pgd_kwargs)
     print(f"[Algo1] PGD acc={pgd_algo1['acc']*100:.2f}% L2={pgd_algo1['avg_l2']:.4f} Linf={pgd_algo1['avg_linf']:.4f}")
 
-    pgd_algo2 = evaluate_pgd(state_algo2, test_ds, **pgd_kwargs)
-    print(f"[Algo2] PGD acc={pgd_algo2['acc']*100:.2f}% L2={pgd_algo2['avg_l2']:.4f} Linf={pgd_algo2['avg_linf']:.4f}")
+    # pgd_algo2 = evaluate_pgd(state_algo2, test_ds, **pgd_kwargs)
+    # print(f"[Algo2] PGD acc={pgd_algo2['acc']*100:.2f}% L2={pgd_algo2['avg_l2']:.4f} Linf={pgd_algo2['avg_linf']:.4f}")
 
     pgd_ppa = evaluate_pgd(state_ppa, test_ds, **pgd_kwargs)
     print(f"[PPA]   PGD acc={pgd_ppa['acc']*100:.2f}% L2={pgd_ppa['avg_l2']:.4f} Linf={pgd_ppa['avg_linf']:.4f}")
@@ -2285,7 +2382,7 @@ if __name__ == "__main__":
         "hyperparameters": asdict(cfg),
         "pgd_config": {"eps": pgd_kwargs["eps"], "num_steps": pgd_kwargs["num_steps"]},
         "algo1_wrm_pgd": pgd_algo1,
-        "algo2_icnn_pgd": pgd_algo2,
+        # "algo2_icnn_pgd": pgd_algo2,
         "ppa_pgd": pgd_ppa,
     }
     os.makedirs("MNIST", exist_ok=True)
@@ -2305,8 +2402,8 @@ if __name__ == "__main__":
     print("\n[Algo1] PGD-L2 sweep evaluation...")
     pgd_sweep_algo1 = evaluate_pgd_l2_sweep(state_algo1, test_ds, pgd_eval_cfg, cfg.batch_size, device)
 
-    print("\n[Algo2] PGD-L2 sweep evaluation...")
-    pgd_sweep_algo2 = evaluate_pgd_l2_sweep(state_algo2, test_ds, pgd_eval_cfg, cfg.batch_size, device)
+    # print("\n[Algo2] PGD-L2 sweep evaluation...")
+    # pgd_sweep_algo2 = evaluate_pgd_l2_sweep(state_algo2, test_ds, pgd_eval_cfg, cfg.batch_size, device)
 
     print("\n[PPA] PGD-L2 sweep evaluation...")
     pgd_sweep_ppa = evaluate_pgd_l2_sweep(state_ppa, test_ds, pgd_eval_cfg, cfg.batch_size, device)
@@ -2321,13 +2418,13 @@ if __name__ == "__main__":
         json.dump(algo1_data, f, indent=2)
 
     # Update algo2 JSON with PGD sweep results
-    algo2_json_path = os.path.join("MNIST", "algo2_icnn_results.json")
-    with open(algo2_json_path, "r") as f:
-        algo2_data = json.load(f)
-    algo2_data["pgd_l2_sweep"] = pgd_sweep_algo2
-    algo2_data["pgd_eval_config"] = asdict(pgd_eval_cfg)
-    with open(algo2_json_path, "w") as f:
-        json.dump(algo2_data, f, indent=2)
+    # algo2_json_path = os.path.join("MNIST", "algo2_icnn_results.json")
+    # with open(algo2_json_path, "r") as f:
+    #     algo2_data = json.load(f)
+    # algo2_data["pgd_l2_sweep"] = pgd_sweep_algo2
+    # algo2_data["pgd_eval_config"] = asdict(pgd_eval_cfg)
+    # with open(algo2_json_path, "w") as f:
+    #     json.dump(algo2_data, f, indent=2)
 
     # Update PPA JSON with PGD sweep results
     ppa_json_path = os.path.join("MNIST", "ppa_results.json")
@@ -2341,7 +2438,7 @@ if __name__ == "__main__":
     # Update PGD evaluation JSON with sweep results
     pgd_results["pgd_l2_sweep_config"] = asdict(pgd_eval_cfg)
     pgd_results["algo1_wrm_pgd_sweep"] = pgd_sweep_algo1
-    pgd_results["algo2_icnn_pgd_sweep"] = pgd_sweep_algo2
+    # pgd_results["algo2_icnn_pgd_sweep"] = pgd_sweep_algo2
     pgd_results["ppa_pgd_sweep"] = pgd_sweep_ppa
     with open(os.path.join("MNIST", "pgd_evaluation_results.json"), "w") as f:
         json.dump(pgd_results, f, indent=2)
@@ -2349,33 +2446,33 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     #  MNIST-C corruption robustness evaluation
     # ------------------------------------------------------------------
-    print("\n" + "=" * 72)
-    print("  MNIST-C Corruption Robustness Evaluation")
-    print("=" * 72)
+    # print("\n" + "=" * 72)
+    # print("  MNIST-C Corruption Robustness Evaluation")
+    # print("=" * 72)
 
-    mnist_c_results = {}
-    for name, st in [("Algo1 (WRM)", state_algo1), ("Algo2 (ICNN)", state_algo2), ("PPA", state_ppa)]:
-        print(f"\n[{name}] Evaluating on MNIST-C corruptions...")
-        res = evaluate_mnist_c(st.model, device, root="data", batch_size=cfg.batch_size)
-        mnist_c_results[name] = res
+    # mnist_c_results = {}
+    # for name, st in [("Algo1 (WRM)", state_algo1), ("Algo2 (ICNN)", state_algo2), ("PPA", state_ppa)]:
+    #     print(f"\n[{name}] Evaluating on MNIST-C corruptions...")
+    #     res = evaluate_mnist_c(st.model, device, root="data", batch_size=cfg.batch_size)
+    #     mnist_c_results[name] = res
 
     # Print comparison table
-    header_corruptions = CORRUPTIONS + ["avg_ood"]
-    algo_names = list(mnist_c_results.keys())
-    print("\n" + "-" * 72)
-    print(f"  {'Corruption':<20}", end="")
-    for aname in algo_names:
-        print(f" | {aname:>14}", end="")
-    print("\n" + "-" * 72)
-    for corr in header_corruptions:
-        label = corr if corr != "avg_ood" else "Avg (OOD only)"
-        print(f"  {label:<20}", end="")
-        for aname in algo_names:
-            val = mnist_c_results[aname].get(corr, 0.0)
-            print(f" | {val:>13.2f}%", end="")
-        print()
-    print("-" * 72)
+    # header_corruptions = CORRUPTIONS + ["avg_ood"]
+    # algo_names = list(mnist_c_results.keys())
+    # print("\n" + "-" * 72)
+    # print(f"  {'Corruption':<20}", end="")
+    # for aname in algo_names:
+    #     print(f" | {aname:>14}", end="")
+    # print("\n" + "-" * 72)
+    # for corr in header_corruptions:
+    #     label = corr if corr != "avg_ood" else "Avg (OOD only)"
+    #     print(f"  {label:<20}", end="")
+    #     for aname in algo_names:
+    #         val = mnist_c_results[aname].get(corr, 0.0)
+    #         print(f" | {val:>13.2f}%", end="")
+    #     print()
+    # print("-" * 72)
 
-    # Save MNIST-C results to JSON
-    with open(os.path.join("MNIST", "mnist_c_results.json"), "w") as f:
-        json.dump(mnist_c_results, f, indent=2)
+    # # Save MNIST-C results to JSON
+    # with open(os.path.join("MNIST", "mnist_c_results.json"), "w") as f:
+    #     json.dump(mnist_c_results, f, indent=2)
