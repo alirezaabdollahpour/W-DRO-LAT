@@ -13,8 +13,8 @@ results/
 results/*
 fig/
 figs/
-models/
-models/*
+# models/
+# models/*
 checkpoints/
 checkpoints/*
 *json
