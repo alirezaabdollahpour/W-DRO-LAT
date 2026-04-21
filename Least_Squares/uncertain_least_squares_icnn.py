@@ -1,39 +1,11 @@
 #!/usr/bin/env python3
-"""uncertain_least_squares_icnn.py
-
-Reproduces **Appendix D.2 (Uncertain Least Square)** from
-"GRADIENT FLOW SAMPLER-BASED DISTRIBUTIONALLY ROBUST OPTIMIZATION" and
-generates a plot matching **Figure 8** (test loss vs perturbation level Δ).
-
-In addition to the paper's baselines (ERM / Particle Ascent / WGF / WFR / Dual), this script
-optionally adds an **ICNN map-based adversary** that follows the exact ICNN
-implementation style used in your `moon.py`:
-
-  - ICNN potential ψ_ω(·) convex in the input
-  - Transport map T_ω(x) = ∇_x ψ_ω(x)
-  - ω optimized by **BB + Armijo** ascent
-  - nonnegative weights use the **principled initialization** (log-normal)
-
-Notes
------
-* The uncertain scalar is ξ ∈ [-1, 1]. We therefore clamp adversarial ξ to [-1,1]
-  (as done in the paper's particle-based inner loops).
-* Default hyperparameters match the Figure 8 caption (10 epochs, λ=0.1,
-  inner stepsize 1e-4 for 3000 iterations, ε=0.1, m=8 particles).
-
-Run
----
-    python uncertain_least_squares_icnn_fig8.py
-
-This will save:
-  - fig8_uncertain_least_squares.pdf           (ERM/WGF/WFR/Particle Ascent/Dual)
-  - fig8_uncertain_least_squares_plus_icnn.pdf (same + ICNN)
-"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -46,11 +18,6 @@ import torch.nn.functional as F
 import torch.nn.utils as nn_utils
 
 
-# -------------------------
-# Repro / utils
-# -------------------------
-
-
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -61,15 +28,28 @@ def to_numpy(x: torch.Tensor) -> np.ndarray:
     return x.detach().cpu().numpy()
 
 
-# -------------------------
-# ICNN: BB + Armijo (ascent)
-# -------------------------
+def save_results_json(
+    delta_values: np.ndarray,
+    results: Dict[str, List[float]],
+    save_dir: str,
+) -> None:
+    """Save each method's results as a separate JSON file in *save_dir*."""
+    os.makedirs(save_dir, exist_ok=True)
+    for method_name, test_losses in results.items():
+        safe_name = method_name.replace(" ", "_").replace("/", "_")
+        payload = {
+            "method": method_name,
+            "delta_values": delta_values.tolist(),
+            "test_losses": test_losses,
+        }
+        path = os.path.join(save_dir, f"{safe_name}.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Saved: {path}")
 
 
 @dataclass
 class BBArmijoState:
-    """Barzilai-Borwein step size + Armijo line search state."""
-
     alpha_min: float
     alpha_max: float
     alpha_prev: float
@@ -100,7 +80,6 @@ class BBArmijoState:
         )
 
     def propose(self, params_vec: torch.Tensor, grad_vec: torch.Tensor) -> float:
-        """Propose a BB step size (before Armijo)."""
         if (
             self.prev_params_vec is None
             or self.prev_grad_vec is None
@@ -141,8 +120,6 @@ def bb_armijo_step_params(
     f_params,
     bb_state: BBArmijoState,
 ) -> Tuple[List[torch.nn.Parameter], BBArmijoState, float, float]:
-    """Single BB+Armijo gradient-ascent step on a parameter collection."""
-
     params = list(params)
     params_vec = nn_utils.parameters_to_vector(params).detach()
 
@@ -192,13 +169,7 @@ def bb_armijo_step_params(
     return params, new_state, f_val_float, grad_vec_new.norm().item()
 
 
-# -------------------------
-# ICNN modules (principled init)
-# -------------------------
-
-
 def icnn_principled_moments(fan_in: int):
-    """Principled log-normal moments for positive weights."""
     if fan_in <= 0:
         raise ValueError(f"ICNN fan-in must be positive; got {fan_in}.")
     denom_offset = 6.0 * (math.pi - 1.0)
@@ -217,8 +188,6 @@ def icnn_principled_moments(fan_in: int):
 
 
 class NonNegativeLinear(nn.Module):
-    """Linear map with strictly non-negative weights via exp/softplus."""
-
     def __init__(self, in_features, out_features, bias=True, init_mode="principled"):
         super().__init__()
         self.in_features = in_features
@@ -264,8 +233,6 @@ class NonNegativeLinear(nn.Module):
 
 
 class InputConvexPotential(nn.Module):
-    """Dense ICNN potential ψ(z) that is convex in z."""
-
     def __init__(
         self,
         input_dim=1,
@@ -333,8 +300,6 @@ class InputConvexPotential(nn.Module):
 
 
 def T_omega(x: torch.Tensor, psi_omega: nn.Module, create_graph: bool) -> torch.Tensor:
-    """Transport map T_ω(x) = ∇_x ψ_ω(x)."""
-
     x_in = x.clone().detach().requires_grad_(True)
     with torch.set_grad_enabled(True):
         psi_val = psi_omega(x_in)
@@ -342,44 +307,32 @@ def T_omega(x: torch.Tensor, psi_omega: nn.Module, create_graph: bool) -> torch.
     return grad.view_as(x)
 
 
-# -------------------------
-# Uncertain least squares: f_θ(ξ)
-# -------------------------
-
-
 @dataclass
 class ULSConfig:
-    # Problem sizes
     dim_m: int = 10
     dim_n: int = 10
     n_train: int = 10
     n_test: int = 1000
 
-    # Delta sweep
     delta_min: float = 0.0
     delta_max: float = 10.0
     delta_steps: int = 50
 
-    # Training hyperparams (Figure 8 caption)
     epochs: int = 10
     lr_theta: float = 1e-2
     lam: float = 0.1
     epsilon: float = 0.1
     grad_clip: float = 100.0
 
-    # Inner-loop hyperparams
     inner_steps: int = 3000
     inner_step_size: float = 1e-4
     m_particles: int = 8
 
-    # WFR
     wfr_weight_step_size: float = 0.0016
     wfr_low_weight_threshold: float = 1e-3
 
-    # Dual (randomized truncation MLMC)
     sinkhorn_sample_level: int = 4
 
-    # ICNN
     run_icnn: bool = True
     icnn_hidden: Tuple[int, ...] = (512, 512, 512, 256, 256, 128, 128, 64)
     icnn_strong_convexity: float = 1.0
@@ -392,15 +345,23 @@ class ULSConfig:
     icnn_bb_ls_max_steps: int = 10
     icnn_omega_steps_per_epoch: int = 50
 
-    # Repro
-    seed: int = 219
+    run_madry: bool = True
+    pgd_epsilon: float = 0.316
+    pgd_steps: int = 50
+    pgd_restarts: int = 5
 
-    # Numerical stability
+    run_ppa: bool = True
+    ppa_num_rounds: int = 5
+    ppa_min_rounds: int = 2
+    ppa_refine_steps: int = 500
+    ppa_refine_lr: float = 1e-4
+    ppa_delta_rtol: float = 1e-4
+
+    seed: int = 219
     ridge: float = 1e-6
 
 
 def make_problem(cfg: ULSConfig, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Generate A0, A1, b as in the paper (i.i.d. standard normal)."""
     rng = np.random.RandomState(cfg.seed)
     A0 = torch.tensor(rng.randn(cfg.dim_m, cfg.dim_n), device=device)
     A1 = torch.tensor(rng.randn(cfg.dim_m, cfg.dim_n), device=device)
@@ -426,11 +387,10 @@ def loss_function(
     b: torch.Tensor,
     dim_m: int,
 ) -> torch.Tensor:
-    """Vectorized f_θ(ξ) = ||A(ξ)θ - b||^2 / m."""
     xi = xi.reshape(-1)
-    A_z = A0.unsqueeze(0) + xi.view(-1, 1, 1) * A1.unsqueeze(0)  # (B,m,n)
-    residual = torch.matmul(A_z, theta) - b.view(1, -1)  # (B,m)
-    loss = (residual**2).sum(dim=1) / float(dim_m)  # (B,)
+    A_z = A0.unsqueeze(0) + xi.view(-1, 1, 1) * A1.unsqueeze(0)
+    residual = torch.matmul(A_z, theta) - b.view(1, -1)
+    loss = (residual**2).sum(dim=1) / float(dim_m)
     return loss
 
 
@@ -441,11 +401,10 @@ def loss_grad_theta(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """Vectorized ∇_θ f_θ(ξ). (Matches the authors' scaling.)"""
     xi = xi.reshape(-1)
     A_z = A0.unsqueeze(0) + xi.view(-1, 1, 1) * A1.unsqueeze(0)
     residual = torch.matmul(A_z, theta) - b.view(1, -1)
-    grad = 2.0 * torch.matmul(A_z.transpose(1, 2), residual.unsqueeze(2)).squeeze(2)  # (B,n)
+    grad = 2.0 * torch.matmul(A_z.transpose(1, 2), residual.unsqueeze(2)).squeeze(2)
     return grad
 
 
@@ -456,12 +415,11 @@ def loss_grad_xi(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """Vectorized ∇_ξ f_θ(ξ). (Matches the authors' scaling.)"""
     xi = xi.reshape(-1)
     A_z = A0.unsqueeze(0) + xi.view(-1, 1, 1) * A1.unsqueeze(0)
     residual = torch.matmul(A_z, theta) - b.view(1, -1)
-    grad_Az = torch.matmul(A1, theta)  # (m,)
-    grad = 2.0 * (residual * grad_Az.view(1, -1)).sum(dim=1)  # (B,)
+    grad_Az = torch.matmul(A1, theta)
+    grad = 2.0 * (residual * grad_Az.view(1, -1)).sum(dim=1)
     return grad
 
 
@@ -472,9 +430,41 @@ def clip_grad(grad: torch.Tensor, max_norm: float) -> torch.Tensor:
     return grad
 
 
-# -------------------------
-# Solvers (paper baselines)
-# -------------------------
+def brenier_projection_1d(
+    z: torch.Tensor,
+    xi_train: torch.Tensor,
+) -> Tuple[torch.Tensor, float, float]:
+    """1D Brenier projection via monotone rearrangement.
+
+    In 1D the optimal-transport coupling between two sets of equal-weight
+    points is the monotone rearrangement: sort both sets and match in order.
+    This is the 1D analogue of the within-class LAP used in MNIST.py.
+
+    Parameters
+    ----------
+    z        : Tensor [n] -- current adversarial points
+    xi_train : Tensor [n] -- nominal training points (anchors)
+
+    Returns
+    -------
+    z_proj : Tensor [n] -- optimally reassigned z (same multiset, new ordering)
+    delta  : float      -- per-sample wasted-transport gap  (C_id - C_ot) / n
+    C_id   : float      -- per-sample identity coupling cost
+    """
+    n = z.numel()
+    if n <= 1:
+        C_id = float(((z - xi_train) ** 2).sum().item()) / max(n, 1)
+        return z.clone(), 0.0, C_id
+
+    z_sorted, _ = torch.sort(z)
+    xi_ranks = torch.argsort(torch.argsort(xi_train))
+    z_proj = z_sorted[xi_ranks]
+
+    C_id = float(((z - xi_train) ** 2).mean().item())
+    C_ot = float(((z_proj - xi_train) ** 2).mean().item())
+    delta = max(C_id - C_ot, 0.0)
+
+    return z_proj, delta, C_id
 
 
 def solve_erm_closed_form(
@@ -484,7 +474,6 @@ def solve_erm_closed_form(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """Closed-form ERM solution (quadratic objective)."""
     n = cfg.dim_n
     S = torch.zeros((n, n), device=xi_train.device)
     t = torch.zeros((n,), device=xi_train.device)
@@ -496,7 +485,7 @@ def solve_erm_closed_form(
     theta = torch.linalg.solve(S, t)
     return theta
 
-# Particle Ascent solver is same as WRM solver in the paper (I just rename it)
+
 def solve_Particle_Ascent(
     xi_train: torch.Tensor,
     cfg: ULSConfig,
@@ -504,7 +493,6 @@ def solve_Particle_Ascent(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """Particle Ascent (ε=0): inner maximization via deterministic gradient ascent on ξ."""
     theta = torch.zeros(cfg.dim_n, device=xi_train.device)
     n_train = xi_train.numel()
 
@@ -515,7 +503,7 @@ def solve_Particle_Ascent(
             z = z + cfg.inner_step_size * grad
             z = z.clamp(-1.0, 1.0)
 
-        grads_theta = loss_grad_theta(theta, z, A0, A1, b)  # (N,n)
+        grads_theta = loss_grad_theta(theta, z, A0, A1, b)
         avg_grad = grads_theta.mean(dim=0)
         avg_grad = clip_grad(avg_grad, cfg.grad_clip)
         theta = theta - cfg.lr_theta * avg_grad
@@ -530,14 +518,13 @@ def solve_wgf(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """WGF sampler (Algorithm 3 in the paper): Langevin-like particle updates."""
     theta = torch.zeros(cfg.dim_n, device=xi_train.device)
     n_train = xi_train.numel()
     m = cfg.m_particles
     noise_scale = math.sqrt(2.0 * cfg.inner_step_size * cfg.lam * cfg.epsilon)
 
     for _epoch in range(cfg.epochs):
-        particles = xi_train.view(-1, 1).repeat(1, m)  # (N,m)
+        particles = xi_train.view(-1, 1).repeat(1, m)
         for _ in range(cfg.inner_steps):
             particles_flat = particles.reshape(-1)
             xi_expanded = xi_train.repeat_interleave(m)
@@ -547,8 +534,8 @@ def solve_wgf(
             particles = particles_flat.view(n_train, m).clamp(-1.0, 1.0)
 
         particles_flat = particles.reshape(-1)
-        grads = loss_grad_theta(theta, particles_flat, A0, A1, b)  # (N*m,n)
-        grads = grads.view(n_train, m, cfg.dim_n).mean(dim=1)  # (N,n)
+        grads = loss_grad_theta(theta, particles_flat, A0, A1, b)
+        grads = grads.view(n_train, m, cfg.dim_n).mean(dim=1)
         avg_grad = grads.mean(dim=0)
         avg_grad = clip_grad(avg_grad, cfg.grad_clip)
         theta = theta - cfg.lr_theta * avg_grad
@@ -563,7 +550,6 @@ def solve_wfr(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """WFR sampler (Algorithm 4 in the paper): WGF + weight dynamics + birth-death."""
     theta = torch.zeros(cfg.dim_n, device=xi_train.device)
     n_train = xi_train.numel()
     m = cfg.m_particles
@@ -581,7 +567,6 @@ def solve_wfr(
             particles_flat = particles_flat + cfg.inner_step_size * grad + noise_scale * noise
             particles = particles_flat.view(n_train, m).clamp(-1.0, 1.0)
 
-            # Weight update
             f_bar = loss_function(theta, particles.reshape(-1), A0, A1, b, cfg.dim_m).view(n_train, m)
             f_bar = f_bar - cfg.lam * (particles - xi_train.view(-1, 1)) ** 2
 
@@ -589,7 +574,6 @@ def solve_wfr(
             weights = (weights.clamp_min(1e-12) ** power) * torch.exp(cfg.wfr_weight_step_size * f_bar)
             weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-12)
 
-            # Birth-death: match the authors' procedure (row-wise)
             thr = cfg.wfr_low_weight_threshold
             low_mask = weights < thr
             rows = torch.any(low_mask, dim=1)
@@ -608,12 +592,10 @@ def solve_wfr(
                     n_low = torch.sum(low).to(w.dtype)
                     avg_w = (w_max + low_sum) / (n_low + 1.0 + 1e-12)
 
-                    # Update weights for {low} ∪ {j_max}
                     update_mask = low.clone()
                     update_mask[j_max] = True
                     w = torch.where(update_mask, avg_w, w)
 
-                    # Move low-weight particles to the max-weight location
                     x = torch.where(low, x_max, x)
                     w = w / (w.sum() + 1e-12)
 
@@ -621,7 +603,7 @@ def solve_wfr(
                     particles[i] = x
 
         grads = loss_grad_theta(theta, particles.reshape(-1), A0, A1, b).view(n_train, m, cfg.dim_n)
-        grads = (weights.unsqueeze(-1) * grads).sum(dim=1)  # (N,n)
+        grads = (weights.unsqueeze(-1) * grads).sum(dim=1)
         avg_grad = grads.mean(dim=0)
         avg_grad = clip_grad(avg_grad, cfg.grad_clip)
         theta = theta - cfg.lr_theta * avg_grad
@@ -636,7 +618,6 @@ def solve_dual(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """Dual method for SDRO (Wang et al., 2021) with randomized truncation MLMC."""
     theta = torch.zeros(cfg.dim_n, device=xi_train.device)
     n_train = xi_train.numel()
     levels = torch.arange(cfg.sinkhorn_sample_level + 1, device=xi_train.device)
@@ -645,7 +626,6 @@ def solve_dual(
     probs = (numerators / denominator).to(torch.float64)
 
     for _epoch in range(cfg.epochs):
-        # sample level
         sampled_level = int(torch.multinomial(probs, num_samples=1).item())
         m = 2 ** sampled_level
 
@@ -668,9 +648,139 @@ def solve_dual(
     return theta
 
 
-# -------------------------
-# ICNN map-based solver (optional)
-# -------------------------
+def pgd_attack_l2(
+    theta: torch.Tensor,
+    xi_nominal: torch.Tensor,
+    epsilon: float,
+    pgd_steps: int,
+    pgd_restarts: int,
+    A0: torch.Tensor,
+    A1: torch.Tensor,
+    b: torch.Tensor,
+    dim_m: int,
+) -> torch.Tensor:
+    n = xi_nominal.numel()
+    step_size = 2.5 * epsilon / float(pgd_steps)
+    best_z = xi_nominal.clone()
+    best_loss = loss_function(theta, xi_nominal, A0, A1, b, dim_m)
+
+    for _ in range(pgd_restarts):
+        delta = torch.empty_like(xi_nominal).uniform_(-1.0, 1.0)
+        delta = delta * epsilon
+        z = xi_nominal + delta
+        z = z.clamp(-1.0, 1.0)
+
+        for _ in range(pgd_steps):
+            z_var = z.clone().detach().requires_grad_(True)
+            l = loss_function(theta, z_var, A0, A1, b, dim_m)
+            grad_z = torch.autograd.grad(l.sum(), z_var)[0]
+            grad_norm = grad_z.abs().clamp_min(1e-12)
+            z = z.detach() + step_size * grad_z / grad_norm
+            delta_vec = z - xi_nominal
+            delta_norm = delta_vec.abs()
+            scale = torch.clamp(epsilon / delta_norm.clamp_min(1e-12), max=1.0)
+            z = xi_nominal + delta_vec * scale
+            z = z.clamp(-1.0, 1.0)
+
+        with torch.no_grad():
+            current_loss = loss_function(theta, z, A0, A1, b, dim_m)
+        improved = current_loss > best_loss
+        best_z = torch.where(improved, z, best_z)
+        best_loss = torch.where(improved, current_loss, best_loss)
+
+    return best_z.detach()
+
+
+def solve_madry_pgd(
+    xi_train: torch.Tensor,
+    cfg: ULSConfig,
+    A0: torch.Tensor,
+    A1: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    theta = torch.zeros(cfg.dim_n, device=xi_train.device)
+
+    for _epoch in range(cfg.epochs):
+        z_adv = pgd_attack_l2(
+            theta,
+            xi_train,
+            cfg.pgd_epsilon,
+            cfg.pgd_steps,
+            cfg.pgd_restarts,
+            A0,
+            A1,
+            b,
+            cfg.dim_m,
+        )
+
+        with torch.no_grad():
+            grads_theta = loss_grad_theta(theta, z_adv, A0, A1, b)
+            avg_grad = grads_theta.mean(dim=0)
+            avg_grad = clip_grad(avg_grad, cfg.grad_clip)
+            theta = theta - cfg.lr_theta * avg_grad
+
+    return theta
+
+
+def solve_ppa(
+    xi_train: torch.Tensor,
+    cfg: ULSConfig,
+    A0: torch.Tensor,
+    A1: torch.Tensor,
+    b: torch.Tensor,
+) -> torch.Tensor:
+    """Projected Particle Ascent (PPA).
+
+    Adapted from the MNIST PPA implementation (train_step_ppa in MNIST.py).
+    The algorithm strictly refines Particle Ascent by interleaving 1D Brenier
+    projections (monotone rearrangement) with constant-lr ascent rounds.
+
+    Round 0:  Replicate Particle Ascent exactly (dominance condition).
+    Round r (r >= 1):
+        (a) Brenier projection: z <- Pi(z)   [monotone rearrangement]
+        (b) Constant-lr ascent from projected z
+    Final: one last projection to capture remaining wasted transport.
+
+    Invariant (Lemma proj_gain):
+        L(theta, Pi(z)) = L(theta, z) + lambda * Delta(z),  Delta >= 0.
+    """
+    theta = torch.zeros(cfg.dim_n, device=xi_train.device)
+
+    for _epoch in range(cfg.epochs):
+        # ===== Round 0: Replicate Particle Ascent exactly =====
+        z = xi_train.clone()
+        for _ in range(cfg.inner_steps):
+            grad = loss_grad_xi(theta, z, A0, A1, b) - 2.0 * cfg.lam * (z - xi_train)
+            z = z + cfg.inner_step_size * grad
+            z = z.clamp(-1.0, 1.0)
+
+        # ===== Refinement rounds 1..R-1: project then ascend =====
+        for round_idx in range(1, cfg.ppa_num_rounds):
+            # (a) 1D Brenier projection (monotone rearrangement)
+            z, delta, C_id = brenier_projection_1d(z, xi_train)
+
+            # (b) Adaptive stopping with minimum-rounds guarantee
+            if (round_idx >= cfg.ppa_min_rounds
+                    and delta < cfg.ppa_delta_rtol * max(C_id, 1e-12)):
+                break
+
+            # (c) Constant-lr ascent from projected position
+            #     Anchor is always the original xi_train (Lagrangian penalty).
+            for _ in range(cfg.ppa_refine_steps):
+                grad = loss_grad_xi(theta, z, A0, A1, b) - 2.0 * cfg.lam * (z - xi_train)
+                z = z + cfg.ppa_refine_lr * grad
+                z = z.clamp(-1.0, 1.0)
+
+        # Final projection: captures remaining wasted transport (gain >= 0)
+        z, _, _ = brenier_projection_1d(z, xi_train)
+
+        # Outer step: update theta
+        grads_theta = loss_grad_theta(theta, z, A0, A1, b)
+        avg_grad = grads_theta.mean(dim=0)
+        avg_grad = clip_grad(avg_grad, cfg.grad_clip)
+        theta = theta - cfg.lr_theta * avg_grad
+
+    return theta
 
 
 def solve_icnn_map(
@@ -680,8 +790,6 @@ def solve_icnn_map(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> Tuple[torch.Tensor, InputConvexPotential]:
-    """Map-based adversary: z = T_ω(ξ) with BB+Armijo on ω."""
-
     device = xi_train.device
     theta = torch.zeros(cfg.dim_n, device=device)
     psi_omega = InputConvexPotential(
@@ -705,7 +813,6 @@ def solve_icnn_map(
     xi_2d = xi_train.view(-1, 1)
 
     for _epoch in range(cfg.epochs):
-        # --- inner: maximize over ω ---
         for _ in range(cfg.icnn_omega_steps_per_epoch):
             def omega_objective(create_graph: bool) -> torch.Tensor:
                 z_adv = T_omega(xi_2d, psi_omega, create_graph=create_graph).view(-1)
@@ -716,7 +823,6 @@ def solve_icnn_map(
 
             _, bb_state, _, _ = bb_armijo_step_params(psi_omega.parameters(), omega_objective, bb_state)
 
-        # --- outer: minimize over θ (envelope theorem: treat z_adv fixed) ---
         with torch.no_grad():
             z_adv = T_omega(xi_2d, psi_omega, create_graph=False).view(-1)
             z_adv = z_adv.clamp(-1.0, 1.0)
@@ -725,11 +831,6 @@ def solve_icnn_map(
             theta = theta - cfg.lr_theta * grad_theta
 
     return theta, psi_omega
-
-
-# -------------------------
-# Experiment + plotting
-# -------------------------
 
 
 def run_experiment(cfg: ULSConfig, device: torch.device):
@@ -749,6 +850,14 @@ def run_experiment(cfg: ULSConfig, device: torch.device):
     if cfg.run_icnn:
         theta_icnn, _psi = solve_icnn_map(xi_train, cfg, A0, A1, b)
 
+    theta_madry = None
+    if cfg.run_madry:
+        theta_madry = solve_madry_pgd(xi_train, cfg, A0, A1, b)
+
+    theta_ppa = None
+    if cfg.run_ppa:
+        theta_ppa = solve_ppa(xi_train, cfg, A0, A1, b)
+
     models: Dict[str, torch.Tensor] = {
         "ERM": theta_erm,
         "WGF(Otto, 1996)": theta_wgf,
@@ -758,6 +867,10 @@ def run_experiment(cfg: ULSConfig, device: torch.device):
     }
     if cfg.run_icnn:
         models["ICNN"] = theta_icnn
+    if cfg.run_madry:
+        models["Madry PGD"] = theta_madry
+    if cfg.run_ppa:
+        models["PPA"] = theta_ppa
 
     delta_values = torch.linspace(cfg.delta_min, cfg.delta_max, cfg.delta_steps, device=device)
     results: Dict[str, List[float]] = {k: [] for k in models.keys()}
@@ -773,8 +886,7 @@ def run_experiment(cfg: ULSConfig, device: torch.device):
     return to_numpy(delta_values), results
 
 
-def plot_results(delta_values: np.ndarray, results: Dict[str, List[float]], save_path: str, *, include_icnn: bool):
-    # Match the paper's compact figure style
+def plot_results(delta_values: np.ndarray, results: Dict[str, List[float]], save_path: str, *, include_icnn: bool, include_madry: bool, include_ppa: bool):
     fig, ax = plt.subplots(figsize=(3.6, 2.613), dpi=300)
 
     styles = {
@@ -784,14 +896,21 @@ def plot_results(delta_values: np.ndarray, results: Dict[str, List[float]], save
         "Particle Ascent": {"color": "#0eaf0e", "linestyle": (0, (3, 1, 1, 1))},
         "Dual(Wang et al., 2021)": {"color": "#7A4E15", "linestyle": (0, (5, 5))},
         "ICNN": {"color": "#1f77b4", "linestyle": "-"},
+        "Madry PGD": {"color": "#e67300", "linestyle": (0, (1, 1))},
+        "PPA": {"color": "#00ced1", "linestyle": (0, (3, 1, 1, 1, 1, 1))},
     }
 
     plot_order = ["ERM", "WGF(Otto, 1996)", "WFR(Xu, 2025)", "Particle Ascent", "Dual(Wang et al., 2021)"]
     if include_icnn and "ICNN" in results:
         plot_order.append("ICNN")
+    if include_madry and "Madry PGD" in results:
+        plot_order.append("Madry PGD")
+    if include_ppa and "PPA" in results:
+        plot_order.append("PPA")
 
     for name in plot_order:
-        ax.plot(delta_values, results[name], linewidth=1.5, label=name, **styles[name])
+        if name in results:
+            ax.plot(delta_values, results[name], linewidth=1.5, label=name, **styles[name])
 
     ax.set_xlabel(r"perturbation $\Delta$", fontsize=9)
     ax.set_ylabel("test loss", fontsize=9)
@@ -802,7 +921,6 @@ def plot_results(delta_values: np.ndarray, results: Dict[str, List[float]], save
     ax.set_ylim(0.0, 3.0)
     ax.grid(False)
     ax.legend(fontsize=6, loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True)
-    # delete top and right spines
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     plt.tight_layout()
@@ -812,7 +930,7 @@ def plot_results(delta_values: np.ndarray, results: Dict[str, List[float]], save
 
 def main():
     torch.set_default_dtype(torch.float64)
-    parser = argparse.ArgumentParser(description="Uncertain least squares (Fig. 8) + optional ICNN map baseline")
+    parser = argparse.ArgumentParser(description="Uncertain least squares (Fig. 8) + optional ICNN map baseline + Madry PGD")
     parser.add_argument("--seed", type=int, default=219)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--n_train", type=int, default=10)
@@ -826,6 +944,14 @@ def main():
     parser.add_argument("--lr_theta", type=float, default=1e-2)
     parser.add_argument("--no_icnn", action="store_true", help="Disable ICNN baseline.")
     parser.add_argument("--icnn_omega_steps_per_epoch", type=int, default=50)
+    parser.add_argument("--no_madry", action="store_true", help="Disable Madry PGD baseline.")
+    parser.add_argument("--pgd_epsilon", type=float, default=0.316)
+    parser.add_argument("--pgd_steps", type=int, default=50)
+    parser.add_argument("--pgd_restarts", type=int, default=5)
+    parser.add_argument("--no_ppa", action="store_true", help="Disable PPA baseline.")
+    parser.add_argument("--ppa_num_rounds", type=int, default=5)
+    parser.add_argument("--ppa_refine_steps", type=int, default=500)
+    parser.add_argument("--ppa_refine_lr", type=float, default=1e-4)
     args = parser.parse_args()
 
     cfg = ULSConfig(
@@ -842,29 +968,59 @@ def main():
         lr_theta=args.lr_theta,
         run_icnn=not args.no_icnn,
         icnn_omega_steps_per_epoch=args.icnn_omega_steps_per_epoch,
+        run_madry=not args.no_madry,
+        pgd_epsilon=args.pgd_epsilon,
+        pgd_steps=args.pgd_steps,
+        pgd_restarts=args.pgd_restarts,
+        run_ppa=not args.no_ppa,
+        ppa_num_rounds=args.ppa_num_rounds,
+        ppa_refine_steps=args.ppa_refine_steps,
+        ppa_refine_lr=args.ppa_refine_lr,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     delta_values, results = run_experiment(cfg, device)
 
-    # Figure 8 replication (paper baselines only)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    save_results_json(delta_values, results, save_dir=script_dir)
+
     plot_results(
         delta_values,
-        {k: v for k, v in results.items() if k != "ICNN"},
+        {k: v for k, v in results.items() if k not in ("ICNN", "Madry PGD", "PPA")},
         save_path="fig8_uncertain_least_squares.pdf",
         include_icnn=False,
+        include_madry=False,
+        include_ppa=False,
     )
     print("Saved: fig8_uncertain_least_squares.pdf")
 
-    # Optional: add ICNN overlay
     if cfg.run_icnn and "ICNN" in results:
         plot_results(
             delta_values,
-            results,
+            {k: v for k, v in results.items() if k not in ("Madry PGD", "PPA")},
             save_path="fig8_uncertain_least_squares_plus_icnn.pdf",
             include_icnn=True,
+            include_madry=False,
+            include_ppa=False,
         )
         print("Saved: fig8_uncertain_least_squares_plus_icnn.pdf")
+
+    all_methods = {k: v for k, v in results.items()}
+    has_extras = (
+        (cfg.run_icnn and "ICNN" in results)
+        or (cfg.run_madry and "Madry PGD" in results)
+        or (cfg.run_ppa and "PPA" in results)
+    )
+    if has_extras:
+        plot_results(
+            delta_values,
+            all_methods,
+            save_path="fig8_uncertain_least_squares_all_methods.pdf",
+            include_icnn=cfg.run_icnn,
+            include_madry=cfg.run_madry,
+            include_ppa=cfg.run_ppa,
+        )
+        print("Saved: fig8_uncertain_least_squares_all_methods.pdf")
 
 
 if __name__ == "__main__":
