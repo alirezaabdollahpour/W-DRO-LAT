@@ -38,3 +38,6 @@ tmp_viz/*
 .png
 .jpg
 .jpeg
+*.pdf
+*.png
+*.jpg
