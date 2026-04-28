@@ -1,7 +1,7 @@
 """NPF-ICNN WDRO adversary (Vesseron & Cuturi, 2024) with persistent Adam inner loop."""
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 
@@ -12,13 +12,13 @@ from utils.loss import loss_function, loss_grad_theta
 from utils.transport import transport_map
 
 
-def solve_npf_icnn_map(
+def _solve_npf_icnn_map_with_zstar(
     xi_train: torch.Tensor,
     cfg: ULSConfig,
     A0: torch.Tensor,
     A1: torch.Tensor,
     b: torch.Tensor,
-) -> Tuple[torch.Tensor, NPFResidualPotential, Dict[str, list]]:
+) -> Dict[str, Any]:
     device = xi_train.device
     theta = torch.zeros(cfg.dim_n, device=device)
 
@@ -42,6 +42,7 @@ def solve_npf_icnn_map(
         "mean_displacement": [],
         "max_displacement": [],
     }
+    z_adv = xi_train.detach().clone()
 
     for _epoch in range(cfg.epochs):
         # Inner ascent on psi (Adam minimises the negated objective).
@@ -72,4 +73,21 @@ def solve_npf_icnn_map(
                        - cfg.lam * (z_adv - xi_train) ** 2).mean().item())
             )
 
-    return theta, psi, diagnostics
+    return {
+        "theta": theta,
+        "psi": psi,
+        "diagnostics": diagnostics,
+        "z_star": z_adv.detach(),
+        "z_star_kind": "paired",
+    }
+
+
+def solve_npf_icnn_map(
+    xi_train: torch.Tensor,
+    cfg: ULSConfig,
+    A0: torch.Tensor,
+    A1: torch.Tensor,
+    b: torch.Tensor,
+) -> Tuple[torch.Tensor, NPFResidualPotential, Dict[str, list]]:
+    out = _solve_npf_icnn_map_with_zstar(xi_train, cfg, A0, A1, b)
+    return out["theta"], out["psi"], out["diagnostics"]
