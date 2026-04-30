@@ -1,4 +1,4 @@
-"""Algorithm 2: ICNN-transport adversarial training."""
+"""Algorithm 2: ICNN-transport adversarial training (BB+Armijo inner loop)."""
 from __future__ import annotations
 
 import copy
@@ -17,7 +17,7 @@ from algorithms.base import (
 )
 from config import TrainConfig
 from models.icnn import InputConvexPotential, icnn_gradient
-from utils.bb_armijo import BBArmijoState
+from utils.bb_armijo import BBArmijoState, bb_armijo_step_params
 from utils.common import (
     accuracy,
     adversary_loss,
@@ -37,8 +37,6 @@ class ICNNState:
     params_vec: torch.Tensor
     meta: Tuple[Tuple[str, Tuple[int, ...], int], ...]
     bb_state: BBArmijoState
-    inner_param: torch.Tensor
-    inner_opt: torch.optim.Optimizer
 
 
 def create_icnn_state(
@@ -55,15 +53,11 @@ def create_icnn_state(
     params_vec, meta = flatten_params(icnn_model)
     params_vec = params_vec.to(device)
     bb_state = BBArmijoState.create(alpha0=cfg.bb_alpha0_icnn)
-    inner_param = params_vec.detach().clone().requires_grad_(True)
-    inner_opt = torch.optim.Adam([inner_param], lr=cfg.bb_alpha0_icnn)
     return ICNNState(
         model=icnn_model,
         params_vec=params_vec,
         meta=meta,
         bb_state=bb_state,
-        inner_param=inner_param,
-        inner_opt=inner_opt,
     )
 
 
@@ -106,31 +100,26 @@ def train_step_algo2(
         w2 = ((adv_x_inner - x) ** 2).sum(dim=(1, 2, 3)).mean()
         return adv_loss - cfg.lambda_reg * w2
 
-    inner_param = icnn_state.inner_param
-    inner_opt = icnn_state.inner_opt
-    with torch.no_grad():
-        inner_param.data.copy_(icnn_state.params_vec.to(device))
+    current_vec = icnn_state.params_vec.to(device)
     adv_loss_val = torch.tensor(0.0, device=device)
-    inner_grad_norm = 0.0
 
     for _ in range(cfg.inner_steps_algo2):
-        inner_opt.zero_grad()
-        obj = adv_obj_params(inner_param, True)
-        neg_obj = -obj
-        neg_obj.backward()
-        if inner_param.grad is not None:
-            inner_grad_norm = float(inner_param.grad.norm().item())
-        inner_opt.step()
-        adv_loss_val = obj.detach()
+        current_vec, bb_state, f_val_f = bb_armijo_step_params(
+            current_vec, meta, adv_obj_params, bb_state
+        )
+        adv_loss_val = torch.tensor(f_val_f, device=device)
 
-    params_vec = inner_param.detach().clone()
+    # Final-iterate gradient norm for diagnostics.
+    v_eval = current_vec.detach().requires_grad_(True)
+    f_eval = adv_obj_params(v_eval, True)
+    g_eval = torch.autograd.grad(f_eval, v_eval, create_graph=False)[0]
+    inner_grad_norm = float(g_eval.norm().item())
+
     icnn_state = ICNNState(
         model=icnn_model,
-        params_vec=params_vec,
+        params_vec=current_vec,
         meta=meta,
         bb_state=bb_state,
-        inner_param=inner_param,
-        inner_opt=inner_opt,
     )
 
     set_requires_grad(model, True)
@@ -185,8 +174,6 @@ def train_algorithm_2(
     best_opt_sd = None
     best_icnn_sd = None
     best_icnn_params_vec = None
-    best_icnn_inner_param = None
-    best_icnn_inner_opt_sd = None
     patience_count = 0
     in_adv_phase = False
 
@@ -196,8 +183,6 @@ def train_algorithm_2(
             copy.deepcopy(state.opt.state_dict()),
             copy.deepcopy(icnn_state.model.state_dict()),
             icnn_state.params_vec.detach().clone(),
-            icnn_state.inner_param.detach().clone(),
-            copy.deepcopy(icnn_state.inner_opt.state_dict()),
         )
 
     for epoch in range(cfg.num_epochs):
@@ -249,8 +234,7 @@ def train_algorithm_2(
                     best_score = score
                     best_epoch = epoch
                     (best_model_sd, best_opt_sd, best_icnn_sd,
-                     best_icnn_params_vec, best_icnn_inner_param,
-                     best_icnn_inner_opt_sd) = _save_best()
+                     best_icnn_params_vec) = _save_best()
             state.scheduler.step()
 
         else:
@@ -315,8 +299,7 @@ def train_algorithm_2(
                     best_score = score
                     best_epoch = epoch
                     (best_model_sd, best_opt_sd, best_icnn_sd,
-                     best_icnn_params_vec, best_icnn_inner_param,
-                     best_icnn_inner_opt_sd) = _save_best()
+                     best_icnn_params_vec) = _save_best()
                     patience_count = 0
                 else:
                     patience_count += 1
@@ -335,8 +318,6 @@ def train_algorithm_2(
         state.opt.load_state_dict(best_opt_sd)
         icnn_state.model.load_state_dict(best_icnn_sd)
         icnn_state.params_vec = best_icnn_params_vec
-        icnn_state.inner_param.data.copy_(best_icnn_inner_param)
-        icnn_state.inner_opt.load_state_dict(best_icnn_inner_opt_sd)
         print(f"[Algo2] Restored best epoch {best_epoch} (score={best_score:.4f})")
 
     test_metrics = evaluate_clean(state, test_ds, cfg.batch_size, device)
