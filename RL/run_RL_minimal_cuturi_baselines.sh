@@ -29,7 +29,8 @@ exec "${PYTHON_BIN}" RL_minimal.py \
   --dual-epsilon 0.01 --dual-sample-level 3 \
   --particle-num-samples 8 --particle-inner-steps 10 --particle-inner-lr 0.05 --particle-epsilon 0.01 \
   --rgo-num-samples 8 --rgo-inner-steps 10 --rgo-inner-lr 0.05 --rgo-epsilon 0.01 --rgo-max-trials 10 \
-  --k-npf 10 --lr-npf 0.05 \
+  --k-npf 10 \
+  --npf-softplus-beta 20.0 \
   --k-nn-dro 10 --lr-nn-dro 0.05 \
   --nn-dro-hidden-sizes 256 128 64 --nn-dro-activation relu --nn-dro-init-scale 1e-3 \
   --no-plot --save-json \

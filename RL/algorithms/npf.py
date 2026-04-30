@@ -1,21 +1,31 @@
 """NPF-style WDRO adversary (Vesseron & Cuturi, 2024).
 
-Faithful to the MNIST_Cuturi and Least_Squares implementations:
-
     psi(u) = 0.5 u^T (diag(delta^2) + A^T A) u + a^T u + phi^{NN}(u),
 
 with phi^{NN} a deep ICNN block that re-injects per-layer NPF quadratic
-forms Q(u) = ||delta o u||^2 + ||Au||^2, non-negative dense layers with
-Hoedt-Klambauer LogNormal init and NEGATIVE bias offset, and an
-identity initialisation (init_as_identity) so that T(u) = grad psi(u) ≈ u
-at t=0.
+forms Q(u) = ||delta o u||^2 + ||Au||^2.
+
+Initialization follows the paper exactly and is *not* a choice: the two
+schemes are applied jointly.
+
+  1. Principled (Hoedt-Klambauer LogNormal) draws are used for every
+     non-negative weight (the hidden-to-hidden cascade {W_y^(l)} and the
+     readout w_out). These are NEVER zeroed.
+  2. Identity init zeros the remaining parameter groups so that
+     T(u) = grad psi(u) ≈ u at t=0:
+        - outer P_omega = I (delta=1, A ~ eps-Gaussian),
+        - outer/output linear terms a = 0, b_out = 0,
+        - input-to-hidden paths W_z^(l) = 0, b^(l) = 0,
+        - per-layer quadratic injections at eps scale.
 
 RL-specific: we apply the NPF potential in the UNCONSTRAINED latent
 space u and decode via the sigmoid box bijection, exactly as the ICNN
 adversary does, so xi_adv stays in [xi_low, xi_high] by construction.
 
-Inner maximisation uses a persistent Adam over the NPF parameters for
-K_npf steps per outer call.
+Inner maximisation uses BB + Armijo line search with NPF-specific
+hyperparameters (cfg.npf_eta, cfg.npf_bb_*) whose defaults exactly match
+the ICNN adversary's (cfg.eta_icnn, cfg.bb_*); user can override via
+--npf-eta / --npf-bb-* CLI flags.
 """
 from __future__ import annotations
 
@@ -25,6 +35,7 @@ from config import InnerConfig
 from envs import VecEnvTorch
 from models.npf import NPFInputConvexPotential
 from models.policy import PolicyNet
+from utils.bb_armijo import BBArmijoState, bb_armijo_step_params
 from utils.rollouts import evaluate_return_batch_pathwise
 
 
@@ -51,10 +62,21 @@ class NPFAdversary:
             softplus_beta=cfg.npf_softplus_beta,
             init_eps=cfg.npf_init_eps,
         ).to(device)
+        # Identity init is applied on top of the principled (LogNormal) draws
+        # already produced inside the constructor's non-negative layers.
         self.icnn.init_as_identity()
 
-        # Persistent Adam over the NPF parameters (matches MNIST/LS persistence).
-        self.opt = torch.optim.Adam(self.icnn.parameters(), lr=float(cfg.lr_npf))
+        # BB + Armijo state with NPF-specific knobs whose defaults equal
+        # ICNN's (alpha0=eta_icnn, bb_alpha_min=bb_alpha_min, etc.) so NPF
+        # runs with identical settings to ICNN out of the box.
+        self.bb_state = BBArmijoState.create(
+            alpha0=cfg.npf_eta,
+            alpha_min=cfg.npf_bb_alpha_min,
+            alpha_max=cfg.npf_bb_alpha_max,
+            ls_c=cfg.npf_bb_ls_c,
+            ls_shrink=cfg.npf_bb_ls_shrink,
+            ls_max_steps=cfg.npf_bb_ls_max_steps,
+        )
 
     # -------- box bijection (latent u <-> physical xi) --------
 
@@ -95,28 +117,32 @@ class NPFAdversary:
                 "NPF exact inner optimization requires --grad-method pathwise (autograd)."
             )
 
+        hat = hat_xi
+
         with torch.enable_grad():
             for k in range(int(self.cfg.K_npf)):
                 seed_k = int(seed0 + 1000 * k)
-                xi_local = self.T(hat_xi, create_graph=True)
 
-                J = evaluate_return_batch_pathwise(
-                    env_eval, policy, xi_local,
-                    n_episodes=int(self.cfg.fd_episodes),
-                    max_steps=int(self.cfg.fd_horizon),
-                    seed0=seed_k,
+                def psi_objective(create_graph: bool) -> torch.Tensor:
+                    xi_local = self.T(hat, create_graph=create_graph)
+                    J = evaluate_return_batch_pathwise(
+                        env_eval, policy, xi_local,
+                        n_episodes=int(self.cfg.fd_episodes),
+                        max_steps=int(self.cfg.fd_horizon),
+                        seed0=seed_k,
+                    )
+                    f = -J
+                    diff = xi_local - hat
+                    cost = (diff * diff * self.Mdiag).sum(dim=-1)
+                    obj = (f - float(self.cfg.lam) * cost).mean()
+                    obj = torch.nan_to_num(obj, nan=-1e9, posinf=-1e9, neginf=-1e9)
+                    return obj
+
+                _params, self.bb_state, _fval, _gnorm = bb_armijo_step_params(
+                    self.icnn.parameters(),
+                    psi_objective,
+                    self.bb_state,
                 )
-                f = -J
-
-                diff = xi_local - hat_xi
-                cost = (diff * diff * self.Mdiag).sum(dim=-1)
-
-                obj = (f - float(self.cfg.lam) * cost).mean()
-                obj = torch.nan_to_num(obj, nan=-1e9, posinf=-1e9, neginf=-1e9)
-
-                self.opt.zero_grad(set_to_none=True)
-                (-obj).backward()
-                self.opt.step()
 
         with torch.no_grad():
-            return self.T(hat_xi, create_graph=False)
+            return self.T(hat, create_graph=False)

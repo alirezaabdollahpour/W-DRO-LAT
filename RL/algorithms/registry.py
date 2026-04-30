@@ -50,7 +50,7 @@ def training_title(method: str, env_name: str) -> str:
         "particle": f"Particle Ascent — {env_name}",
         "icnn":     f"ICNN Transport (BB+Armijo) — {env_name}",
         "algo1":    f"Algo1 / WRM — {env_name}",
-        "npf":      f"NPF (ICNN + Adam) — {env_name}",
+        "npf":      f"NPF (ICNN + BB+Armijo) — {env_name}",
         "ppa":      f"PPA — {env_name}",
         "new_ppa":  f"New_PPA — {env_name}",
         "dual":     f"Dual (log-sum-exp) — {env_name}",
