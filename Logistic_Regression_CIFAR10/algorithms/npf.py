@@ -2,15 +2,22 @@
 
 Adapted to the CIFAR-10 feature-space logistic-regression setting:
   * Outer loop: SGD on logistic-regression classifier B
-  * Inner loop: Adam on a flat parameter vector ω optimising
+  * Inner loop: BB+Armijo on the NPF ICNN parameters ω optimising
 
         max_ω  E[ CE(B(T_ω(x)), y) - λ ||T_ω(x) - x||_2^2 ]
 
 where T_ω(x) = ∇ψ_ω(x) is the NPF ICNN transport map (see models/npf.py).
 
-Core algorithm is identical to ``MNIST_Cuturi/algorithms/npf.py``; only the
-outer driver is rewritten so NPF fits the ``BaseLinearDRO.fit`` interface
-used by every other CIFAR-10 DRO baseline.
+Initialization follows the paper exactly and is *not* a choice: principled
+LogNormal draws (used inside the non-negative layers' constructor) and the
+identity init that zeros the input-to-hidden, output linear, and outer/
+per-layer quadratic terms are always applied JOINTLY so that
+T_ω(x) ≈ x at t=0 while the non-negative cascade and readout retain
+their LogNormal draws.
+
+The inner BB+Armijo step uses the EXACT SAME hyperparameters as the
+ICNN-DRO algorithm (cfg.icnn_bb_*) so the only modeling difference
+between NPF and ICNN is the potential's parametrisation.
 """
 from __future__ import annotations
 
@@ -24,12 +31,12 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from algorithms.base import BaseLinearDRO, make_linear_model
-from models.npf import NPFInputConvexPotential, npf_transport_map
-from utils.flatten import flatten_params, unflatten_vector
+from models.npf import NPFInputConvexPotential, npf_T_omega
+from utils.bb_armijo import BBArmijoState, bb_armijo_step_params
 
 
 class NPF(BaseLinearDRO):
-    """NPF-style ICNN transport-map adversary with Adam inner optimiser."""
+    """NPF-style ICNN transport-map adversary with BB+Armijo inner optimiser."""
 
     def __init__(
         self,
@@ -44,8 +51,13 @@ class NPF(BaseLinearDRO):
         npf_elu_alpha: float = 1.0,
         npf_softplus_beta: float = 20.0,
         npf_init_eps: float = 1e-3,
-        inner_steps_npf: int = 20,
-        inner_lr_npf: float = 1e-2,
+        omega_steps_per_batch: int = 10,
+        bb_alpha0: float = 5e-4,
+        bb_alpha_min: float = 1e-6,
+        bb_alpha_max: float = 1.0,
+        bb_ls_c: float = 0.1,
+        bb_ls_shrink: float = 0.5,
+        bb_ls_max_steps: int = 10,
         lr_B: float = 5e-3,
         weight_decay_B: float = 0.0,
         max_itr: int = 10,
@@ -58,8 +70,7 @@ class NPF(BaseLinearDRO):
         super().__init__(input_dim, num_classes, fit_intercept)
 
         self.lambda_param = float(lambda_param)
-        self.inner_steps_npf = int(inner_steps_npf)
-        self.inner_lr_npf = float(inner_lr_npf)
+        self.omega_steps_per_batch = int(omega_steps_per_batch)
         self.lr_B = float(lr_B)
         self.weight_decay_B = float(weight_decay_B)
         self.max_itr = int(max_itr)
@@ -79,29 +90,18 @@ class NPF(BaseLinearDRO):
             softplus_beta=npf_softplus_beta,
             init_eps=npf_init_eps,
         ).to(self.device)
+        # Identity init applied on top of the LogNormal draws produced inside
+        # the non-negative layers' constructor.
         self.psi_omega.init_as_identity()
 
-        params_vec, meta = flatten_params(self.psi_omega)
-        self.params_vec = params_vec.to(self.device)
-        self.meta = meta
-        self.inner_param = self.params_vec.detach().clone().requires_grad_(True)
-        self.inner_opt = optim.Adam([self.inner_param], lr=self.inner_lr_npf)
-
-    def _adv_obj_params(
-        self,
-        vec: torch.Tensor,
-        x_batch: torch.Tensor,
-        y_batch: torch.Tensor,
-        create_graph: bool,
-    ) -> torch.Tensor:
-        params_dict = unflatten_vector(vec, self.meta)
-        adv = npf_transport_map(
-            self.psi_omega, params_dict, x_batch, create_graph=create_graph
+        self.bb_state = BBArmijoState.create(
+            alpha0=bb_alpha0,
+            alpha_min=bb_alpha_min,
+            alpha_max=bb_alpha_max,
+            ls_c=bb_ls_c,
+            ls_shrink=bb_ls_shrink,
+            ls_max_steps=bb_ls_max_steps,
         )
-        logits = self.model(adv)
-        ce = nn.CrossEntropyLoss(reduction="none")(logits, y_batch)
-        w2 = ((adv - x_batch) ** 2).sum(dim=1)
-        return (ce - self.lambda_param * w2).mean()
 
     def fit(
         self,
@@ -134,33 +134,34 @@ class NPF(BaseLinearDRO):
                 x_batch = x_original_batch.to(self.device)
                 y_batch = y_original_batch.to(self.device)
 
-                # Inner loop: Adam ascent on ω (flat parameter vector)
+                # Inner loop: ω-ascent via BB+Armijo
                 self.model.eval()
                 self.psi_omega.train()
 
-                with torch.no_grad():
-                    self.inner_param.data.copy_(self.params_vec.to(self.device))
-
-                for _ in range(self.inner_steps_npf):
-                    self.inner_opt.zero_grad()
-                    obj = self._adv_obj_params(
-                        self.inner_param, x_batch, y_batch, create_graph=True
+                def omega_objective(create_graph: bool) -> torch.Tensor:
+                    x_adv = npf_T_omega(
+                        x_batch, self.psi_omega, create_graph=create_graph
                     )
-                    (-obj).backward()
-                    self.inner_opt.step()
+                    logits = self.model(x_adv)
+                    ce = nn.CrossEntropyLoss(reduction="none")(logits, y_batch)
+                    transport_cost = torch.sum((x_adv - x_batch) ** 2, dim=1)
+                    return (ce - self.lambda_param * transport_cost).mean()
 
-                self.params_vec = self.inner_param.detach().clone()
+                for _ in range(self.omega_steps_per_batch):
+                    _, self.bb_state, _, _ = bb_armijo_step_params(
+                        self.psi_omega.parameters(),
+                        omega_objective,
+                        self.bb_state,
+                    )
 
                 # Outer loop: B-update (SGD) on adversarial features
                 self.model.train()
                 self.psi_omega.eval()
 
-                params_dict_final = unflatten_vector(
-                    self.params_vec.to(self.device), self.meta
-                )
-                adv_feats = npf_transport_map(
-                    self.psi_omega, params_dict_final, x_batch, create_graph=False
-                ).detach()
+                with torch.no_grad():
+                    adv_feats = npf_T_omega(
+                        x_batch, self.psi_omega, create_graph=False
+                    ).detach()
 
                 logits_adv = self.model(adv_feats)
                 loss_B = nn.CrossEntropyLoss()(logits_adv, y_batch)
@@ -179,7 +180,6 @@ class NPF(BaseLinearDRO):
                 {
                     "B_state_dict": self.model.state_dict(),
                     "psi_omega_state_dict": self.psi_omega.state_dict(),
-                    "params_vec": self.params_vec.detach().cpu(),
                 },
                 f"{checkpoint_dir}/NPF_run{run_id}_epoch_{epoch+1}.pth",
             )

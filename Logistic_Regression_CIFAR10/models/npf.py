@@ -294,3 +294,22 @@ def npf_transport_map(
             out.sum(), z_flat_req, create_graph=create_graph
         )[0]
     return grad
+
+
+def npf_T_omega(
+    z_flat: torch.Tensor,
+    icnn_model: NPFInputConvexPotential,
+    create_graph: bool,
+) -> torch.Tensor:
+    """T_ω(z) = ∇_z ψ_ω(z) using the model's live parameters (no functional_call).
+
+    Mirrors the ICNN ``T_omega`` helper so NPF can drive a parameter-list
+    BB+Armijo step in the same idiomatic way as ICNN.
+    """
+    z_in = z_flat.clone().detach().requires_grad_(True)
+    with torch.set_grad_enabled(True):
+        psi_val = icnn_model(z_in)
+        grad = torch.autograd.grad(
+            psi_val.sum(), z_in, create_graph=create_graph
+        )[0]
+    return grad.view_as(z_flat)

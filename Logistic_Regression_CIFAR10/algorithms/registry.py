@@ -103,6 +103,9 @@ def _build_icnn(cfg, input_dim: int, num_classes: int, device: torch.device, eps
 
 
 def _build_npf(cfg, input_dim: int, num_classes: int, device: torch.device, eps_ent: float) -> BaseLinearDRO:
+    # NPF uses its own BB+Armijo knobs (cfg.npf_bb_*); defaults are set to
+    # exactly the ICNN values, so out of the box "same parameters as ICNN"
+    # holds, and the user can deviate from those defaults via --npf_bb_*.
     return NPF(
         input_dim,
         num_classes,
@@ -115,8 +118,13 @@ def _build_npf(cfg, input_dim: int, num_classes: int, device: torch.device, eps_
         npf_elu_alpha=cfg.npf_elu_alpha,
         npf_softplus_beta=cfg.npf_softplus_beta,
         npf_init_eps=cfg.npf_init_eps,
-        inner_steps_npf=cfg.inner_steps_npf,
-        inner_lr_npf=cfg.inner_lr_npf,
+        omega_steps_per_batch=cfg.inner_steps_npf,
+        bb_alpha0=cfg.npf_bb_alpha0,
+        bb_alpha_min=cfg.npf_bb_alpha_min,
+        bb_alpha_max=cfg.npf_bb_alpha_max,
+        bb_ls_c=cfg.npf_bb_ls_c,
+        bb_ls_shrink=cfg.npf_bb_ls_shrink,
+        bb_ls_max_steps=cfg.npf_bb_ls_max_steps,
         lr_B=cfg.npf_lr_B,
         weight_decay_B=cfg.npf_weight_decay_B,
         max_itr=cfg.epochs,
