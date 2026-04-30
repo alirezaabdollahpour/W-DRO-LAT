@@ -92,7 +92,8 @@ class TrainConfig:
     npf_softplus_beta: float = 20.0
     npf_init_eps: float = 1e-3
     inner_steps_npf: int = 20
-    inner_lr_npf: float = 1e-2
+    inner_lr_npf: float = 1e-2  # deprecated (Adam) — kept for CLI back-compat
+    bb_alpha0_npf: float = 5e-4  # NPF BB+Armijo alpha0 (default == bb_alpha0_icnn)
     use_margin_adv_npf: bool = False
 
 
@@ -214,7 +215,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     npf.add_argument("--npf-softplus-beta", type=float, default=20.0)
     npf.add_argument("--npf-init-eps", type=float, default=1e-3)
     npf.add_argument("--inner-steps-npf", type=int, default=20)
-    npf.add_argument("--inner-lr-npf", type=float, default=1e-2)
+    npf.add_argument("--inner-lr-npf", type=float, default=1e-2,
+                     help="Deprecated: NPF now uses BB+Armijo (alpha0=bb_alpha0_npf).")
+    npf.add_argument("--bb-alpha0-npf", type=float, default=5e-4,
+                     help="NPF BB+Armijo alpha0 (default matches --bb-alpha0-icnn).")
     npf.add_argument("--use-margin-adv-npf", action="store_true")
 
     # Sampling-based baselines (I got it from JJ paper)

@@ -63,6 +63,7 @@ class ULSConfig:
     ppa_delta_rtol: float = 1e-4
 
     # NPF-ICNN adversary (Vesseron & Cuturi, 2024)
+    # BB+Armijo defaults mirror icnn_bb_* per "same parameters" spec.
     npf_hidden: Sequence[int] = (64, 64, 64, 64)
     npf_outer_rank: int = 1
     npf_inner_rank: int = 1
@@ -71,7 +72,13 @@ class ULSConfig:
     npf_softplus_beta: float = 20.0
     npf_init_eps: float = 1e-3
     npf_omega_steps_per_epoch: int = 500
-    inner_lr_npf: float = 1e-2
+    inner_lr_npf: float = 1e-2  # deprecated (Adam) — kept for CLI back-compat
+    npf_bb_alpha0: float = 1e-1
+    npf_bb_alpha_min: float = 1e-6
+    npf_bb_alpha_max: float = 10.0
+    npf_bb_ls_c: float = 1e-4
+    npf_bb_ls_shrink: float = 0.5
+    npf_bb_ls_max_steps: int = 10
 
     # NN-DRO (vanilla MLP adversary)
     nn_dro_hidden: Sequence[int] = (64, 64, 64, 64)
@@ -185,7 +192,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     npf.add_argument("--npf-softplus-beta", type=float, default=20.0, dest="npf_softplus_beta")
     npf.add_argument("--npf-init-eps", type=float, default=1e-3, dest="npf_init_eps")
     npf.add_argument("--npf-omega-steps-per-epoch", type=int, default=500, dest="npf_omega_steps_per_epoch")
-    npf.add_argument("--inner-lr-npf", type=float, default=1e-2, dest="inner_lr_npf")
+    npf.add_argument("--inner-lr-npf", type=float, default=1e-2, dest="inner_lr_npf",
+                     help="Deprecated: NPF now uses BB+Armijo, not Adam.")
+    npf.add_argument("--npf-bb-alpha0", type=float, default=1e-1, dest="npf_bb_alpha0",
+                     help="NPF BB+Armijo alpha0 (default matches --icnn-bb-alpha0 conceptually).")
+    npf.add_argument("--npf-bb-alpha-min", type=float, default=1e-6, dest="npf_bb_alpha_min")
+    npf.add_argument("--npf-bb-alpha-max", type=float, default=10.0, dest="npf_bb_alpha_max")
+    npf.add_argument("--npf-bb-ls-c", type=float, default=1e-4, dest="npf_bb_ls_c")
+    npf.add_argument("--npf-bb-ls-shrink", type=float, default=0.5, dest="npf_bb_ls_shrink")
+    npf.add_argument("--npf-bb-ls-max-steps", type=int, default=10, dest="npf_bb_ls_max_steps")
 
     nn_dro = parser.add_argument_group("nn_dro")
     nn_dro.add_argument("--nn-dro-hidden", type=_int_tuple, default=(64, 64, 64, 64), dest="nn_dro_hidden")

@@ -23,7 +23,7 @@ class TrainConfig:
     # Figure 6 core hyperparameters
     tau: float = 0.05
     lambda_param: float = 10.0  # derived: 1 / (2 * tau)
-    eps_ent: Tuple[float, ...] = (0.2, 0.02, 0.002)
+    eps_ent: Tuple[float, ...] = (0.2) # (0.2, 0.02, 0.002)
     epochs: int = 10
     inner_lr: float = 0.01
     inner_steps: int = 100
@@ -69,21 +69,27 @@ class TrainConfig:
     icnn_bb_ls_shrink: float = 0.5
     icnn_bb_ls_max_steps: int = 10
 
-    # NPF knobs
-    npf_hidden: Tuple[int, ...] = (512, 512, 256, 256, 128)
+    # NPF knobs (BB+Armijo defaults mirror icnn_bb_* per "same parameters" spec)
+    npf_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
     npf_outer_rank: int = 4
     npf_inner_rank: int = 1
     npf_activation: str = "elu"
     npf_elu_alpha: float = 1.0
     npf_softplus_beta: float = 20.0
     npf_init_eps: float = 1e-3
-    inner_steps_npf: int = 20
-    inner_lr_npf: float = 1e-2
+    inner_steps_npf: int = 10
+    inner_lr_npf: float = 1e-2  # deprecated (Adam) — kept for CLI back-compat
     npf_lr_B: float = 5e-4
     npf_weight_decay_B: float = 0.0
+    npf_bb_alpha0: float = 5e-4
+    npf_bb_alpha_min: float = 1e-6
+    npf_bb_alpha_max: float = 1.0
+    npf_bb_ls_c: float = 0.1
+    npf_bb_ls_shrink: float = 0.5
+    npf_bb_ls_max_steps: int = 10
 
     # NN-DRO knobs (vanilla-MLP adversary, no gradient-of-potential)
-    nn_dro_hidden: Tuple[int, ...] = (512, 512, 256)
+    nn_dro_hidden: Tuple[int, ...] = (512, 512, 256, 256, 128)
     nn_dro_activation: str = "relu"
     nn_dro_softplus_beta: float = 20.0
     nn_dro_init_scale: float = 1e-3
@@ -141,9 +147,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dro_lr", type=float, default=5e-3,
                         help="Outer learning rate for DRO baselines (reference code uses 5e-3).")
     parser.add_argument("--saa_lr", type=float, default=1e-3, help="ERM/SAA learning rate.")
-    parser.add_argument("--batch_size", type=int, default=128,
+    parser.add_argument("--batch_size", type=int, default=256,
                         help="Batch size for training DRO + SAA.")
-    parser.add_argument("--feature_batch_size", type=int, default=128,
+    parser.add_argument("--feature_batch_size", type=int, default=256,
                         help="Batch size for feature extraction.")
     parser.add_argument("--num_workers", type=int, default=2,
                         help="Dataloader workers (feature extraction + eval).")
@@ -203,18 +209,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # NPF knobs
     npf = parser.add_argument_group("npf")
     npf.add_argument("--npf_hidden", type=int, nargs="+",
-                     default=[512, 512, 256, 256, 128])
+                     default=[512, 512, 256])
     npf.add_argument("--npf_outer_rank", type=int, default=4)
     npf.add_argument("--npf_inner_rank", type=int, default=1)
-    npf.add_argument("--npf_activation", type=str, default="elu",
+    npf.add_argument("--npf_activation", type=str, default="softplus",
                      choices=["elu", "softplus", "relu"])
     npf.add_argument("--npf_elu_alpha", type=float, default=1.0)
     npf.add_argument("--npf_softplus_beta", type=float, default=20.0)
     npf.add_argument("--npf_init_eps", type=float, default=1e-3)
-    npf.add_argument("--inner_steps_npf", type=int, default=20)
-    npf.add_argument("--inner_lr_npf", type=float, default=1e-2)
+    npf.add_argument("--inner_steps_npf", type=int, default=10)
+    npf.add_argument("--inner_lr_npf", type=float, default=1e-2,
+                     help="Deprecated: Adam lr is no longer used (now BB+Armijo).")
     npf.add_argument("--npf_lr_B", type=float, default=5e-4)
     npf.add_argument("--npf_weight_decay_B", type=float, default=0.0)
+    npf.add_argument("--npf_bb_alpha0", type=float, default=5e-4,
+                     help="NPF BB+Armijo alpha0 (default matches --icnn_bb_alpha0).")
+    npf.add_argument("--npf_bb_alpha_min", type=float, default=1e-6)
+    npf.add_argument("--npf_bb_alpha_max", type=float, default=1.0)
+    npf.add_argument("--npf_bb_ls_c", type=float, default=0.1)
+    npf.add_argument("--npf_bb_ls_shrink", type=float, default=0.5)
+    npf.add_argument("--npf_bb_ls_max_steps", type=int, default=10)
 
     # NN-DRO knobs
     nn_dro = parser.add_argument_group("nn_dro")

@@ -88,9 +88,13 @@ class InnerConfig:
     rgo_inner_lr: float = 0.05
     rgo_max_trials: int = 10
 
-    # --- npf (Vesseron & Cuturi, 2024): NPF ICNN potential + persistent Adam ---
+    # --- npf (Vesseron & Cuturi, 2024): NPF ICNN potential + BB+Armijo ---
+    # Defaults of npf_eta and npf_bb_* mirror the ICNN adversary's
+    # eta_icnn / bb_* exactly, so NPF runs with identical BB+Armijo
+    # settings to ICNN unless the user overrides them.  lr_npf is
+    # retained only for backward CLI compatibility (Adam is gone).
     K_npf: int = 10
-    lr_npf: float = 5e-2
+    lr_npf: float = 5e-2  # deprecated, kept for CLI back-compat
     npf_hidden_sizes: Tuple[int, ...] = (512, 512, 256, 128, 64)
     npf_outer_rank: int = 4
     npf_inner_rank: int = 1
@@ -98,6 +102,12 @@ class InnerConfig:
     npf_elu_alpha: float = 1.0
     npf_softplus_beta: float = 20.0
     npf_init_eps: float = 1e-3
+    npf_eta: float = 5e-2          # mirrors eta_icnn (BB+Armijo alpha0)
+    npf_bb_alpha_min: float = 0.0005
+    npf_bb_alpha_max: float = 0.01
+    npf_bb_ls_c: float = 0.1
+    npf_bb_ls_shrink: float = 0.5
+    npf_bb_ls_max_steps: int = 10
 
     # --- nn_dro (vanilla MLP adversary, no gradient-of-potential) ---
     K_nn_dro: int = 10
@@ -304,6 +314,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--npf-init-eps", type=float, default=default_inner.npf_init_eps,
         help="Live-at-init scale for per-layer quadratic forms (0 to disable).",
     )
+    parser.add_argument(
+        "--npf-eta", type=float, default=default_inner.npf_eta,
+        help="NPF BB+Armijo alpha0 (default matches --eta-icnn).",
+    )
+    parser.add_argument("--npf-bb-alpha-min", type=float, default=default_inner.npf_bb_alpha_min)
+    parser.add_argument("--npf-bb-alpha-max", type=float, default=default_inner.npf_bb_alpha_max)
+    parser.add_argument("--npf-bb-ls-c", type=float, default=default_inner.npf_bb_ls_c)
+    parser.add_argument("--npf-bb-ls-shrink", type=float, default=default_inner.npf_bb_ls_shrink)
+    parser.add_argument("--npf-bb-ls-max-steps", type=int, default=default_inner.npf_bb_ls_max_steps)
 
     # --- nn_dro (vanilla MLP adversary) ---
     parser.add_argument("--k-nn-dro", type=int, default=default_inner.K_nn_dro)
@@ -430,6 +449,12 @@ def build_inner_config_from_args(args: argparse.Namespace, *, env_name: str) -> 
         npf_elu_alpha=float(args.npf_elu_alpha),
         npf_softplus_beta=float(args.npf_softplus_beta),
         npf_init_eps=float(args.npf_init_eps),
+        npf_eta=float(args.npf_eta),
+        npf_bb_alpha_min=float(args.npf_bb_alpha_min),
+        npf_bb_alpha_max=float(args.npf_bb_alpha_max),
+        npf_bb_ls_c=float(args.npf_bb_ls_c),
+        npf_bb_ls_shrink=float(args.npf_bb_ls_shrink),
+        npf_bb_ls_max_steps=int(args.npf_bb_ls_max_steps),
         K_nn_dro=int(args.k_nn_dro),
         lr_nn_dro=float(args.lr_nn_dro),
         nn_dro_hidden_sizes=tuple(int(v) for v in args.nn_dro_hidden_sizes),
