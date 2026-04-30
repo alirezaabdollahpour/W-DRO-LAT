@@ -1,4 +1,15 @@
-"""NPF-ICNN WDRO adversary (Vesseron & Cuturi, 2024) with persistent Adam inner loop."""
+"""NPF-ICNN WDRO adversary (Vesseron & Cuturi, 2024) with BB+Armijo inner loop.
+
+Inner ω-ascent uses BB+Armijo with NPF-specific hyperparameters
+(cfg.npf_bb_*) whose defaults exactly match the ICNN adversary's
+(cfg.icnn_bb_*) — out of the box, NPF and ICNN run with identical
+inner-loop settings, and the user can deviate via --npf-bb-* CLI flags.
+
+Initialization follows the paper exactly and is *not* a choice: the
+non-negative layers' principled LogNormal draws and the identity init
+that zeros the remaining parameter groups (down to eps scale) are
+applied JOINTLY so T(z) ≈ z at t=0.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict, Tuple
@@ -7,6 +18,7 @@ import torch
 
 from config import ULSConfig
 from models.npf import NPFResidualPotential
+from utils.bb_armijo import BBArmijoState, bb_armijo_step_params
 from utils.common import clip_grad
 from utils.loss import loss_function, loss_grad_theta
 from utils.transport import transport_map
@@ -33,7 +45,15 @@ def _solve_npf_icnn_map_with_zstar(
         init_eps=cfg.npf_init_eps,
     ).to(device).to(xi_train.dtype)
 
-    inner_opt = torch.optim.Adam(psi.parameters(), lr=cfg.inner_lr_npf)
+    bb_state = BBArmijoState.create(
+        alpha0=cfg.npf_bb_alpha0,
+        alpha_min=cfg.npf_bb_alpha_min,
+        alpha_max=cfg.npf_bb_alpha_max,
+        ls_c=cfg.npf_bb_ls_c,
+        ls_shrink=cfg.npf_bb_ls_shrink,
+        ls_max_steps=cfg.npf_bb_ls_max_steps,
+    )
+
     xi_2d = xi_train.view(-1, 1)
 
     diagnostics: Dict[str, list] = {
@@ -45,15 +65,17 @@ def _solve_npf_icnn_map_with_zstar(
     z_adv = xi_train.detach().clone()
 
     for _epoch in range(cfg.epochs):
-        # Inner ascent on psi (Adam minimises the negated objective).
+        # Inner ascent on psi via BB+Armijo (mirrors the ICNN inner loop).
         for _ in range(cfg.npf_omega_steps_per_epoch):
-            inner_opt.zero_grad()
-            z_adv = transport_map(xi_2d, psi, create_graph=True).view(-1)
-            f = loss_function(theta, z_adv, A0, A1, b, cfg.dim_m)
-            reg = cfg.lam * (z_adv - xi_train) ** 2
-            obj = (f - reg).mean()
-            (-obj).backward()
-            inner_opt.step()
+            def omega_objective(create_graph: bool) -> torch.Tensor:
+                z_a = transport_map(xi_2d, psi, create_graph=create_graph).view(-1)
+                f = loss_function(theta, z_a, A0, A1, b, cfg.dim_m)
+                reg = cfg.lam * (z_a - xi_train) ** 2
+                return (f - reg).mean()
+
+            _, bb_state, _, _ = bb_armijo_step_params(
+                psi.parameters(), omega_objective, bb_state
+            )
 
         # Outer update on theta using the final clamped adversary.
         with torch.no_grad():

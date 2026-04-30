@@ -202,7 +202,12 @@ class NPFInputConvexBlock(nn.Module):
 class NPFResidualPotential(nn.Module):
     """Top-level convex potential:
         psi(z) = 0.5 z^T (diag(delta^2) + A^T A) z + a^T z + phi^{NN}(z).
-    Identity-initialised so that T(z) = grad psi(z) ≈ z at t=0.
+
+    Initialization follows the paper exactly: principled (Hoedt-Klambauer
+    LogNormal) draws on every non-negative weight (always retained) AND
+    the identity init that zeros the input-to-hidden, output linear, and
+    outer/per-layer quadratic terms (down to eps scale) are applied
+    JOINTLY so that T(z) = grad psi(z) ≈ z at t=0.
     """
 
     def __init__(
