@@ -108,8 +108,12 @@ def bb_armijo_step_params(
         retain_graph=False,
         allow_unused=True,
     )
+    # Use reshape(-1) + cat instead of nn_utils.parameters_to_vector here:
+    # autograd.grad can return non-contiguous tensors (e.g. through .t() /
+    # einsum in NPF), and parameters_to_vector internally calls view(-1)
+    # which fails on non-contiguous storage.
     grad_tensors = [g.detach() if g is not None else torch.zeros_like(p) for p, g in zip(params, grads)]
-    grad_vec = nn_utils.parameters_to_vector(grad_tensors)
+    grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
     grad_norm = grad_vec.norm().item()
 
     alpha = bb_state.propose(params_vec, grad_vec)
@@ -141,7 +145,7 @@ def bb_armijo_step_params(
         allow_unused=True,
     )
     grad_tensors_new = [g.detach() if g is not None else torch.zeros_like(p) for p, g in zip(params, grads_new)]
-    grad_vec_new = nn_utils.parameters_to_vector(grad_tensors_new)
+    grad_vec_new = torch.cat([g.reshape(-1) for g in grad_tensors_new])
     new_state = bb_state.update_history(final_vec, grad_vec_new, alpha_k)
     return params, new_state, f_val_float, grad_vec_new.norm().item()
 
