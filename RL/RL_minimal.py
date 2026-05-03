@@ -297,7 +297,7 @@ def train(
         hat_xi_plot = sample_hat_xi(cfg_inner, int(plot_samples), seed=seed + 99_999, device=device)
         xi_adv_plot = adv.adversarial_xi(env_eval, policy, hat_xi_plot, seed0=seed + 88_888)
 
-    return logs, to_np(hat_xi_plot), to_np(xi_adv_plot), policy
+    return logs, to_np(hat_xi_plot), to_np(xi_adv_plot), policy, adv
 
 
 def plot_results(logs, hat_xi, xi_adv, title: str, *, xi_names: Optional[Tuple[str, ...]] = None):
@@ -362,7 +362,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     methods_payload: Dict[str, Any] = {}
     for method in methods:
-        logs, hat_xi, xi_adv, trained_policy = train(
+        logs, hat_xi, xi_adv, trained_policy, trained_adv = train(
             method=method,
             env_name=str(args.env),
             seed=int(args.seed),
@@ -401,6 +401,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "hat_xi_plot": hat_xi.tolist(),
             "xi_adv_plot": xi_adv.tolist(),
             "_policy": trained_policy,
+            "_adv": trained_adv,
         }
 
         if not args.no_plot:
@@ -443,9 +444,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         for method_name, md in payload["runs"].items():
             policy_obj = md.pop("_policy", None)
+            adv_obj = md.pop("_adv", None)
             if policy_obj is not None:
                 ckpt_path = out_path.parent / f"{out_path.stem}_{method_name}_policy.pt"
-                torch.save({
+                ckpt_payload: Dict[str, Any] = {
                     "policy_state_dict": policy_obj.state_dict(),
                     "obs_dim": policy_obj.net[0].in_features,
                     "act_dim": policy_obj.net[-1].out_features,
@@ -455,7 +457,58 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "seed": int(args.seed),
                     "lam": float(args.lam),
                     "iters": int(args.iters),
-                }, ckpt_path)
+                }
+                # Persist the trained parametric-adversary state so the Monge-gap
+                # eval (monge_gap_sweep.py rl_cartpole backend) can reload the
+                # exact trained transport map T_psi rather than re-running an
+                # inner ascent from a freshly initialized adversary.
+                # Non-parametric adversaries (particle, ppa, dual, wfr, ...)
+                # carry no learned state, so we record adv_kind="none".
+                if adv_obj is not None and getattr(adv_obj, "icnn", None) is not None:
+                    icnn_mod = adv_obj.icnn
+                    is_npf = type(icnn_mod).__name__ == "NPFInputConvexPotential"
+                    ckpt_payload["adv_kind"] = "npf" if is_npf else "icnn"
+                    ckpt_payload["adv_state_dict"] = icnn_mod.state_dict()
+                    if is_npf:
+                        ckpt_payload["adv_arch"] = {
+                            "input_dim": int(len(cfg_inner.xi_low)),
+                            "hidden_sizes": list(cfg_inner.npf_hidden_sizes),
+                            "outer_rank": int(cfg_inner.npf_outer_rank),
+                            "inner_rank": int(cfg_inner.npf_inner_rank),
+                            "activation": str(cfg_inner.npf_activation),
+                            "elu_alpha": float(cfg_inner.npf_elu_alpha),
+                            "softplus_beta": float(cfg_inner.npf_softplus_beta),
+                            "init_eps": float(cfg_inner.npf_init_eps),
+                        }
+                    else:
+                        ckpt_payload["adv_arch"] = {
+                            "input_dim": int(len(cfg_inner.xi_low)),
+                            "hidden_sizes": list(cfg_inner.icnn_hidden_sizes),
+                            "activation": str(cfg_inner.icnn_activation),
+                            "strong_convexity": float(cfg_inner.icnn_strong_convexity),
+                            "nonneg_init": str(cfg_inner.icnn_nonneg_init),
+                            "softplus_beta": float(cfg_inner.icnn_softplus_beta),
+                            "icnn_init": str(cfg_inner.icnn_init),
+                        }
+                elif adv_obj is not None and getattr(adv_obj, "mlp", None) is not None:
+                    mlp_mod = adv_obj.mlp
+                    ckpt_payload["adv_kind"] = "nn_dro"
+                    ckpt_payload["adv_state_dict"] = mlp_mod.state_dict()
+                    ckpt_payload["adv_arch"] = {
+                        "input_dim": int(len(cfg_inner.xi_low)),
+                        "hidden_sizes": list(cfg_inner.nn_dro_hidden_sizes),
+                        "activation": str(cfg_inner.nn_dro_activation),
+                        "softplus_beta": float(cfg_inner.nn_dro_softplus_beta),
+                        "init_scale": float(cfg_inner.nn_dro_init_scale),
+                    }
+                else:
+                    ckpt_payload["adv_kind"] = "none"
+                # The xi-box defines the box bijection used by parametric
+                # adversaries; persist alongside arch so the eval backend can
+                # reconstruct without re-reading the JSON.
+                ckpt_payload["xi_low"] = list(cfg_inner.xi_low)
+                ckpt_payload["xi_high"] = list(cfg_inner.xi_high)
+                torch.save(ckpt_payload, ckpt_path)
                 log_line(f"[save] wrote checkpoint: {ckpt_path}")
 
         write_json(out_path, payload)
@@ -463,6 +516,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         for md in methods_payload.values():
             md.pop("_policy", None)
+            md.pop("_adv", None)
 
     return 0
 
