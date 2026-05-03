@@ -89,25 +89,39 @@ class InnerConfig:
     rgo_max_trials: int = 10
 
     # --- npf (Vesseron & Cuturi, 2024): NPF ICNN potential + BB+Armijo ---
-    # Defaults of npf_eta and npf_bb_* mirror the ICNN adversary's
-    # eta_icnn / bb_* exactly, so NPF runs with identical BB+Armijo
-    # settings to ICNN unless the user overrides them.  lr_npf is
-    # retained only for backward CLI compatibility (Adam is gone).
+    # Defaults below were retuned after the lam=0.1 cell collapsed to the
+    # corner-saturation regime (every anchor mapped to a box corner; |u_adv|
+    # ~ 1e11 in u-space; Monge gap ~1e19). With weak regularization (small
+    # lam), the inner objective -J - lam*cost has an unbounded sup unless
+    # psi's weights are kept finite. Two safeguards:
+    #
+    #   (1) npf_weight_decay > 0 — adds 0.5*wd*||theta||^2 to the inner
+    #       objective, so the BB+Armijo ascent direction becomes
+    #           g_eff = grad(-J - lam*cost) - wd * theta.
+    #       This bounds psi's weights and is the cleanest fix for small lam.
+    #   (2) npf_grad_clip > 0 — caps ||g_eff|| per step. Catches transient
+    #       spikes from near-edge anchors where the policy gradient explodes.
+    #
+    # Step-size ceilings (npf_eta, npf_bb_alpha_max) and init perturbation
+    # (npf_init_eps) are also tighter so the optimizer stays in the
+    # well-conditioned regime even at lam=0.1.
     K_npf: int = 10
     lr_npf: float = 5e-2  # deprecated, kept for CLI back-compat
-    npf_hidden_sizes: Tuple[int, ...] = (512, 512, 256, 128, 64)
+    npf_hidden_sizes: Tuple[int, ...] = (512, 512, 256)
     npf_outer_rank: int = 4
     npf_inner_rank: int = 1
-    npf_activation: str = "elu"  # ELU is the NPF paper's default
+    npf_activation: str = "softplus"  # ELU is the NPF paper's default
     npf_elu_alpha: float = 1.0
     npf_softplus_beta: float = 20.0
-    npf_init_eps: float = 1e-3
-    npf_eta: float = 5e-2          # mirrors eta_icnn (BB+Armijo alpha0)
-    npf_bb_alpha_min: float = 0.0005
-    npf_bb_alpha_max: float = 0.01
+    npf_init_eps: float = 1e-4     # was 1e-3; start closer to identity
+    npf_eta: float = 1e-2          # was 5e-2; gentler initial BB+Armijo step
+    npf_bb_alpha_min: float = 1e-4 # was 5e-4
+    npf_bb_alpha_max: float = 5e-3 # was 1e-2; halved to bound single steps
     npf_bb_ls_c: float = 0.1
     npf_bb_ls_shrink: float = 0.5
     npf_bb_ls_max_steps: int = 10
+    npf_weight_decay: float = 1e-4 # NEW: prevents psi-weight drift at small lam
+    npf_grad_clip: float = 10.0    # NEW: caps single-step grad norm
 
     # --- nn_dro (vanilla MLP adversary, no gradient-of-potential) ---
     K_nn_dro: int = 10
@@ -323,6 +337,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--npf-bb-ls-c", type=float, default=default_inner.npf_bb_ls_c)
     parser.add_argument("--npf-bb-ls-shrink", type=float, default=default_inner.npf_bb_ls_shrink)
     parser.add_argument("--npf-bb-ls-max-steps", type=int, default=default_inner.npf_bb_ls_max_steps)
+    parser.add_argument(
+        "--npf-weight-decay", type=float, default=default_inner.npf_weight_decay,
+        help="L2 weight decay on the NPF convex potential. 0 disables. "
+             "Use a non-zero value (e.g. 1e-4) for small lambda to keep "
+             "psi-weights bounded — without it the inner objective -J - "
+             "lam*cost has an unbounded sup at small lam and ascent drives "
+             "every push to a corner of the xi-box.",
+    )
+    parser.add_argument(
+        "--npf-grad-clip", type=float, default=default_inner.npf_grad_clip,
+        help="Cap on ||g||_2 per BB+Armijo step (0 disables). Mostly a "
+             "safety net — most steps fall well below the cap.",
+    )
 
     # --- nn_dro (vanilla MLP adversary) ---
     parser.add_argument("--k-nn-dro", type=int, default=default_inner.K_nn_dro)
@@ -455,6 +482,8 @@ def build_inner_config_from_args(args: argparse.Namespace, *, env_name: str) -> 
         npf_bb_ls_c=float(args.npf_bb_ls_c),
         npf_bb_ls_shrink=float(args.npf_bb_ls_shrink),
         npf_bb_ls_max_steps=int(args.npf_bb_ls_max_steps),
+        npf_weight_decay=float(args.npf_weight_decay),
+        npf_grad_clip=float(args.npf_grad_clip),
         K_nn_dro=int(args.k_nn_dro),
         lr_nn_dro=float(args.lr_nn_dro),
         nn_dro_hidden_sizes=tuple(int(v) for v in args.nn_dro_hidden_sizes),

@@ -17,6 +17,8 @@ class BBArmijoState:
     ls_c: float
     ls_shrink: float
     ls_max_steps: int
+    weight_decay: float = 0.0
+    grad_clip: float = 0.0  # 0 disables; otherwise rescale to ||g|| <= grad_clip
     prev_params_vec: Optional[torch.Tensor] = None
     prev_grad_vec: Optional[torch.Tensor] = None
 
@@ -29,6 +31,8 @@ class BBArmijoState:
         ls_c: float = 1e-4,
         ls_shrink: float = 0.5,
         ls_max_steps: int = 10,
+        weight_decay: float = 0.0,
+        grad_clip: float = 0.0,
     ) -> "BBArmijoState":
         alpha0 = float(max(alpha_min, min(alpha_max, alpha0)))
         return cls(
@@ -38,6 +42,8 @@ class BBArmijoState:
             ls_c=float(ls_c),
             ls_shrink=float(ls_shrink),
             ls_max_steps=int(max(ls_max_steps, 1)),
+            weight_decay=float(max(weight_decay, 0.0)),
+            grad_clip=float(max(grad_clip, 0.0)),
         )
 
     def propose(self, params_vec: torch.Tensor, grad_vec: torch.Tensor) -> float:
@@ -71,6 +77,8 @@ class BBArmijoState:
             ls_c=self.ls_c,
             ls_shrink=self.ls_shrink,
             ls_max_steps=self.ls_max_steps,
+            weight_decay=self.weight_decay,
+            grad_clip=self.grad_clip,
             prev_params_vec=params_vec.detach().clone(),
             prev_grad_vec=grad_vec.detach().clone(),
         )
@@ -101,6 +109,22 @@ def bb_armijo_step_params(
     # calls view(-1) which fails on non-contiguous storage.
     grad_tensors = [g.detach() if g is not None else torch.zeros_like(p) for p, g in zip(params, grads)]
     grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
+
+    # Weight decay: ascending on (J - 0.5*wd*||theta||^2) means subtracting
+    # wd*theta from the ascent direction. This is the standard L2-prox trick;
+    # for the NPF/ICNN convex potential it prevents weight drift to the
+    # corner-saturation regime when the cost penalty (lam) is small.
+    if bb_state.weight_decay > 0.0:
+        grad_vec = grad_vec - bb_state.weight_decay * params_vec
+
+    # Gradient norm clipping. Caps single-step magnitude when the policy
+    # term -J spikes (e.g. on near-edge anchors); has no effect inside the
+    # well-behaved regime where ||g|| <= grad_clip.
+    if bb_state.grad_clip > 0.0:
+        gnorm = grad_vec.norm()
+        if torch.isfinite(gnorm) and float(gnorm.item()) > bb_state.grad_clip:
+            grad_vec = grad_vec * (bb_state.grad_clip / float(gnorm.item()))
+
     grad_norm = grad_vec.norm().item()
 
     alpha = bb_state.propose(params_vec, grad_vec)

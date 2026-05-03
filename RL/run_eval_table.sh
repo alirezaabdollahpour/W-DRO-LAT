@@ -6,6 +6,22 @@ cd "${SCRIPT_DIR}"
 
 PYTHON_BIN="${PYTHON:-python}"
 
+# Where to look for *_policy.pt checkpoints. Defaults to SCRIPT_DIR (legacy:
+# RL_minimal.py drops checkpoints next to itself). Override to evaluate
+# checkpoints stored in a sibling dir, e.g. monge_gap_runs/horizon_1000/.
+CKPT_DIR="${CKPT_DIR:-${SCRIPT_DIR}}"
+
+# Eval-time episode cap and trial count. Default mirrors the paper table
+# (max_steps=500, trials=1000). Override MAX_STEPS for longer-horizon
+# stress tests of policies trained with a shorter training horizon.
+MAX_STEPS="${MAX_STEPS:-500}"
+TRIALS="${TRIALS:-1000}"
+
+# Where to write the per-prefix .tex/.json. Defaults to CKPT_DIR so eval
+# artifacts land alongside the inputs they describe.
+OUT_DIR="${OUT_DIR:-${CKPT_DIR}}"
+mkdir -p "${OUT_DIR}"
+
 # ---- Configuration ----
 # Evaluate ALL method checkpoints produced by a single training run of
 # RL_minimal.py, so the comparison is fair (same seed, same environment,
@@ -30,9 +46,9 @@ if [ -z "$PREFIX" ]; then
     # Latest checkpoint file (any method); strip a known method suffix to
     # recover the run prefix. We must match against the method list because
     # the prefix itself contains underscores (e.g. the timestamp chunk).
-    LATEST=$(ls -t "${SCRIPT_DIR}"/*_policy.pt 2>/dev/null | head -1 || true)
+    LATEST=$(ls -t "${CKPT_DIR}"/*_policy.pt 2>/dev/null | head -1 || true)
     if [ -z "$LATEST" ]; then
-        echo "ERROR: No *_policy.pt checkpoints found in ${SCRIPT_DIR}."
+        echo "ERROR: No *_policy.pt checkpoints found in ${CKPT_DIR}."
         echo "Train first with: bash run_RL_minimal_icnn.sh"
         exit 1
     fi
@@ -76,7 +92,7 @@ CKPTS=()
 NAMES=()
 
 for m in "${ORDER[@]}"; do
-    f="${SCRIPT_DIR}/${PREFIX}_${m}_policy.pt"
+    f="${CKPT_DIR}/${PREFIX}_${m}_policy.pt"
     if [ -f "$f" ]; then
         CKPTS+=("$f")
         NAMES+=("${LABEL[$m]}")
@@ -95,14 +111,14 @@ echo
 echo "Evaluating ${#CKPTS[@]} policies."
 echo
 
-OUT_TAG="${PREFIX}"
+OUT_TAG="${PREFIX}_h${MAX_STEPS}"
 
 exec "${PYTHON_BIN}" RL_eval_table.py \
     --checkpoints   "${CKPTS[@]}" \
     --column-names  "${NAMES[@]}" \
-    --trials 1000 \
-    --max-steps 500 \
+    --trials "${TRIALS}" \
+    --max-steps "${MAX_STEPS}" \
     --seed 42 \
-    --out-latex "eval_table_${OUT_TAG}.tex" \
-    --out-json  "eval_table_${OUT_TAG}.json" \
+    --out-latex "${OUT_DIR}/eval_table_${OUT_TAG}.tex" \
+    --out-json  "${OUT_DIR}/eval_table_${OUT_TAG}.json" \
     "$@"

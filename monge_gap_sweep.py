@@ -35,7 +35,11 @@ import torch
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from monge_gap_utils.monge_gap import monge_gap_hungarian, monge_gap_sinkhorn
+from monge_gap_utils.monge_gap import (
+    monge_gap_hungarian,
+    monge_gap_sinkhorn,
+    monge_gap_subsample_hungarian,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -740,12 +744,29 @@ class RLCartpoleBackend:
     gap on a held-out batch of xi anchors (drawn uniformly from the
     [xi_low, xi_high] box).
 
-    Training in RL_minimal.py only saves the *policy* parameters; the
-    adversary state (NPF psi, NN-DRO MLP, etc.) is not persisted. Therefore
-    the Monge-gap evaluation re-runs ``adversary.adversarial_xi(...)`` once
-    on the held-out batch, with the policy frozen. This is exactly what
-    each outer-iteration call to the adversary does during training, so the
-    evaluation matches the trained behavior up to inner optimizer state.
+    Behavior depends on whether the checkpoint was produced by the *current*
+    RL_minimal.py (which persists the trained parametric adversary state
+    alongside the policy under the keys ``adv_kind`` / ``adv_state_dict`` /
+    ``adv_arch``) or an older version (policy-only):
+
+      * **Parametric adversaries** (``icnn``, ``npf``, ``nn_dro``).  When the
+        checkpoint contains ``adv_kind in {"icnn", "npf", "nn_dro"}``, we
+        rebuild the trained module from ``adv_arch`` + ``adv_state_dict`` and
+        apply its transport map ``T(z_hat)`` *directly* (one map evaluation;
+        no inner re-optimization). This matches what the LR-CIFAR10 backend
+        does and is what the paper table reports.
+      * **Non-parametric adversaries** (``particle``, ``ppa``, ``dual``,
+        ``wfr``, ``wgf``, ``svg``, ``rgo``, ``algo1``, ``new_ppa``).  These
+        carry no trained state of their own; we replay the inner
+        ascent/sampling against the trained policy via
+        ``adversary.adversarial_xi(...)`` — semantically identical to a
+        per-minibatch call at training time.
+      * **Nominal** (= ERM). Identity push by definition (the row used as
+        ``T = id`` reference in the LR-CIFAR10 table).
+
+    Older policy-only checkpoints are still accepted: parametric methods
+    fall back to a freshly initialized ``adversarial_xi`` run, with a
+    one-time warning printed to stderr.
 
     Checkpoint filenames are
         ``RL_minimal_{env}_{tag}_seed{seed}_lam_{lam}_softplusbeta_{beta}_{ts}_{method}_policy.pt``
@@ -786,7 +807,19 @@ class RLCartpoleBackend:
     # --- backend interface ---
 
     def supported_methods(self):
-        return ("nominal", "particle", "ppa", "npf", "wfr", "dual", "nn_dro")
+        # Mirrors the registry in RL/algorithms/registry.py. The paper's table
+        # rows map as follows:
+        #   ERM      -> nominal      (identity push)
+        #   PA       -> particle     (or algo1 / WRM)
+        #   WFR      -> wfr
+        #   SDRO     -> dual
+        #   NN-DRO   -> nn_dro
+        #   MPA      -> ppa          (Brenier-projection-based)
+        #   ICNN-DRO -> icnn or npf  (gradient of ICNN potential; both Brenier)
+        return (
+            "nominal", "particle", "icnn", "algo1", "npf",
+            "ppa", "new_ppa", "dual", "wgf", "wfr", "svg", "rgo", "nn_dro",
+        )
 
     def sample_held_out_anchors(self, eval_size, seed, device):
         g = torch.Generator(device="cpu").manual_seed(int(seed))
@@ -795,17 +828,32 @@ class RLCartpoleBackend:
 
     def _find_policy(self, method, lam, seed) -> Path:
         # Filename: RL_minimal_{env}_{tag}_seed{seed}_lam_{lam}_..._{method}_policy.pt
-        # Glob with seed/lam/method substrings; return the most recent timestamp.
-        # The {tag} in the filename is the method tag; we just match by *method*_policy.pt.
+        # Strict primary match on (seed, lam, method). The fallback to a less
+        # specific glob is only allowed when it is *unambiguous* (1 candidate);
+        # otherwise we fail loudly rather than silently evaluating the wrong
+        # checkpoint and reporting it as if it were the requested cell. The
+        # legacy fallback masked missing (seed, lam) combinations and produced
+        # constant rows across lambdas/seeds in the CSV.
         pattern = (
             f"RL_minimal_*_seed{int(seed)}_lam_{lam}_*_{method}_policy.pt"
         )
         candidates = sorted(self._checkpoint_dir.glob(pattern))
         if not candidates:
-            # Try without the _seed_lam suffix (in case the user supplied a
-            # custom --json-path during training).
-            candidates = sorted(self._checkpoint_dir.glob(f"*_{method}_policy.pt"))
-        if not candidates:
+            fallback = sorted(self._checkpoint_dir.glob(f"*_{method}_policy.pt"))
+            if len(fallback) == 1:
+                # Single training run with a custom filename — preserve the
+                # original "user supplied --json-path" use case.
+                return fallback[0]
+            if len(fallback) > 1:
+                names = "\n  ".join(p.name for p in fallback)
+                raise FileNotFoundError(
+                    f"No RL policy found matching seed={seed} lam={lam} method={method!r} "
+                    f"under {self._checkpoint_dir} (pattern: {pattern}). "
+                    f"Refusing to fall back: {len(fallback)} ambiguous "
+                    f"{method!r} checkpoints exist:\n  {names}\n"
+                    f"Train the missing cell, or restrict --seeds / --lams to "
+                    f"combinations that have a checkpoint."
+                )
             raise FileNotFoundError(
                 f"No RL policy found for method={method!r} lam={lam} seed={seed} "
                 f"under {self._checkpoint_dir}."
@@ -817,7 +865,9 @@ class RLCartpoleBackend:
         from models.policy import PolicyNet  # type: ignore
 
         ckpt_path = self._find_policy(method, lam, seed)
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        # Use weights_only=False so the optional ``adv_state_dict`` (which
+        # contains tensors but is wrapped in a plain dict) loads cleanly.
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         policy = PolicyNet(
             obs_dim=int(ckpt["obs_dim"]),
             hidden=int(ckpt["hidden"]),
@@ -826,27 +876,139 @@ class RLCartpoleBackend:
         policy.load_state_dict(ckpt["policy_state_dict"])
         policy.eval()
 
+        # If the training run wrote xi-box explicitly, prefer it (covers the
+        # case where the user trained with overridden --xi-low / --xi-high).
+        xi_low = ckpt.get("xi_low", self._xi_low.tolist())
+        xi_high = ckpt.get("xi_high", self._xi_high.tolist())
         cfg_inner = self.InnerConfig(
             lam=float(lam),
-            xi_low=tuple(float(v) for v in self._xi_low.tolist()),
-            xi_high=tuple(float(v) for v in self._xi_high.tolist()),
-            M_diag=tuple(1.0 / (h - l) ** 2 for l, h in zip(self._xi_low.tolist(), self._xi_high.tolist())),
+            xi_low=tuple(float(v) for v in xi_low),
+            xi_high=tuple(float(v) for v in xi_high),
+            M_diag=tuple(1.0 / (h - l) ** 2 for l, h in zip(xi_low, xi_high)),
             fd_episodes=self.fd_episodes,
             fd_horizon=self.fd_horizon,
         )
         env_eval = self._make_vec_env(self.env_name, max_steps=self.env_max_steps, device=device)
 
+        adv_module = self._maybe_build_trained_adversary(ckpt, cfg_inner, device)
+
         return {
-            "method":    method,
-            "lam":       float(lam),
-            "policy":    policy,
-            "env_eval":  env_eval,
-            "cfg_inner": cfg_inner,
-            "device":    device,
-            "ckpt_path": str(ckpt_path),
+            "method":     method,
+            "lam":        float(lam),
+            "policy":     policy,
+            "env_eval":   env_eval,
+            "cfg_inner":  cfg_inner,
+            "device":     device,
+            "ckpt_path":  str(ckpt_path),
+            "adv_kind":   ckpt.get("adv_kind", None),
+            "adv_module": adv_module,
+            "xi_low":     torch.tensor(xi_low, device=device, dtype=torch.float32),
+            "xi_high":    torch.tensor(xi_high, device=device, dtype=torch.float32),
         }
 
+    @staticmethod
+    def _maybe_build_trained_adversary(ckpt: Dict[str, Any], cfg_inner, device):
+        """Reconstruct the trained parametric adversary module if persisted.
+
+        Returns one of:
+          * an ``ICNN`` module with state loaded (adv_kind == "icnn"),
+          * an ``NPFInputConvexPotential`` module (adv_kind == "npf"),
+          * an ``MLPAdversary`` module (adv_kind == "nn_dro"),
+          * ``None`` (no parametric state in checkpoint, or adv_kind == "none").
+        """
+        kind = ckpt.get("adv_kind", None)
+        if kind in (None, "none"):
+            return None
+        sd = ckpt.get("adv_state_dict", None)
+        arch = ckpt.get("adv_arch", None)
+        if sd is None or arch is None:
+            return None
+
+        if kind == "icnn":
+            from models.icnn import ICNN  # type: ignore
+            mod = ICNN(
+                input_dim=int(arch["input_dim"]),
+                hidden_sizes=tuple(int(h) for h in arch["hidden_sizes"]),
+                activation=str(arch["activation"]),
+                strong_convexity=float(arch["strong_convexity"]),
+                nonneg_init=str(arch["nonneg_init"]),
+                softplus_beta=float(arch["softplus_beta"]),
+            ).to(device)
+            mod.load_state_dict(sd)
+            mod.eval()
+            return mod
+        if kind == "npf":
+            from models.npf import NPFInputConvexPotential  # type: ignore
+            mod = NPFInputConvexPotential(
+                input_dim=int(arch["input_dim"]),
+                hidden_sizes=tuple(int(h) for h in arch["hidden_sizes"]),
+                outer_rank=int(arch["outer_rank"]),
+                inner_rank=int(arch["inner_rank"]),
+                activation=str(arch["activation"]),
+                elu_alpha=float(arch.get("elu_alpha", 1.0)),
+                softplus_beta=float(arch["softplus_beta"]),
+                init_eps=float(arch.get("init_eps", 1e-3)),
+            ).to(device)
+            mod.load_state_dict(sd)
+            mod.eval()
+            return mod
+        if kind == "nn_dro":
+            from models.nn_dro import MLPAdversary  # type: ignore
+            mod = MLPAdversary(
+                input_dim=int(arch["input_dim"]),
+                hidden_sizes=tuple(int(h) for h in arch["hidden_sizes"]),
+                activation=str(arch["activation"]),
+                softplus_beta=float(arch["softplus_beta"]),
+                init_scale=float(arch.get("init_scale", 1e-3)),
+            ).to(device)
+            mod.load_state_dict(sd)
+            mod.eval()
+            return mod
+        return None
+
     def push(self, method, state, z_hat):
+        # ERM / nominal: identity push by definition (matches the LR-CIFAR10
+        # paper's reference row T_ERM := id with M=0 by definition).
+        if method == "nominal":
+            return z_hat.detach().clone()
+
+        adv_module = state.get("adv_module", None)
+        adv_kind = state.get("adv_kind", None)
+
+        # Parametric adversaries (icnn / npf / nn_dro) — apply the *trained*
+        # transport map directly. This is the single map evaluation T_psi(z_hat),
+        # *not* a freshly-initialized inner re-optimization. The Brenier
+        # methods (icnn, npf) satisfy M(T) = 0 by construction *in u-space*
+        # (the unconstrained latent where the convex potential lives). After
+        # the sigmoid box-bijection back to xi, T is no longer OT for ||.||^2
+        # in xi-space — the gap is small but non-zero by construction. See
+        # gap_inputs() below: for icnn/npf we evaluate the gap in u-space so
+        # the reported number reflects what the method actually optimizes.
+        if adv_module is not None and adv_kind in ("icnn", "npf", "nn_dro"):
+            xi_low = state["xi_low"]
+            xi_high = state["xi_high"]
+            with torch.no_grad():
+                if adv_kind in ("icnn", "npf"):
+                    return self._apply_brenier_potential(adv_module, z_hat, xi_low, xi_high)
+                return self._apply_mlp_displacement(adv_module, z_hat, xi_low, xi_high)
+
+        # Parametric method requested but no trained-adversary state in
+        # checkpoint — emit a one-time warning and fall back to the legacy
+        # behavior (re-run inner ascent from a fresh adversary).
+        if method in ("icnn", "npf", "nn_dro") and not getattr(self, "_warned_legacy", False):
+            print(
+                f"[rl_cartpole] WARNING: checkpoint for method={method!r} has no "
+                f"adv_state_dict. Falling back to a freshly-initialized adversary "
+                f"inner-loop run; results will not reflect training. Re-train "
+                f"with the current RL_minimal.py to persist adv state.",
+                file=sys.stderr,
+            )
+            self._warned_legacy = True
+
+        # Non-parametric adversaries (particle, ppa, dual, wfr, wgf, svg,
+        # rgo, algo1, new_ppa) — these carry no learned state, so re-running
+        # adversarial_xi against the trained policy is exactly what training
+        # does on each minibatch.
         from algorithms.registry import build_registry  # type: ignore
 
         reg = build_registry()
@@ -866,6 +1028,72 @@ class RLCartpoleBackend:
             Tz = Tz.view(z_hat.shape[0], S, -1).mean(dim=1)
 
         return Tz
+
+    def gap_inputs(self, method, state, z_hat, Tz):
+        """Return (z, Tz) in the space where the Monge gap should be measured.
+
+        For the Brenier-potential methods (icnn, npf) the convex potential
+        lives in unconstrained latent u-space, with T(xi) = decode(grad_u
+        psi(encode(xi))). Brenier guarantees grad_u psi is OT in u-space
+        under ||.||^2; the sigmoid decode bijection breaks that in xi-space.
+        We recompute u_adv = grad_u psi(u_hat) directly (rather than
+        round-tripping logit(Tz), which clamps at the box bijection's eps
+        and loses points whose pushed |u_adv| > logit(1 - eps)) so the gap
+        is exactly 0 at convergence — matching the LR-CIFAR10 backend.
+
+        For all other methods the native space *is* xi (no bijection in
+        push), so we leave inputs unchanged.
+        """
+        if method not in ("icnn", "npf"):
+            return z_hat, Tz
+        adv_module = state.get("adv_module", None)
+        if adv_module is None:
+            # No persisted adversary state — push fell back to a freshly-
+            # initialized inner loop, so u-space recovery is not meaningful.
+            return z_hat, Tz
+        xi_low = state["xi_low"]
+        xi_high = state["xi_high"]
+        eps = 1e-6
+        rng = (xi_high - xi_low).clamp_min(1e-12)
+        p = ((z_hat - xi_low) / rng).clamp(eps, 1.0 - eps)
+        u_hat = (torch.log(p) - torch.log1p(-p)).detach().requires_grad_(True)
+        with torch.enable_grad():
+            phi = adv_module(u_hat)
+            u_adv = torch.autograd.grad(phi.sum(), u_hat, create_graph=False)[0]
+        u_adv = torch.nan_to_num(u_adv, nan=0.0, posinf=0.0, neginf=0.0)
+        return u_hat.detach(), u_adv.detach()
+
+    @staticmethod
+    def _apply_brenier_potential(potential, hat_xi, xi_low, xi_high):
+        """T(hat_xi) = decode(grad_u phi(encode(hat_xi))) — same box bijection
+        used at training time by ICNN/NPF adversaries (see
+        RL/algorithms/icnn.py and RL/algorithms/npf.py)."""
+        eps = 1e-6
+        rng = (xi_high - xi_low).clamp_min(1e-12)
+        p = ((hat_xi - xi_low) / rng).clamp(eps, 1.0 - eps)
+        u_in = (torch.log(p) - torch.log1p(-p)).detach().requires_grad_(True)
+        with torch.enable_grad():
+            phi = potential(u_in)
+            u_adv = torch.autograd.grad(phi.sum(), u_in, create_graph=False)[0]
+        u_adv = torch.nan_to_num(u_adv, nan=0.0, posinf=0.0, neginf=0.0)
+        xi_adv = xi_low + rng * torch.sigmoid(u_adv)
+        xi_adv = torch.where(torch.isfinite(xi_adv), xi_adv, hat_xi)
+        return xi_adv.detach()
+
+    @staticmethod
+    def _apply_mlp_displacement(mlp, hat_xi, xi_low, xi_high):
+        """T(hat_xi) = decode(encode(hat_xi) + mlp(encode(hat_xi))) — matches
+        RL/algorithms/nn_dro.py. mlp is the trained MLPAdversary."""
+        eps = 1e-6
+        rng = (xi_high - xi_low).clamp_min(1e-12)
+        p = ((hat_xi - xi_low) / rng).clamp(eps, 1.0 - eps)
+        hat_u = (torch.log(p) - torch.log1p(-p)).detach()
+        delta = mlp(hat_u)
+        u_adv = hat_u + delta
+        u_adv = torch.nan_to_num(u_adv, nan=0.0, posinf=0.0, neginf=0.0)
+        xi_adv = xi_low + rng * torch.sigmoid(u_adv)
+        xi_adv = torch.where(torch.isfinite(xi_adv), xi_adv, hat_xi)
+        return xi_adv.detach()
 
     def compute_test_loss(self, state, seed, device, delta: float = 1.0):
         """Average episode length over a grid of perturbed (masspole, length)
@@ -902,10 +1130,41 @@ DATASET_BACKENDS = {
 # ---------------------------------------------------------------------------
 
 
-def _gap_for_state(z_hat: torch.Tensor, Tz: torch.Tensor, eval_size: int) -> Dict[str, float]:
+def _gap_for_state(
+    z_hat: torch.Tensor,
+    Tz: torch.Tensor,
+    eval_size: int,
+    mode: str = "auto",
+    sub_M: int = 4096,
+    sub_K: int = 10,
+    sub_seed: int = 0,
+    sinkhorn_eps_frac: float = 0.01,
+    sinkhorn_n_iter: int = 1000,
+) -> Dict[str, float]:
+    if mode == "subsample_hungarian":
+        return monge_gap_subsample_hungarian(
+            z_hat, Tz, M=sub_M, K=sub_K, seed=sub_seed,
+        )
+    if mode == "hungarian":
+        return monge_gap_hungarian(z_hat, Tz)
+    if mode == "sinkhorn":
+        from monge_gap_utils.monge_gap import median_pairwise_distance_sq
+        eps = sinkhorn_eps_frac * median_pairwise_distance_sq(
+            torch.cat([z_hat, Tz], dim=0)
+        )
+        if eps <= 0.0:
+            eps = 1e-6
+        return monge_gap_sinkhorn(z_hat, Tz, eps=eps, n_iter=sinkhorn_n_iter)
+    # auto: Hungarian for small N, Sinkhorn otherwise.
     if eval_size <= 4096:
         return monge_gap_hungarian(z_hat, Tz)
-    return monge_gap_sinkhorn(z_hat, Tz)
+    from monge_gap_utils.monge_gap import median_pairwise_distance_sq
+    eps = sinkhorn_eps_frac * median_pairwise_distance_sq(
+        torch.cat([z_hat, Tz], dim=0)
+    )
+    if eps <= 0.0:
+        eps = 1e-6
+    return monge_gap_sinkhorn(z_hat, Tz, eps=eps, n_iter=sinkhorn_n_iter)
 
 
 def _flatten_lams(lams: List[float]) -> List[float]:
@@ -931,6 +1190,31 @@ def main():
                         help="Defaults to cuda if available, else cpu.")
     parser.add_argument("--shift_delta", type=float, default=1.0,
                         help="Distribution shift delta passed to the test-loss eval.")
+    parser.add_argument("--gap_mode", type=str, default="auto",
+                        choices=["auto", "hungarian", "sinkhorn",
+                                 "subsample_hungarian"],
+                        help="Estimator for the Monge gap. ``auto`` uses "
+                             "Hungarian when eval_size <= 4096 and Sinkhorn "
+                             "otherwise. ``subsample_hungarian`` runs K "
+                             "exact Hungarian solves on random subsamples of "
+                             "size M and reports median + IQR — robust to "
+                             "the adaptive-ε artifacts that show up when "
+                             "the push collapses or expands the cloud.")
+    parser.add_argument("--gap_subsample_M", type=int, default=4096,
+                        help="Subsample size for --gap_mode subsample_hungarian.")
+    parser.add_argument("--gap_subsample_K", type=int, default=10,
+                        help="Number of subsamples for --gap_mode "
+                             "subsample_hungarian.")
+    parser.add_argument("--sinkhorn_eps_frac", type=float, default=0.01,
+                        help="Sinkhorn eps as a fraction of the median "
+                             "pairwise sq-distance on the union of (z, Tz). "
+                             "0.01 = paper default; raise to 0.05 for "
+                             "tighter convergence at the cost of more bias "
+                             "(canceled in the debiased Sinkhorn divergence).")
+    parser.add_argument("--sinkhorn_n_iter", type=int, default=1000,
+                        help="Sinkhorn iteration cap (log-domain). 1000 is "
+                             "enough at eps_frac >= 0.01; raise to 5000 if "
+                             "you push eps_frac below 0.005.")
 
     # LR-CIFAR10 backend
     lrc = parser.add_argument_group("lr_cifar10 backend")
@@ -1017,7 +1301,22 @@ def main():
                 )
                 Tz = backend.push(method, state, z_hat)
 
-                gap_result = _gap_for_state(z_hat, Tz, args.eval_size)
+                # Optional per-backend hook: transform (z, Tz) into the space
+                # where M(T) is well-defined for the method. Default identity.
+                # rl_cartpole overrides this for npf/icnn (u-space encoding).
+                gap_z, gap_Tz = z_hat, Tz
+                if hasattr(backend, "gap_inputs"):
+                    gap_z, gap_Tz = backend.gap_inputs(method, state, z_hat, Tz)
+
+                gap_result = _gap_for_state(
+                    gap_z, gap_Tz, args.eval_size,
+                    mode=args.gap_mode,
+                    sub_M=args.gap_subsample_M,
+                    sub_K=args.gap_subsample_K,
+                    sub_seed=int(seed) + 300_000,
+                    sinkhorn_eps_frac=args.sinkhorn_eps_frac,
+                    sinkhorn_n_iter=args.sinkhorn_n_iter,
+                )
 
                 test_loss = backend.compute_test_loss(
                     state, seed + 200_000, device, delta=args.shift_delta,

@@ -66,9 +66,10 @@ class NPFAdversary:
         # already produced inside the constructor's non-negative layers.
         self.icnn.init_as_identity()
 
-        # BB + Armijo state with NPF-specific knobs whose defaults equal
-        # ICNN's (alpha0=eta_icnn, bb_alpha_min=bb_alpha_min, etc.) so NPF
-        # runs with identical settings to ICNN out of the box.
+        # BB + Armijo state with NPF-specific knobs. Weight decay and
+        # gradient-norm clipping (cfg.npf_weight_decay, cfg.npf_grad_clip)
+        # were added after the lam=0.1 cell collapsed to corner-saturation;
+        # see InnerConfig for the rationale.
         self.bb_state = BBArmijoState.create(
             alpha0=cfg.npf_eta,
             alpha_min=cfg.npf_bb_alpha_min,
@@ -76,6 +77,8 @@ class NPFAdversary:
             ls_c=cfg.npf_bb_ls_c,
             ls_shrink=cfg.npf_bb_ls_shrink,
             ls_max_steps=cfg.npf_bb_ls_max_steps,
+            weight_decay=cfg.npf_weight_decay,
+            grad_clip=cfg.npf_grad_clip,
         )
 
     # -------- box bijection (latent u <-> physical xi) --------
