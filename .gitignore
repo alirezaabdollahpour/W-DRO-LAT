@@ -46,3 +46,4 @@ tmp_viz/*
 */*.png
 */*.jpg
 */*.jpeg
+*.tex
