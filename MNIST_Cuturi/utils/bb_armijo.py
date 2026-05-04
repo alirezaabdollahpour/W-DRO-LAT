@@ -16,6 +16,7 @@ class BBArmijoState:
     ls_c: float
     ls_shrink: float
     ls_max_steps: int
+    reject_on_armijo_failure: bool = False
     prev_params_vec: Optional[torch.Tensor] = None
     prev_grad_vec: Optional[torch.Tensor] = None
 
@@ -28,6 +29,7 @@ class BBArmijoState:
         ls_c: float = 0.1,
         ls_shrink: float = 0.5,
         ls_max_steps: int = 10,
+        reject_on_armijo_failure: bool = False,
     ) -> "BBArmijoState":
         alpha0 = float(max(alpha_min, min(alpha_max, alpha0)))
         return cls(
@@ -37,9 +39,17 @@ class BBArmijoState:
             ls_c=ls_c,
             ls_shrink=ls_shrink,
             ls_max_steps=int(max(ls_max_steps, 1)),
+            reject_on_armijo_failure=bool(reject_on_armijo_failure),
         )
 
     def propose(self, params_vec: torch.Tensor, grad_vec: torch.Tensor) -> float:
+        """Barzilai-Borwein step proposal for *ascent*.
+
+        For locally concave maximization with ``g = +grad f``, ``<s, y>``
+        is negative; the standard descent BB ``<s,s>/<s,y>`` would be
+        negative and clamp to ``alpha_min``. We use the ascent form
+        ``alpha = -<s,s>/<s,y>``.
+        """
         if (
             self.prev_params_vec is None
             or self.prev_grad_vec is None
@@ -52,9 +62,11 @@ class BBArmijoState:
             y = grad_vec - self.prev_grad_vec
             denom = torch.dot(s, y)
             num = torch.dot(s, s)
-            cond = torch.isfinite(denom) & (torch.abs(denom) > 1e-12)
+            cond = torch.isfinite(denom) & (denom < -1e-12)
             alpha_bb = torch.where(
-                cond, num / denom, torch.tensor(self.alpha_prev, device=denom.device)
+                cond,
+                -num / denom,
+                torch.tensor(self.alpha_prev, device=denom.device, dtype=denom.dtype),
             )
             alpha = float(alpha_bb.clamp(self.alpha_min, self.alpha_max).item())
         if not math.isfinite(alpha):
@@ -72,6 +84,7 @@ class BBArmijoState:
             ls_c=self.ls_c,
             ls_shrink=self.ls_shrink,
             ls_max_steps=self.ls_max_steps,
+            reject_on_armijo_failure=self.reject_on_armijo_failure,
             prev_params_vec=params_vec.detach().clone(),
             prev_grad_vec=grad_vec.detach().clone(),
         )
@@ -82,30 +95,43 @@ def bb_armijo_step_params(vec: torch.Tensor, meta, f_params, bb_state: BBArmijoS
 
     f_params(vec, create_graph) -> scalar tensor.
     Uses torch.no_grad() during Armijo line search trials for efficiency.
+
+    History is stored as (entry params, entry grad) so that on the next
+    call ``s = params_curr - params_prev = alpha_prev * grad_prev`` is
+    nonzero. Saving (post-step params, post-step grad) instead would
+    give ``s = 0`` (the next call's entry equals the previous call's
+    exit), which silently disables BB.
     """
     vec_det = vec.detach().requires_grad_(True)
     f_val = f_params(vec_det, True)
     grad_vec = torch.autograd.grad(f_val, vec_det, create_graph=False)[0]
-    alpha = bb_state.propose(vec_det.reshape(-1), grad_vec.reshape(-1))
-    f_val_f = float(f_val.item())
-    g_dot_g = float(torch.dot(grad_vec.reshape(-1), grad_vec.reshape(-1)).item())
-    if g_dot_g == 0.0:
-        return vec_det.detach(), bb_state, f_val_f
     grad_vec_det = grad_vec.detach()
     vec_det_val = vec_det.detach()
+
+    alpha = bb_state.propose(vec_det_val.reshape(-1), grad_vec_det.reshape(-1))
+    f_val_f = float(f_val.item())
+    g_dot_g = float(torch.dot(grad_vec_det.reshape(-1), grad_vec_det.reshape(-1)).item())
+    if g_dot_g == 0.0:
+        return vec_det_val, bb_state, f_val_f
+
     alpha_k = alpha
-    for _ in range(bb_state.ls_max_steps):
+    armijo_succeeded = False
+    for i in range(bb_state.ls_max_steps):
         v_trial = vec_det_val + alpha_k * grad_vec_det
         with torch.no_grad():
             f_trial = f_params(v_trial, False).item()
         if f_trial >= f_val_f + bb_state.ls_c * alpha_k * g_dot_g:
+            armijo_succeeded = True
             break
-        alpha_k *= bb_state.ls_shrink
-    v_new = (vec_det_val + alpha_k * grad_vec_det).detach()
-    v_new.requires_grad_(True)
-    f_new = f_params(v_new, True)
-    grad_vec_new = torch.autograd.grad(f_new, v_new, create_graph=False)[0]
-    new_bb_state = bb_state.update_history(
-        v_new.reshape(-1), grad_vec_new.reshape(-1), alpha_k
-    )
-    return v_new.detach(), new_bb_state, f_val_f
+        if i < bb_state.ls_max_steps - 1:
+            alpha_k *= bb_state.ls_shrink
+
+    if armijo_succeeded or not bb_state.reject_on_armijo_failure:
+        v_new = (vec_det_val + alpha_k * grad_vec_det).detach()
+        new_bb_state = bb_state.update_history(
+            vec_det_val.reshape(-1), grad_vec_det.reshape(-1), alpha_k
+        )
+    else:
+        v_new = vec_det_val
+        new_bb_state = bb_state
+    return v_new, new_bb_state, f_val_f

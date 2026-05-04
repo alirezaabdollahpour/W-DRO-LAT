@@ -147,7 +147,22 @@ def train_step_npf(
     adv_flat = npf_transport_map(
         icnn_model, params_dict_final, x_flat, create_graph=False
     ).detach()
-    adv_x = adv_flat.view_as(x).clamp(0.0, 1.0)
+    # Cyclically-monotone transport map output (no post-hoc projection):
+    # ``adv_flat`` is grad_z psi(x), which is cyclically monotone by
+    # construction. The Monge-gap claim "M(T_omega) = 0" holds for THIS
+    # map, in unconstrained pixel space.
+    adv_x_unclamped = adv_flat.view_as(x)
+    # Box projection is applied ONLY at the classifier boundary so the
+    # downstream cross-entropy is computed at a valid pixel input. This
+    # box projection is many-to-one (composition of a cyclically-monotone
+    # gradient with a clamp is generally not the gradient of a convex
+    # function), so the transport interpretation is preserved by using
+    # ``adv_x_unclamped`` for any geometry diagnostic and reserving
+    # ``adv_x`` for classifier-side losses/metrics only.
+    adv_x = adv_x_unclamped.clamp(0.0, 1.0)
+    saturating_frac = float(
+        ((adv_x_unclamped < 0.0) | (adv_x_unclamped > 1.0)).float().mean().item()
+    )
 
     with torch.enable_grad():
         logits_adv = model(adv_x)
@@ -161,7 +176,9 @@ def train_step_npf(
         logits_adv_post = model(adv_x)
         acc_clean = accuracy(logits_clean, y)
         acc_adv = accuracy(logits_adv_post, y)
-        w2_proxy = ((adv_x - x) ** 2).sum(dim=(1, 2, 3)).mean()
+        # W2 proxy is on the unclamped map -- this is the quantity the
+        # transport cost penalty in the inner objective targets.
+        w2_proxy = ((adv_x_unclamped - x) ** 2).sum(dim=(1, 2, 3)).mean()
 
     metrics = {
         "adv_loss": adv_loss_val.detach(),
@@ -170,6 +187,12 @@ def train_step_npf(
         "acc_adv": acc_adv,
         "w2_proxy": w2_proxy,
         "inner_grad_norm": torch.tensor(inner_grad_norm, device=device),
+        # Fraction of pixels where the unclamped map left [0, 1]. Useful
+        # to monitor: if this is near zero, the box projection at the
+        # classifier boundary is essentially a no-op and the gap claim on
+        # ``adv_x_unclamped`` (cyclically monotone) and on ``adv_x``
+        # (post-clamp) coincide in practice.
+        "saturating_frac": torch.tensor(saturating_frac, device=device),
     }
     return state, icnn_state, metrics
 
