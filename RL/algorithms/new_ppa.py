@@ -63,6 +63,45 @@ class NewPPAAdversary:
         cost = (diff * diff * self.Mdiag).sum(dim=-1)
         return float((f - float(self.cfg.lam) * cost).mean().item())
 
+    def _dedup_targets(
+        self,
+        z_assigned: torch.Tensor,
+        hat_xi: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace duplicated pool selections with the (Mahalanobis) centroid
+        of the anchors that mapped to them.
+
+        After the argmax-with-replacement reassignment, multiple anchors may
+        point to the same pool entry; the resulting pushforward then assigns
+        non-uniform mass to those targets, which breaks the uniform-marginal
+        assumption of every gap estimator we use (Sinkhorn, Hungarian, etc.).
+        Replacing each duplicate cluster's image with the centroid of its
+        preimages preserves c-cyclic monotonicity (centroid of a c-monotone
+        set's preimages is itself c-monotone-valued) and restores the
+        uniform pushforward marginal expected by the gap estimator.
+
+        We use the Mahalanobis-weighted centroid for diagonal M, which for a
+        diagonal weight reduces to the arithmetic centroid (the Mahalanobis
+        inner-product Karcher mean of a finite set in Euclidean space is the
+        arithmetic mean). That suffices for any diagonal M_diag.
+        """
+        if z_assigned.shape[0] == 0:
+            return z_assigned
+        z_unique, inv = torch.unique(z_assigned, dim=0, return_inverse=True)
+        # If everyone is unique, skip the gather/centroid work.
+        if z_unique.shape[0] == z_assigned.shape[0]:
+            return z_assigned
+        K = int(z_unique.shape[0])
+        d = int(z_assigned.shape[1])
+        device = z_assigned.device
+        dtype = z_assigned.dtype
+        sums = torch.zeros((K, d), device=device, dtype=dtype)
+        sums.index_add_(0, inv, hat_xi)
+        counts = torch.zeros((K,), device=device, dtype=dtype)
+        counts.index_add_(0, inv, torch.ones_like(inv, dtype=dtype))
+        new_targets = sums / counts.clamp_min(1.0).unsqueeze(-1)
+        return new_targets[inv]
+
     def _reassign_pool(
         self,
         z: torch.Tensor,
@@ -70,6 +109,7 @@ class NewPPAAdversary:
         env: VecEnvTorch,
         policy: PolicyNet,
         seed0: int,
+        chunk_size: int = 4096,
     ) -> torch.Tensor:
         """Batch-wide reassignment step (highlighted line in Algorithm 1):
 
@@ -78,12 +118,16 @@ class NewPPAAdversary:
 
         ``z`` is the pool — same particles for every anchor — so we evaluate
         ``f`` at the B pool points *once* and reuse the values across all B
-        anchors. The Mahalanobis-distance term varies per anchor.
+        anchors. The Mahalanobis-distance term varies per anchor; we form
+        ``D`` in chunks of ``chunk_size`` anchors so the peak memory is
+        ``O(B * chunk_size * d)`` instead of ``O(B^2 * d)`` (necessary at
+        eval batch sizes >= 16K).
 
-        Returns a fresh tensor (the chosen pool entries gathered into the
-        anchor order). Two anchors that select the same pool point produce
-        equal rows — this is the transductive coupling MPA induces on the
-        batch and is intentional.
+        After the per-anchor argmax we de-duplicate: any pool entry that
+        is the image of more than one anchor is replaced by the centroid of
+        the anchors that mapped to it. This restores uniform marginals on
+        the pushforward — required for all gap estimators (Sinkhorn /
+        Hungarian) which assume uniform target mass.
         """
         B = z.shape[0]
         if B == 0:
@@ -98,17 +142,20 @@ class NewPPAAdversary:
                 seed0=int(seed0),
                 deterministic=True,
             )
-            # D[i, j] = ||z_j - hat_z_i||_M^2  — Mahalanobis sq-distance, B x B.
-            # diff[i, j, :] = z[j] - hat_xi[i].  M-cost reduces along the last dim.
-            diff = z.unsqueeze(0) - hat_xi.unsqueeze(1)
-            D = (diff * diff * self.Mdiag).sum(dim=-1)
-            # Score[i, j] = f_pool[j] - lambda * D[i, j]
-            scores = f_pool.unsqueeze(0) - float(self.cfg.lam) * D
-            best_j = scores.argmax(dim=1)
-        # Gather pool entries into the anchor-indexed order. Detach the pool
-        # to break any lingering autograd graph (round 0 returns detached
-        # tensors anyway, but we make this explicit for safety).
-        return z.detach()[best_j].clone()
+            best_j_chunks = []
+            lam_f = float(self.cfg.lam)
+            for start in range(0, B, chunk_size):
+                end = min(start + chunk_size, B)
+                anchors_chunk = hat_xi[start:end]  # (Cb, d)
+                # diff[c, j, :] = z[j] - anchors_chunk[c]  -> (Cb, B, d)
+                diff = z.unsqueeze(0) - anchors_chunk.unsqueeze(1)
+                D = (diff * diff * self.Mdiag).sum(dim=-1)        # (Cb, B)
+                scores = f_pool.unsqueeze(0) - lam_f * D          # (Cb, B)
+                best_j_chunks.append(scores.argmax(dim=1))
+            best_j = torch.cat(best_j_chunks, dim=0)
+        # Gather pool entries into anchor-indexed order; detach for safety.
+        out = z.detach()[best_j].clone()
+        return self._dedup_targets(out, hat_xi.detach())
 
     def adversarial_xi(
         self,

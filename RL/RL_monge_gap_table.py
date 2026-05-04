@@ -152,12 +152,18 @@ def render_table(
         r"Empirical debiased estimator $\widehat{\cM}_{\widehat\PP}(T)$ on a held-out "
         r"anchor batch sampled uniformly from the xi-box, computed with the "
         r"bias-corrected Sinkhorn divergence~\citep{uscidda2023monge}. "
-        r"Smaller is better. The highlighted reference row "
+        r"Smaller is better. For ICNN-DRO and NPF, the gap is evaluated in the "
+        r"latent $u$-space on which the convex potential is defined; the "
+        r"residual $\xi$-space gap induced by the sigmoid box decoder is not "
+        r"reflected here. For all other rows the gap is evaluated in $\xi$-space "
+        r"under the same diagonal-Mahalanobis cost $\|\cdot\|_M^2$ used by the "
+        r"training objective. The highlighted reference row "
         r"($T_{\mathrm{ERM}}{:=}\mathrm{id}$, $\cM\!=\!0$ by definition) is not "
-        r"a candidate adversary. ICNN-DRO satisfies $\cM_{\widehat\PP}(T_\omega)=0$ "
-        r"exactly by construction (\autoref{prop:wasted_transport}); the "
-        r"$\sim\!10^{-7}$ entries are the Sinkhorn estimator's convergence floor, "
-        r"not residual transport waste.}"
+        r"a candidate adversary. ICNN-DRO satisfies "
+        r"$\cM_{\widehat\PP\circ\,\mathrm{encode}^{-1}}(\nabla_u\psi_\omega) = 0$ "
+        r"exactly in $u$-space by construction (\autoref{prop:wasted_transport}); "
+        r"the $\sim\!10^{-7}$ entries are the Sinkhorn estimator's convergence "
+        r"floor, not residual transport waste.}"
     )
     lines.append(r"  \resizebox{\linewidth}{!}{")
     lines.append(rf"    \begin{{tabular}}{{{col_spec}}}")

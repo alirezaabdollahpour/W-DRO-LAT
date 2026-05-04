@@ -45,6 +45,12 @@ class ICNNAdversary:
         if cfg.icnn_init.lower() == "identity":
             initialize_icnn_identity(self.icnn, strong_convexity=cfg.icnn_strong_convexity)
 
+        # Intentionally does NOT pass ``weight_decay`` or ``grad_clip``
+        # (defaults to 0/0 in BBArmijoState.create). The ICNN adversary's
+        # training trajectory is well-conditioned at all tested lambdas
+        # under identity-init + BB+Armijo alone, so the NPF safeguards
+        # (cfg.npf_weight_decay, cfg.npf_grad_clip) are unnecessary here.
+        # Match cfg.icnn_/cfg.bb_ knobs only.
         self.bb_state = BBArmijoState.create(
             alpha0=cfg.eta_icnn,
             alpha_min=cfg.bb_alpha_min,
