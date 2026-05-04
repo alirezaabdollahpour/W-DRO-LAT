@@ -1029,6 +1029,30 @@ class RLCartpoleBackend:
 
         return Tz
 
+    def gap_cost_kwargs(self, method, state):
+        """Per-method ground-cost weights for the Monge-gap estimator.
+
+        * For ``icnn`` and ``npf`` the gap is evaluated in u-space, where
+          the convex potential lives and Brenier optimality is under
+          ``||.||_2^2``. Return None so the gap utilities use Euclidean.
+        * For every other method the gap is evaluated in xi-space under
+          the SAME diagonal-Mahalanobis cost ``||.||_M^2`` that the
+          training-time inner objective uses (cfg.M_diag). MPA's
+          c-cyclically-monotone reassignment is monotone under this cost,
+          not under Euclidean — the gap utilities must match or MPA looks
+          spuriously suboptimal.
+        """
+        if method in ("icnn", "npf"):
+            return {"M_diag": None}
+        cfg_inner = state.get("cfg_inner", None)
+        if cfg_inner is None or not getattr(cfg_inner, "M_diag", None):
+            return {"M_diag": None}
+        return {
+            "M_diag": torch.tensor(
+                cfg_inner.M_diag, dtype=torch.float32, device=state["device"],
+            )
+        }
+
     def gap_inputs(self, method, state, z_hat, Tz):
         """Return (z, Tz) in the space where the Monge gap should be measured.
 
@@ -1140,31 +1164,36 @@ def _gap_for_state(
     sub_seed: int = 0,
     sinkhorn_eps_frac: float = 0.01,
     sinkhorn_n_iter: int = 1000,
+    M_diag: torch.Tensor | None = None,
 ) -> Dict[str, float]:
     if mode == "subsample_hungarian":
         return monge_gap_subsample_hungarian(
-            z_hat, Tz, M=sub_M, K=sub_K, seed=sub_seed,
+            z_hat, Tz, M=sub_M, K=sub_K, seed=sub_seed, M_diag=M_diag,
         )
     if mode == "hungarian":
-        return monge_gap_hungarian(z_hat, Tz)
+        return monge_gap_hungarian(z_hat, Tz, M_diag=M_diag)
     if mode == "sinkhorn":
         from monge_gap_utils.monge_gap import median_pairwise_distance_sq
         eps = sinkhorn_eps_frac * median_pairwise_distance_sq(
-            torch.cat([z_hat, Tz], dim=0)
+            torch.cat([z_hat, Tz], dim=0), M_diag=M_diag,
         )
         if eps <= 0.0:
             eps = 1e-6
-        return monge_gap_sinkhorn(z_hat, Tz, eps=eps, n_iter=sinkhorn_n_iter)
+        return monge_gap_sinkhorn(
+            z_hat, Tz, eps=eps, n_iter=sinkhorn_n_iter, M_diag=M_diag,
+        )
     # auto: Hungarian for small N, Sinkhorn otherwise.
     if eval_size <= 4096:
-        return monge_gap_hungarian(z_hat, Tz)
+        return monge_gap_hungarian(z_hat, Tz, M_diag=M_diag)
     from monge_gap_utils.monge_gap import median_pairwise_distance_sq
     eps = sinkhorn_eps_frac * median_pairwise_distance_sq(
-        torch.cat([z_hat, Tz], dim=0)
+        torch.cat([z_hat, Tz], dim=0), M_diag=M_diag,
     )
     if eps <= 0.0:
         eps = 1e-6
-    return monge_gap_sinkhorn(z_hat, Tz, eps=eps, n_iter=sinkhorn_n_iter)
+    return monge_gap_sinkhorn(
+        z_hat, Tz, eps=eps, n_iter=sinkhorn_n_iter, M_diag=M_diag,
+    )
 
 
 def _flatten_lams(lams: List[float]) -> List[float]:
@@ -1308,6 +1337,17 @@ def main():
                 if hasattr(backend, "gap_inputs"):
                     gap_z, gap_Tz = backend.gap_inputs(method, state, z_hat, Tz)
 
+                # Optional per-backend hook: per-coordinate Mahalanobis weights
+                # for the Monge-gap cost. The MPA/ICNN-DRO objectives in RL use
+                # ||xi - hat_xi||_M^2 with a strongly anisotropic M_diag; the
+                # gap must be measured under the same cost or MPA's
+                # cyclically-monotone reassignment looks Euclidean-suboptimal.
+                gap_M_diag = None
+                if hasattr(backend, "gap_cost_kwargs"):
+                    gap_M_diag = backend.gap_cost_kwargs(method, state).get(
+                        "M_diag", None
+                    )
+
                 gap_result = _gap_for_state(
                     gap_z, gap_Tz, args.eval_size,
                     mode=args.gap_mode,
@@ -1316,6 +1356,7 @@ def main():
                     sub_seed=int(seed) + 300_000,
                     sinkhorn_eps_frac=args.sinkhorn_eps_frac,
                     sinkhorn_n_iter=args.sinkhorn_n_iter,
+                    M_diag=gap_M_diag,
                 )
 
                 test_loss = backend.compute_test_loss(

@@ -1,12 +1,16 @@
 """Compute the Monge gap of a map T on an empirical reference batch,
-under the squared-Euclidean ground cost.
+under either squared-Euclidean or diagonal-Mahalanobis ground cost.
 
-Definition (Uscidda & Cuturi, ICML 2023):
-    M(T) = (1/N) sum_i ||T(z_i) - z_i||^2  -  W_2^2(P_hat, T_# P_hat).
+Definition (Uscidda & Cuturi, ICML 2023), generalised to a diagonal
+Mahalanobis cost ``c_M(x, y) = (x - y)^T diag(M) (x - y)``:
 
-The first term is the identity-coupling cost. The second is the W_2 cost
-between the empirical reference and its pushforward. The gap is
-non-negative; equality holds iff T is OT-optimal between P_hat and T_#P_hat.
+    M(T) = (1/N) sum_i c_M(T(z_i), z_i)  -  W_2^2(P_hat, T_# P_hat; c_M).
+
+The first term is the identity-coupling cost. The second is the OT cost
+between the empirical reference and its pushforward under c_M. The gap
+is non-negative; equality holds iff T is OT-optimal between P_hat and
+T_#P_hat under c_M. Passing ``M_diag = None`` (the default) recovers the
+squared-Euclidean cost.
 
 Two backends are provided:
 
@@ -23,45 +27,107 @@ shared by all methods and cancels in the *ranking* of methods.
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from scipy.optimize import linear_sum_assignment
 
 
-def median_pairwise_distance_sq(z: torch.Tensor, max_pairs: int = 50_000) -> float:
-    """Median of pairwise squared Euclidean distances, used as a robust
+def median_pairwise_distance_sq(
+    z: torch.Tensor,
+    max_pairs: int = 50_000,
+    M_diag: Optional[torch.Tensor] = None,
+) -> float:
+    """Median of pairwise (Mahalanobis-)squared distances, used as a robust
     bandwidth for Sinkhorn epsilon. Always subsamples ``max_pairs`` random
     pairs (without materializing the full (N, N, d) tensor)."""
     N = z.shape[0]
     n_pairs = min(max_pairs, N * N)
     idx_i = torch.randint(0, N, (n_pairs,), device=z.device)
     idx_j = torch.randint(0, N, (n_pairs,), device=z.device)
-    d = ((z[idx_i] - z[idx_j]) ** 2).sum(-1)
+    diff = z[idx_i] - z[idx_j]
+    if M_diag is not None:
+        d = ((diff * diff) * M_diag).sum(-1)
+    else:
+        d = (diff * diff).sum(-1)
     return float(d.median().item())
 
 
-def _pairwise_sq_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """(B, B) squared-Euclidean cost matrix without materializing (B, B, d).
+def _pairwise_sq_dist_direct(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    M_diag: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Memory-heavy but numerically-stable direct expansion. Use when
+    ``B*M*d`` fits in memory: avoids the catastrophic cancellation of
+    ``x_sq + y_sq - 2 x@y.T`` for tiny ``||x - y||``."""
+    diff = x.unsqueeze(1) - y.unsqueeze(0)  # (B, M, d)
+    if M_diag is not None:
+        sq = (diff * diff) * M_diag
+    else:
+        sq = diff * diff
+    return sq.sum(-1).clamp_min_(0.0)
 
-    Memory: 2 * B^2 * dtype_size for the output matrix plus the two ||.||^2
-    vectors. For B = 10_000, d = 512, fp32: ~400 MiB instead of 200 GiB.
+
+def _pairwise_sq_dist(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    M_diag: Optional[torch.Tensor] = None,
+    *,
+    max_direct_bytes: int = 2**32,
+) -> torch.Tensor:
+    """(B, M) (Mahalanobis-)squared distance matrix.
+
+    With ``M_diag`` (per-coordinate weights), computes
+    ``Cxy[i, j] = sum_k M_diag[k] * (x[i, k] - y[j, k])**2``.
+
+    Uses the numerically-stable direct expansion when ``B*M*d`` fits in
+    ``max_direct_bytes`` (default 4 GiB), and falls back to the memory-
+    cheap outer-product expansion otherwise. The expansion suffers
+    catastrophic cancellation when ``x[i] ~= y[j]``; ``clamp_min_(0.0)``
+    masks but does not fix this. Float32 noise floor of the expansion is
+    ``||x||^2 * 1e-7`` and is the dominant source of the residual gap
+    seen at the Sinkhorn convergence floor for large-batch settings.
     """
-    x_sq = (x * x).sum(-1)
-    y_sq = (y * y).sum(-1)
-    Cxy = x_sq.unsqueeze(1) + y_sq.unsqueeze(0) - 2.0 * (x @ y.t())
-    # Numerical noise can drive an exact zero distance slightly negative.
+    B, M = x.shape[0], y.shape[0]
+    d = x.shape[1] if x.dim() > 1 else 1
+    if B * M * d * x.element_size() <= max_direct_bytes:
+        return _pairwise_sq_dist_direct(x, y, M_diag)
+
+    if M_diag is not None:
+        wx = x * M_diag
+        wy = y * M_diag
+        x_sq = (wx * x).sum(-1)
+        y_sq = (wy * y).sum(-1)
+        Cxy = x_sq.unsqueeze(1) + y_sq.unsqueeze(0) - 2.0 * (x @ wy.t())
+    else:
+        x_sq = (x * x).sum(-1)
+        y_sq = (y * y).sum(-1)
+        Cxy = x_sq.unsqueeze(1) + y_sq.unsqueeze(0) - 2.0 * (x @ y.t())
     return Cxy.clamp_min_(0.0)
 
 
-def monge_gap_hungarian(z: torch.Tensor, Tz: torch.Tensor) -> dict:
-    """Exact Monge gap via Hungarian assignment. Use only for small N (<= 4096)."""
+def monge_gap_hungarian(
+    z: torch.Tensor,
+    Tz: torch.Tensor,
+    M_diag: Optional[torch.Tensor] = None,
+) -> dict:
+    """Exact Monge gap via Hungarian assignment. Use only for small N (<= 4096).
+
+    With ``M_diag`` set, the gap is measured under the diagonal-Mahalanobis
+    cost the per-coordinate weights induce; both ``cost_id`` and the LAP
+    objective use the same cost.
+    """
     assert z.shape == Tz.shape, f"shape mismatch: {z.shape} vs {Tz.shape}"
     if z.dim() == 1:
         z = z.view(-1, 1)
         Tz = Tz.view(-1, 1)
-    cost_id = float(((Tz - z) ** 2).sum(-1).mean().item())
-    cost_pair = _pairwise_sq_dist(z, Tz)
+    diff = Tz - z
+    if M_diag is not None:
+        cost_id = float(((diff * diff) * M_diag).sum(-1).mean().item())
+    else:
+        cost_id = float((diff * diff).sum(-1).mean().item())
+    cost_pair = _pairwise_sq_dist(z, Tz, M_diag=M_diag)
     row, col = linear_sum_assignment(cost_pair.detach().cpu().numpy())
     w2_sq = float(cost_pair[row, col].mean().item())
     gap = max(cost_id - w2_sq, 0.0)  # guard against numerical undershoot
@@ -75,32 +141,36 @@ def _sinkhorn_log_transport_cost(
     eps: float,
     n_iter: int,
     tol: float,
+    *,
+    check_every: int = 10,
 ) -> float:
     """Log-domain Sinkhorn iteration. Returns ``<C, P*>`` where P* is the
     entropic-OT plan with marginals ``(exp(log_a), exp(log_b))``, bandwidth
-    ``eps``, and squared-Euclidean cost ``C``.
+    ``eps``, and (possibly Mahalanobis) cost matrix ``C``.
 
     This is the numerically-stable form: every update is a logsumexp, so
     we never form ``exp(-C/eps)`` directly (which underflows whenever the
-    ratio C/eps is large — e.g. at eps = 1% of median sq-dist). The naive
-    matrix-scaling form returned costs *below* the true W_2^2 in our setup
-    because ``exp(-C/eps)`` collapsed to zero on most cells, leaving the
-    iteration unable to redistribute mass.
+    ratio ``C/eps`` is large — e.g. at ``eps = 1%`` of median sq-dist).
+
+    Convergence is checked every ``check_every`` iterations rather than
+    every iteration to amortise the GPU↔CPU sync cost of ``.item()``.
     """
     log_K = -C / eps  # (N, M); intentionally NOT exponentiated
     log_u = torch.zeros_like(log_a)
     log_v = torch.zeros_like(log_b)
-    for _ in range(n_iter):
+    for it in range(n_iter):
         # u_i: log_u_i = log_a_i - logsumexp_j (log_K_ij + log_v_j)
         log_u_new = log_a - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
         log_v_new = log_b - torch.logsumexp(log_K + log_u_new.unsqueeze(1), dim=0)
-        max_diff = max(
-            float((log_u_new - log_u).abs().max().item()),
-            float((log_v_new - log_v).abs().max().item()),
-        )
-        log_u, log_v = log_u_new, log_v_new
-        if max_diff < tol:
-            break
+        if (it + 1) % check_every == 0:
+            diff_u = (log_u_new - log_u).abs().max()
+            diff_v = (log_v_new - log_v).abs().max()
+            max_diff = float(torch.max(diff_u, diff_v).item())
+            log_u, log_v = log_u_new, log_v_new
+            if max_diff < tol:
+                break
+        else:
+            log_u, log_v = log_u_new, log_v_new
     # Plan: P_ij = exp(log_u_i + log_K_ij + log_v_j). Marginals are (a, b).
     # Materializing P at fp32 is fine — values lie in [0, max(a, b)].
     log_P = log_u.unsqueeze(1) + log_K + log_v.unsqueeze(0)
@@ -114,14 +184,17 @@ def sinkhorn_w2_sq(
     eps: float,
     n_iter: int = 1000,
     tol: float = 1e-7,
+    M_diag: Optional[torch.Tensor] = None,
 ) -> Tuple[float, float]:
     """Entropic-OT cost and Sinkhorn divergence between two empirical
-    distributions of equal size, with uniform weights, squared-Euclidean cost.
+    distributions of equal size, with uniform weights, under either the
+    squared-Euclidean or diagonal-Mahalanobis cost.
+
     Returns ``(raw_w2_sq_eps, sinkhorn_divergence)``. The latter is the
-    bias-corrected Sinkhorn divergence S_eps(P, Q) = OT_eps(P, Q) -
-    0.5 * (OT_eps(P, P) + OT_eps(Q, Q)) and is the rigorous quantity to
-    report — it is positive-definite, kernel-like, and recovers W_2^2 as
-    eps -> 0."""
+    bias-corrected Sinkhorn divergence
+    ``S_eps(P, Q) = OT_eps(P, Q) - 0.5 * (OT_eps(P, P) + OT_eps(Q, Q))``
+    and is the rigorous quantity to report.
+    """
     if z.dim() == 1:
         z = z.view(-1, 1)
         Tz = Tz.view(-1, 1)
@@ -130,7 +203,7 @@ def sinkhorn_w2_sq(
     log_b = log_a.clone()
 
     def transport_cost(x, y):
-        Cxy = _pairwise_sq_dist(x, y)
+        Cxy = _pairwise_sq_dist(x, y, M_diag=M_diag)
         return _sinkhorn_log_transport_cost(Cxy, log_a, log_b, eps, n_iter, tol)
 
     cost_xy = transport_cost(z, Tz)
@@ -145,20 +218,31 @@ def monge_gap_sinkhorn(
     Tz: torch.Tensor,
     eps: float | None = None,
     n_iter: int = 1000,
+    M_diag: Optional[torch.Tensor] = None,
 ) -> dict:
     """Monge gap via Sinkhorn. If ``eps`` is None, set it adaptively to
-    1% of the median pairwise distance squared on the union of z and Tz."""
+    1% of the median pairwise distance squared on the union of z and Tz.
+    The bandwidth is computed under the same cost the OT uses (so when
+    ``M_diag`` is set, ``eps`` scales with the Mahalanobis median)."""
     assert z.shape == Tz.shape
     if z.dim() == 1:
         z = z.view(-1, 1)
         Tz = Tz.view(-1, 1)
     if eps is None:
-        eps = 0.01 * median_pairwise_distance_sq(torch.cat([z, Tz], dim=0))
+        eps = 0.01 * median_pairwise_distance_sq(
+            torch.cat([z, Tz], dim=0), M_diag=M_diag
+        )
         # Avoid degenerate eps when both clouds collapse onto the same point.
         if eps <= 0.0:
             eps = 1e-6
-    cost_id = float(((Tz - z) ** 2).sum(-1).mean().item())
-    raw_w2, sinkdiv = sinkhorn_w2_sq(z, Tz, eps=eps, n_iter=n_iter)
+    diff = Tz - z
+    if M_diag is not None:
+        cost_id = float(((diff * diff) * M_diag).sum(-1).mean().item())
+    else:
+        cost_id = float((diff * diff).sum(-1).mean().item())
+    raw_w2, sinkdiv = sinkhorn_w2_sq(
+        z, Tz, eps=eps, n_iter=n_iter, M_diag=M_diag,
+    )
     return {
         "cost_id":          cost_id,
         "w2_sq_raw":        raw_w2,    # entropic, biased: ~ W_2^2 + O(eps)
@@ -176,6 +260,7 @@ def monge_gap_subsample_hungarian(
     M: int = 4096,
     K: int = 10,
     seed: int = 0,
+    M_diag: Optional[torch.Tensor] = None,
 ) -> dict:
     """Robust Monge gap via K Hungarian solves on random subsamples of size M.
 
@@ -194,7 +279,7 @@ def monge_gap_subsample_hungarian(
         Tz = Tz.view(-1, 1)
     N = z.shape[0]
     if N <= M:
-        out = monge_gap_hungarian(z, Tz)
+        out = monge_gap_hungarian(z, Tz, M_diag=M_diag)
         out.update({
             "monge_gap_lo": out["monge_gap"], "monge_gap_hi": out["monge_gap"],
             "monge_gap_min": out["monge_gap"], "monge_gap_max": out["monge_gap"],
@@ -203,11 +288,21 @@ def monge_gap_subsample_hungarian(
         })
         return out
 
-    g = torch.Generator(device="cpu").manual_seed(int(seed))
+    # Use the device's own generator when on CUDA so the random indices
+    # don't trigger an extra CPU↔GPU sync per draw.
+    try:
+        g = torch.Generator(device=z.device).manual_seed(int(seed))
+        on_device_gen = True
+    except (RuntimeError, TypeError):
+        g = torch.Generator(device="cpu").manual_seed(int(seed))
+        on_device_gen = False
     gaps, cost_ids, w2s = [], [], []
     for _ in range(K):
-        idx = torch.randperm(N, generator=g)[:M].to(z.device)
-        out = monge_gap_hungarian(z[idx], Tz[idx])
+        if on_device_gen:
+            idx = torch.randperm(N, generator=g, device=z.device)[:M]
+        else:
+            idx = torch.randperm(N, generator=g)[:M].to(z.device)
+        out = monge_gap_hungarian(z[idx], Tz[idx], M_diag=M_diag)
         gaps.append(out["monge_gap"])
         cost_ids.append(out["cost_id"])
         w2s.append(out["w2_sq"])
@@ -227,8 +322,13 @@ def monge_gap_subsample_hungarian(
     }
 
 
-def monge_gap(z: torch.Tensor, Tz: torch.Tensor, batch_size: int = 4096) -> dict:
+def monge_gap(
+    z: torch.Tensor,
+    Tz: torch.Tensor,
+    batch_size: int = 4096,
+    M_diag: Optional[torch.Tensor] = None,
+) -> dict:
     """Top-level convenience: choose the backend by batch size."""
     if batch_size <= 4096:
-        return monge_gap_hungarian(z, Tz)
-    return monge_gap_sinkhorn(z, Tz)
+        return monge_gap_hungarian(z, Tz, M_diag=M_diag)
+    return monge_gap_sinkhorn(z, Tz, M_diag=M_diag)
