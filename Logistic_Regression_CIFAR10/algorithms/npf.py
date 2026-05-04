@@ -33,6 +33,7 @@ from tqdm import tqdm
 from algorithms.base import BaseLinearDRO, make_linear_model
 from models.npf import NPFInputConvexPotential, npf_T_omega
 from utils.bb_armijo import BBArmijoState, bb_armijo_step_params
+from utils.common import set_requires_grad
 
 
 class NPF(BaseLinearDRO):
@@ -134,9 +135,17 @@ class NPF(BaseLinearDRO):
                 x_batch = x_original_batch.to(self.device)
                 y_batch = y_original_batch.to(self.device)
 
-                # Inner loop: ω-ascent via BB+Armijo
+                # Inner loop: ω-ascent via BB+Armijo. Explicitly freeze the
+                # classifier — bb_armijo_step_params calls
+                # ``torch.autograd.grad(..., params=psi.parameters())`` so
+                # the classifier's .grad is not accumulated today, but the
+                # explicit freeze makes the contract robust to future
+                # refactors that switch to ``f.backward()``. Mirrors the
+                # convention in MNIST_Cuturi.algorithms.npf.train_step_npf.
                 self.model.eval()
                 self.psi_omega.train()
+                set_requires_grad(self.model, False)
+                set_requires_grad(self.psi_omega, True)
 
                 def omega_objective(create_graph: bool) -> torch.Tensor:
                     x_adv = npf_T_omega(
@@ -154,9 +163,12 @@ class NPF(BaseLinearDRO):
                         self.bb_state,
                     )
 
-                # Outer loop: B-update (SGD) on adversarial features
+                # Outer loop: B-update (SGD) on adversarial features. Restore
+                # train/eval modes and gradient flags on both modules.
                 self.model.train()
                 self.psi_omega.eval()
+                set_requires_grad(self.model, True)
+                set_requires_grad(self.psi_omega, False)
 
                 with torch.no_grad():
                     adv_feats = npf_T_omega(
@@ -183,5 +195,16 @@ class NPF(BaseLinearDRO):
                 },
                 f"{checkpoint_dir}/NPF_run{run_id}_epoch_{epoch+1}.pth",
             )
+
+        # Diagnostic: ``outer_a`` is the linear term of the convex potential
+        # and is initialized to zero. If it remains ~0 across training,
+        # nothing in the inner objective is applying pressure on it and the
+        # parameter is dead weight. Print the final norm so a future
+        # reviewer can spot this without re-loading the checkpoint.
+        try:
+            outer_a_norm = float(self.psi_omega.outer_a.detach().norm().item())
+            print(f"[NPF] final ||outer_a||_2 = {outer_a_norm:.4e}")
+        except AttributeError:
+            pass
 
         return loss_history
