@@ -1,9 +1,21 @@
-"""Barzilai-Borwein step-size proposal + Armijo line search."""
+"""Barzilai-Borwein step size with Armijo line search.
+
+Two flavours are provided:
+
+* ``bb_armijo_step_params`` operates on a **list of nn.Parameters**, in
+  place. Used by both the ICNN-DRO and NPF algorithms in this pipeline
+  (the classifier/policy and the convex potential are nn.Modules and we update
+  the potential directly via parameters_to_vector / vector_to_parameters).
+* ``bb_armijo_step_vector`` operates on a **flat parameter vector**
+  (paired with metadata so it can be unflattened back into a parameter
+  dict for ``functional_call``). Currently unused in this pipeline; kept
+  for API parity with MNIST_Cuturi which uses this pattern.
+"""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.utils as nn_utils
@@ -11,14 +23,14 @@ import torch.nn.utils as nn_utils
 
 @dataclass
 class BBArmijoState:
+    """Barzilai-Borwein step size + Armijo line search state."""
+
     alpha_min: float
     alpha_max: float
     alpha_prev: float
     ls_c: float
     ls_shrink: float
     ls_max_steps: int
-    weight_decay: float = 0.0
-    grad_clip: float = 0.0  # 0 disables; otherwise rescale to ||g|| <= grad_clip
     reject_on_armijo_failure: bool = False
     prev_params_vec: Optional[torch.Tensor] = None
     prev_grad_vec: Optional[torch.Tensor] = None
@@ -26,14 +38,12 @@ class BBArmijoState:
     @classmethod
     def create(
         cls,
-        alpha0: float = 1e-1,
+        alpha0: float = 0.0005,
         alpha_min: float = 1e-6,
-        alpha_max: float = 10.0,
-        ls_c: float = 1e-4,
+        alpha_max: float = 1.0,
+        ls_c: float = 0.1,
         ls_shrink: float = 0.5,
         ls_max_steps: int = 10,
-        weight_decay: float = 0.0,
-        grad_clip: float = 0.0,
         reject_on_armijo_failure: bool = False,
     ) -> "BBArmijoState":
         alpha0 = float(max(alpha_min, min(alpha_max, alpha0)))
@@ -44,8 +54,6 @@ class BBArmijoState:
             ls_c=float(ls_c),
             ls_shrink=float(ls_shrink),
             ls_max_steps=int(max(ls_max_steps, 1)),
-            weight_decay=float(max(weight_decay, 0.0)),
-            grad_clip=float(max(grad_clip, 0.0)),
             reject_on_armijo_failure=bool(reject_on_armijo_failure),
         )
 
@@ -55,10 +63,10 @@ class BBArmijoState:
         For a locally concave maximization objective ``f`` with ascent
         direction ``g = +grad f``:
             s = alpha_prev * g_prev,
-            y = grad_new - grad_prev ≈ alpha_prev * H @ g_prev,    H ≺ 0
+            y = grad_new - grad_prev ~= alpha_prev * H @ g_prev,    H < 0
         so ``<s, y> < 0``. The standard descent BB ``alpha = <s, s>/<s, y>``
         is therefore negative, and clamping to ``[alpha_min, alpha_max]``
-        collapses to ``alpha_min`` — disabling BB. We use the ascent BB
+        collapses to ``alpha_min`` - disabling BB. We use the ascent BB
         ``alpha = -<s, s> / <s, y>`` which is positive whenever ``y`` is
         meaningful and reflects the local concavity (more curvature ->
         smaller step).
@@ -77,7 +85,7 @@ class BBArmijoState:
             num = torch.dot(s, s)
             # Concave-ascent regime: denom < 0. Accept any sufficiently
             # negative value; fall back to alpha_prev otherwise (denom near
-            # zero means y ≈ 0 / numerically unreliable curvature).
+            # zero means y ~= 0 / numerically unreliable curvature).
             cond = torch.isfinite(denom) & (denom < -1e-12)
             alpha_bb = torch.where(
                 cond,
@@ -91,7 +99,9 @@ class BBArmijoState:
         alpha = max(self.alpha_min, min(self.alpha_max, float(alpha)))
         return alpha
 
-    def update_history(self, params_vec: torch.Tensor, grad_vec: torch.Tensor, alpha: float) -> "BBArmijoState":
+    def update_history(
+        self, params_vec: torch.Tensor, grad_vec: torch.Tensor, alpha: float
+    ) -> "BBArmijoState":
         alpha_clamped = max(self.alpha_min, min(self.alpha_max, float(alpha)))
         return BBArmijoState(
             alpha_min=self.alpha_min,
@@ -100,8 +110,6 @@ class BBArmijoState:
             ls_c=self.ls_c,
             ls_shrink=self.ls_shrink,
             ls_max_steps=self.ls_max_steps,
-            weight_decay=self.weight_decay,
-            grad_clip=self.grad_clip,
             reject_on_armijo_failure=self.reject_on_armijo_failure,
             prev_params_vec=params_vec.detach().clone(),
             prev_grad_vec=grad_vec.detach().clone(),
@@ -109,28 +117,25 @@ class BBArmijoState:
 
 
 def bb_armijo_step_params(
-    params: Any,
+    params,
     f_params,
     bb_state: BBArmijoState,
-) -> Tuple[Any, BBArmijoState, float, float]:
+) -> Tuple[List[torch.nn.Parameter], BBArmijoState, float, float]:
     """Single BB+Armijo gradient-ascent step on a parameter collection.
 
-    f_params: callable(create_graph: bool) -> scalar torch tensor (maximized).
-
-    The ``grad_norm`` returned is the gradient norm at the START of the
-    step (i.e. at the iterate the call entered with). We do NOT recompute
-    a fresh fwd+bwd at the post-step iterate just to log its norm — the
-    gradient at the entry of the next call is the same quantity, so an
-    extra fwd+bwd here is wasted work (~25-50% of inner-loop wallclock
-    on NPF/ICNN). The history stored for BB uses the entry gradient
-    paired with the entry params, which is the standard BB convention.
+    The returned ``grad_norm`` is the gradient norm at the START of this
+    call. We don't run a second fwd+bwd at the post-step iterate just for
+    logging - the next call recomputes that gradient anyway, so the extra
+    pass is wasted work (~25-50% of inner-loop wallclock).
     """
     params = list(params)
+    if len(params) == 0:
+        raise ValueError("bb_armijo_step_params received an empty parameter list.")
     params_vec = nn_utils.parameters_to_vector(params).detach()
 
-    f_val_raw = f_params(True)
+    f_val = f_params(True)
     grads = torch.autograd.grad(
-        f_val_raw,
+        f_val,
         params,
         create_graph=False,
         retain_graph=False,
@@ -141,29 +146,19 @@ def bb_armijo_step_params(
     # calls view(-1) which fails on non-contiguous storage.
     grad_tensors = [g.detach() if g is not None else torch.zeros_like(p) for p, g in zip(params, grads)]
     grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
-
-    # Weight decay: ascend on f(theta) - 0.5*wd*||theta||^2. Keep the
-    # Armijo value and gradient tied to the same penalized objective.
-    f_val = f_val_raw
-    if bb_state.weight_decay > 0.0:
-        f_val = f_val - 0.5 * bb_state.weight_decay * torch.dot(params_vec, params_vec)
-        grad_vec = grad_vec - bb_state.weight_decay * params_vec
-    grad_obj_vec = grad_vec
-
-    # Gradient norm clipping. Caps single-step magnitude when the policy
-    # term -J spikes (e.g. on near-edge anchors); has no effect inside the
-    # well-behaved regime where ||g|| <= grad_clip.
-    if bb_state.grad_clip > 0.0:
-        gnorm = grad_vec.norm()
-        if torch.isfinite(gnorm) and float(gnorm.item()) > bb_state.grad_clip:
-            grad_vec = grad_vec * (bb_state.grad_clip / float(gnorm.item()))
-
     grad_norm = grad_vec.norm().item()
+    f_val_float = float(f_val.detach())
+
+    if (
+        not math.isfinite(f_val_float)
+        or not torch.isfinite(grad_vec).all()
+        or not math.isfinite(grad_norm)
+    ):
+        return params, bb_state, f_val_float, grad_norm
 
     alpha = bb_state.propose(params_vec, grad_vec)
-    f_val_float = float(f_val.detach())
-    directional_derivative = float(torch.dot(grad_obj_vec, grad_vec).item())
-    if directional_derivative <= 0.0:
+    directional_derivative = float(torch.dot(grad_vec, grad_vec).item())
+    if directional_derivative <= 0.0 or not math.isfinite(directional_derivative):
         return params, bb_state, f_val_float, grad_norm
 
     alpha_k = alpha
@@ -172,19 +167,16 @@ def bb_armijo_step_params(
         trial_vec = params_vec + alpha_k * grad_vec
         with torch.no_grad():
             nn_utils.vector_to_parameters(trial_vec, params)
-            f_trial_raw = f_params(False).detach()
-            if bb_state.weight_decay > 0.0:
-                f_trial_raw = f_trial_raw - 0.5 * bb_state.weight_decay * torch.dot(trial_vec, trial_vec)
-            f_trial = float(f_trial_raw)
-        if f_trial >= f_val_float + bb_state.ls_c * alpha_k * directional_derivative:
+            f_trial = float(f_params(False).detach())
+        if (
+            math.isfinite(f_trial)
+            and f_trial >= f_val_float + bb_state.ls_c * alpha_k * directional_derivative
+        ):
             armijo_succeeded = True
             break
         if i < bb_state.ls_max_steps - 1:
             alpha_k *= bb_state.ls_shrink
 
-    # If Armijo never accepted: a naive "apply alpha_k anyway" steps in a
-    # direction that just failed Armijo at every trial. Optionally reject
-    # the step (no-op) and reset history so BB recomputes fresh next call.
     if armijo_succeeded or not bb_state.reject_on_armijo_failure:
         final_vec = params_vec + alpha_k * grad_vec
         with torch.no_grad():
@@ -193,5 +185,56 @@ def bb_armijo_step_params(
     else:
         with torch.no_grad():
             nn_utils.vector_to_parameters(params_vec, params)
-        new_state = bb_state  # preserve previous history; alpha unchanged
+        new_state = bb_state
     return params, new_state, f_val_float, grad_norm
+
+
+def bb_armijo_step_vector(
+    vec: torch.Tensor,
+    f_params,
+    bb_state: BBArmijoState,
+) -> Tuple[torch.Tensor, BBArmijoState, float]:
+    """Single BB+Armijo gradient-ascent step on a flat parameter vector.
+
+    ``f_params(vec, create_graph: bool) -> scalar tensor`` is the objective
+    evaluated with the flattened parameters.
+    """
+    vec_det = vec.detach().requires_grad_(True)
+    f_val = f_params(vec_det, True)
+    grad_vec = torch.autograd.grad(f_val, vec_det, create_graph=False)[0]
+    f_val_f = float(f_val.detach())
+    grad_flat = grad_vec.reshape(-1)
+    grad_norm = float(grad_flat.norm().item())
+    if (
+        not math.isfinite(f_val_f)
+        or not torch.isfinite(grad_flat).all()
+        or not math.isfinite(grad_norm)
+    ):
+        return vec_det.detach(), bb_state, f_val_f
+    alpha = bb_state.propose(vec_det.reshape(-1), grad_vec.reshape(-1))
+    g_dot_g = float(torch.dot(grad_flat, grad_flat).item())
+    if g_dot_g <= 0.0 or not math.isfinite(g_dot_g):
+        return vec_det.detach(), bb_state, f_val_f
+    grad_vec_det = grad_vec.detach()
+    vec_det_val = vec_det.detach()
+    alpha_k = alpha
+    armijo_succeeded = False
+    for i in range(bb_state.ls_max_steps):
+        v_trial = vec_det_val + alpha_k * grad_vec_det
+        with torch.no_grad():
+            f_trial = f_params(v_trial, False).item()
+        if math.isfinite(float(f_trial)) and f_trial >= f_val_f + bb_state.ls_c * alpha_k * g_dot_g:
+            armijo_succeeded = True
+            break
+        if i < bb_state.ls_max_steps - 1:
+            alpha_k *= bb_state.ls_shrink
+
+    if armijo_succeeded or not bb_state.reject_on_armijo_failure:
+        v_new = (vec_det_val + alpha_k * grad_vec_det).detach()
+        new_bb_state = bb_state.update_history(
+            vec_det_val.reshape(-1), grad_vec_det.reshape(-1), alpha_k
+        )
+    else:
+        v_new = vec_det_val.detach()
+        new_bb_state = bb_state
+    return v_new, new_bb_state, f_val_f

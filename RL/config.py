@@ -89,27 +89,27 @@ class InnerConfig:
     rgo_max_trials: int = 10
 
     # --- npf (Vesseron & Cuturi, 2024): NPF ICNN potential + BB+Armijo ---
-    # Defaults intentionally mirror the ICNN adversary's topology/BB settings
-    # so an NPF-vs-ICNN run changes the potential parameterization, not the
-    # optimizer budget. For very small lam, the optional safeguards below can
-    # still be enabled from the CLI:
-    #   --npf-weight-decay 1e-4 --npf-grad-clip 10 --npf-eta 1e-2
-    K_npf: int = 10
-    lr_npf: float = 5e-2  # deprecated, kept for CLI back-compat
-    npf_hidden_sizes: Tuple[int, ...] = (1024, 512, 512, 256, 128, 64)
-    npf_outer_rank: int = 4
-    npf_inner_rank: int = 1
-    npf_activation: str = "elu"
+    # Tuned to the same profile as Logistic_Regression_CIFAR10/config.py, but
+    # applied in RL's unconstrained latent xi coordinates before sigmoid
+    # decoding back to the environment box.
+    K_npf: int = 20
+    lr_npf: float = 1e-2  # deprecated (Adam); kept for CLI back-compat
+    npf_hidden_sizes: Tuple[int, ...] = (512, 512, 256, 128, 64)
+    npf_outer_rank: int = 8
+    npf_inner_rank: int = 2
+    npf_activation: str = "softplus"
     npf_elu_alpha: float = 1.0
-    npf_softplus_beta: float = 20.0
-    npf_init_eps: float = 1e-3
+    npf_softplus_beta: float = 10.0
+    npf_init_eps: float = 1e-4
     npf_strong_convexity: float = 1.0
-    npf_eta: float = 5e-2
-    npf_bb_alpha_min: float = 0.0005
-    npf_bb_alpha_max: float = 0.01
-    npf_bb_ls_c: float = 0.1
+    npf_eta: float = 2e-4
+    npf_bb_alpha_min: float = 1e-7
+    npf_bb_alpha_max: float = 0.25
+    npf_bb_ls_c: float = 1e-4
     npf_bb_ls_shrink: float = 0.5
-    npf_bb_ls_max_steps: int = 10
+    npf_bb_ls_max_steps: int = 15
+    # Deprecated no-op CLI compatibility fields. The NPF BB+Armijo update
+    # intentionally matches the CIFAR implementation and does not add these.
     npf_weight_decay: float = 0.0
     npf_grad_clip: float = 0.0
 
@@ -327,7 +327,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--npf-eta", type=float, default=default_inner.npf_eta,
-        help="NPF BB+Armijo alpha0 (default matches --eta-icnn).",
+        help="NPF BB+Armijo alpha0; tuned to match the CIFAR NPF profile.",
     )
     parser.add_argument("--npf-bb-alpha-min", type=float, default=default_inner.npf_bb_alpha_min)
     parser.add_argument("--npf-bb-alpha-max", type=float, default=default_inner.npf_bb_alpha_max)
@@ -336,16 +336,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--npf-bb-ls-max-steps", type=int, default=default_inner.npf_bb_ls_max_steps)
     parser.add_argument(
         "--npf-weight-decay", type=float, default=default_inner.npf_weight_decay,
-        help="L2 weight decay on the NPF convex potential. 0 disables. "
-             "Use a non-zero value (e.g. 1e-4) for small lambda to keep "
-             "psi-weights bounded — without it the inner objective -J - "
-             "lam*cost has an unbounded sup at small lam and ascent drives "
-             "every push to a corner of the xi-box.",
+        help="Deprecated no-op. Kept so older run scripts still parse.",
     )
     parser.add_argument(
         "--npf-grad-clip", type=float, default=default_inner.npf_grad_clip,
-        help="Cap on ||g||_2 per BB+Armijo step (0 disables). Mostly a "
-             "safety net — most steps fall well below the cap.",
+        help="Deprecated no-op. Kept so older run scripts still parse.",
     )
 
     # --- nn_dro (vanilla MLP adversary) ---

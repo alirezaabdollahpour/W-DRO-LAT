@@ -1,30 +1,24 @@
-"""NPF-style ICNN potential (Vesseron & Cuturi, 2024).
+"""NPF-style ICNN potential (Vesseron & Cuturi, 2024) + transport map.
 
-Faithful port of MNIST_Cuturi/models/npf.py and
-Least_Squares/models/npf.py, unchanged at the math level:
-
-    psi(z) = 0.5*mu*||z||^2
-             + 0.5 z^T (diag(delta^2) + A^T A) z + a^T z + phi^{NN}(z),
-
-where phi^{NN} is a deep ICNN block that re-injects per-layer quadratic
-forms Q(z) = ||delta o z||^2 + ||Az||^2, uses non-negative dense layers
-with the Hoedt-Klambauer LogNormal init (negative bias offset), and is
-identity-initialised so that T(z) = grad psi(z) ≈ z at t=0.
-
-Set ``strong_convexity=0`` to recover the pure NPF outer-base convention
-used by older checkpoints; RL training uses ``strong_convexity=1`` to keep
-the ICNN identity base fixed while NPF learns additional quadratic factors.
+Architecture: per-layer diagonal + low-rank convex quadratic injections on
+top of a fixed strong-convexity base plus a learnable PSD residual, with
+non-negative hidden-to-hidden weights and a convex non-decreasing activation.
 """
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from models.icnn import icnn_principled_moments
+
+try:
+    from torch.func import functional_call
+except ImportError:
+    from torch.nn.utils._stateless import functional_call  # type: ignore
 
 
 def _npf_softplus_inverse(y: float) -> float:
@@ -35,8 +29,7 @@ def _npf_softplus_inverse(y: float) -> float:
 
 
 class NPFNonNegativeDense(nn.Module):
-    """Non-negative linear layer with Hoedt-Klambauer LogNormal init and
-    NEGATIVE bias offset (matches MNIST_Cuturi/Least_Squares convention)."""
+    """Non-negative linear layer with Hoedt & Klambauer negative bias init."""
 
     def __init__(self, in_features: int, out_features: int, use_bias: bool = True):
         super().__init__()
@@ -69,7 +62,7 @@ class NPFNonNegativeDense(nn.Module):
 
 
 class NPFQuadraticForm(nn.Module):
-    """Stack of q convex quadratic forms  Q(z) = ||delta o z||^2 + ||Az||^2."""
+    """Stack of q convex quadratic forms Q(z) = ||delta o z||^2 + ||Az||^2."""
 
     def __init__(
         self,
@@ -119,7 +112,7 @@ class NPFQuadraticForm(nn.Module):
 
 
 class NPFInputConvexPotential(nn.Module):
-    """NPF ICNN potential: learnable PSD base + deep quadratic block."""
+    """NPF Eq. (5) ICNN potential: learnable PSD base + deep quadratic block."""
 
     def __init__(
         self,
@@ -131,7 +124,7 @@ class NPFInputConvexPotential(nn.Module):
         elu_alpha: float = 1.0,
         softplus_beta: float = 20.0,
         init_eps: float = 1e-3,
-        strong_convexity: float = 0.0,
+        strong_convexity: float = 1.0,
     ):
         super().__init__()
         if len(hidden_sizes) < 1:
@@ -146,9 +139,6 @@ class NPFInputConvexPotential(nn.Module):
         self.init_eps = float(init_eps)
         self.strong_convexity = float(strong_convexity)
 
-        # Fixed ICNN base plus learnable outer PSD residual
-        # P = mu*I + diag(delta^2) + A^T A.  When mu > 0, initialise the
-        # residual near zero so T(z) starts at z rather than 2z.
         outer_delta_init = self.init_eps if self.strong_convexity > 0.0 else 1.0
         self.outer_delta_raw = nn.Parameter(
             torch.full((self.input_dim,), _npf_softplus_inverse(outer_delta_init))
@@ -162,10 +152,8 @@ class NPFInputConvexPotential(nn.Module):
         else:
             self.register_parameter("outer_A", None)
 
-        # Outer linear a^T z
         self.outer_a = nn.Parameter(torch.zeros(self.input_dim))
 
-        # Deep block
         self.q_blocks = nn.ModuleList()
         self.b_linears = nn.ModuleList()
         self.w_linears: nn.ModuleList = nn.ModuleList()
@@ -205,7 +193,7 @@ class NPFInputConvexPotential(nn.Module):
         self.b_out = nn.Linear(self.input_dim, 1, bias=True)
 
     def init_as_identity(self):
-        """Force grad_z psi(z) ≈ z at t=0 (live-at-init when init_eps > 0)."""
+        """Force grad psi(z) approx z at t=0 (live-at-init when init_eps > 0)."""
         eps = self.init_eps
         delta_raw_init = _npf_softplus_inverse(eps) if eps > 0.0 else -1e3
         with torch.no_grad():
@@ -240,6 +228,19 @@ class NPFInputConvexPotential(nn.Module):
             self.b_out.weight.zero_()
             if self.b_out.bias is not None:
                 self.b_out.bias.zero_()
+
+    @property
+    def outer_delta(self) -> torch.Tensor:
+        return F.softplus(self.outer_delta_raw)
+
+    def outer_P(self) -> torch.Tensor:
+        eye = torch.eye(
+            self.input_dim, dtype=self.outer_delta.dtype, device=self.outer_delta.device
+        )
+        P = self.strong_convexity * eye + torch.diag(self.outer_delta.pow(2))
+        if self.outer_A is not None:
+            P = P + self.outer_A.t() @ self.outer_A
+        return P
 
     def _act(self, u: torch.Tensor) -> torch.Tensor:
         if self.activation == "elu":
@@ -279,3 +280,42 @@ class NPFInputConvexPotential(nn.Module):
             + self.b_out(z_flat).squeeze(-1)
         )
         return fixed_q + q_diag + q_lr + linear + phi
+
+
+def npf_transport_map(
+    icnn_model: NPFInputConvexPotential,
+    params: Dict[str, torch.Tensor],
+    z_flat: torch.Tensor,
+    create_graph: bool = False,
+) -> torch.Tensor:
+    """T_omega(z) = grad_z psi_omega(z) via functional_call."""
+    z_flat_req = z_flat.detach().requires_grad_(True)
+    with torch.set_grad_enabled(True):
+        out = functional_call(icnn_model, params, (z_flat_req,))
+        grad = torch.autograd.grad(
+            out.sum(), z_flat_req, create_graph=create_graph
+        )[0]
+    return grad
+
+
+def npf_T_omega(
+    z_flat: torch.Tensor,
+    icnn_model: NPFInputConvexPotential,
+    create_graph: bool,
+) -> torch.Tensor:
+    """T_omega(z) = grad_z psi_omega(z) using the model's live parameters.
+
+    Mirrors the ICNN ``T_omega`` helper so NPF can drive a parameter-list
+    BB+Armijo step in the same idiomatic way as ICNN.
+    """
+    z_in = z_flat.clone().detach().requires_grad_(True)
+    with torch.set_grad_enabled(True):
+        psi_val = icnn_model(z_in)
+        grad = torch.autograd.grad(
+            psi_val.sum(), z_in, create_graph=create_graph
+        )[0]
+    grad = torch.where(torch.isfinite(grad), grad, z_flat)
+    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+    if not create_graph:
+        grad = grad.detach()
+    return grad.view_as(z_flat)

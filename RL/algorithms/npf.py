@@ -1,6 +1,8 @@
 """NPF-style WDRO adversary (Vesseron & Cuturi, 2024).
 
-    psi(u) = 0.5 u^T (diag(delta^2) + A^T A) u + a^T u + phi^{NN}(u),
+    psi(u) = 0.5*mu*||u||^2
+             + 0.5 u^T (diag(delta^2) + A^T A) u
+             + a^T u + phi^{NN}(u),
 
 with phi^{NN} a deep ICNN block that re-injects per-layer NPF quadratic
 forms Q(u) = ||delta o u||^2 + ||Au||^2.
@@ -12,8 +14,8 @@ schemes are applied jointly.
      non-negative weight (the hidden-to-hidden cascade {W_y^(l)} and the
      readout w_out). These are NEVER zeroed.
   2. Identity init zeros the remaining parameter groups so that
-     T(u) = grad psi(u) ≈ u at t=0:
-        - outer P_omega = I (delta=1, A ~ eps-Gaussian),
+     T(u) = grad psi(u) approx u at t=0:
+        - fixed strong-convexity base mu=1 with epsilon-scale PSD residual,
         - outer/output linear terms a = 0, b_out = 0,
         - input-to-hidden paths W_z^(l) = 0, b^(l) = 0,
         - per-layer quadratic injections at eps scale.
@@ -22,10 +24,10 @@ RL-specific: we apply the NPF potential in the UNCONSTRAINED latent
 space u and decode via the sigmoid box bijection, exactly as the ICNN
 adversary does, so xi_adv stays in [xi_low, xi_high] by construction.
 
-Inner maximisation uses BB + Armijo line search with NPF-specific
-hyperparameters (cfg.npf_eta, cfg.npf_bb_*) whose defaults exactly match
-the ICNN adversary's (cfg.eta_icnn, cfg.bb_*); user can override via
---npf-eta / --npf-bb-* CLI flags.
+Inner maximisation uses the same BB + Armijo line-search semantics as the
+CIFAR-10 NPF implementation, with NPF-specific hyperparameters
+(cfg.npf_eta, cfg.npf_bb_*) tuned to the same profile and adapted to the
+RL latent-coordinate transport.
 """
 from __future__ import annotations
 
@@ -33,9 +35,10 @@ import torch
 
 from config import InnerConfig
 from envs import VecEnvTorch
-from models.npf import NPFInputConvexPotential
+from models.npf import NPFInputConvexPotential, npf_T_omega
 from models.policy import PolicyNet
 from utils.bb_armijo import BBArmijoState, bb_armijo_step_params
+from utils.common import freeze_params
 from utils.rollouts import evaluate_return_batch_pathwise
 
 
@@ -67,9 +70,9 @@ class NPFAdversary:
         # already produced inside the constructor's non-negative layers.
         self.icnn.init_as_identity()
 
-        # BB + Armijo state with NPF-specific knobs. By default these mirror
-        # the ICNN adversary; cfg.npf_weight_decay/cfg.npf_grad_clip are
-        # optional safeguards for small-lambda corner-saturation runs.
+        # BB + Armijo state with NPF-specific knobs matching the CIFAR NPF
+        # implementation. No optimizer-side weight decay or gradient clipping
+        # is injected into the adversary step.
         self.bb_state = BBArmijoState.create(
             alpha0=cfg.npf_eta,
             alpha_min=cfg.npf_bb_alpha_min,
@@ -77,8 +80,6 @@ class NPFAdversary:
             ls_c=cfg.npf_bb_ls_c,
             ls_shrink=cfg.npf_bb_ls_shrink,
             ls_max_steps=cfg.npf_bb_ls_max_steps,
-            weight_decay=cfg.npf_weight_decay,
-            grad_clip=cfg.npf_grad_clip,
             reject_on_armijo_failure=True,
         )
 
@@ -97,12 +98,7 @@ class NPFAdversary:
     def T(self, hat_xi: torch.Tensor, create_graph: bool = True) -> torch.Tensor:
         """xi_adv = decode(grad_u psi(encode(hat_xi)))."""
         hat_u = self._encode(hat_xi)
-        with torch.set_grad_enabled(True):
-            u_in = hat_u.clone().detach().requires_grad_(True)
-            phi = self.icnn(u_in)
-            u_adv = torch.autograd.grad(phi.sum(), u_in, create_graph=create_graph)[0]
-        u_adv = u_adv.view_as(hat_xi)
-        u_adv = torch.nan_to_num(u_adv, nan=0.0, posinf=0.0, neginf=0.0)
+        u_adv = npf_T_omega(hat_u, self.icnn, create_graph=create_graph)
         xi_adv = self._decode(u_adv)
         xi_adv = torch.where(torch.isfinite(xi_adv), xi_adv, hat_xi)
         if not create_graph:
@@ -123,7 +119,7 @@ class NPFAdversary:
 
         hat = hat_xi
 
-        with torch.enable_grad():
+        with torch.enable_grad(), freeze_params(policy):
             for k in range(int(self.cfg.K_npf)):
                 seed_k = int(seed0 + 1000 * k)
 

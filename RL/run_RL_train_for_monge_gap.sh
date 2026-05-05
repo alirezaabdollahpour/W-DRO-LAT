@@ -84,12 +84,14 @@ echo "[run] OUT_DIR=${OUT_DIR}"
 
 for seed in ${SEEDS}; do
   for lam in ${LAMS}; do
-    json_path="${OUT_DIR}/RL_minimal_${ENV_NAME}_paper_seed${seed}_lam_${lam}_softplusbeta_20.0.json"
+    json_path="${OUT_DIR}/RL_minimal_${ENV_NAME}_paper_seed${seed}_lam_${lam}_npf_softplusbeta_10.0.json"
+    ckpt_prefix="${json_path%.json}"
     # Skip a cell only if every requested method already has a checkpoint
-    # (so partial-failure cells get retried).
+    # for this exact run profile (so partial-failure cells get retried, and
+    # older NPF profiles do not mask the CIFAR-aligned NPF checkpoints).
     all_present=1
     for m in ${METHODS}; do
-      if ! compgen -G "${OUT_DIR}/RL_minimal_${ENV_NAME}_*_seed${seed}_lam_${lam}_*_${m}_policy.pt" >/dev/null; then
+      if [ ! -f "${ckpt_prefix}_${m}_policy.pt" ]; then
         all_present=0
         break
       fi
@@ -120,11 +122,11 @@ for seed in ${SEEDS}; do
       --particle-num-samples 8 --particle-inner-steps 10 --particle-inner-lr 0.05 --particle-epsilon 0.01 \
       --rgo-num-samples 8 --rgo-inner-steps 10 --rgo-inner-lr 0.05 --rgo-epsilon 0.01 --rgo-max-trials 10 \
       --k-npf 20 \
-      --npf-hidden-sizes 1024 512 512 256 128 64 \
-      --npf-outer-rank 4 --npf-inner-rank 1 \
-      --npf-activation elu --npf-init-eps 1e-3 --npf-strong-convexity 1.0 --npf-softplus-beta 20.0 \
-      --npf-eta 0.05 --npf-bb-alpha-min 0.0005 --npf-bb-alpha-max 0.01 \
-      --npf-weight-decay 0.0 --npf-grad-clip 0.0 \
+      --npf-hidden-sizes 512 512 256 128 64 \
+      --npf-outer-rank 8 --npf-inner-rank 2 \
+      --npf-activation softplus --npf-init-eps 1e-4 --npf-strong-convexity 1.0 --npf-softplus-beta 10.0 \
+      --npf-eta 0.0002 --npf-bb-alpha-min 1e-7 --npf-bb-alpha-max 0.25 \
+      --npf-bb-ls-c 1e-4 --npf-bb-ls-shrink 0.5 --npf-bb-ls-max-steps 15 \
       --k-nn-dro 10 --lr-nn-dro 0.05 \
       --nn-dro-hidden-sizes 256 128 64 --nn-dro-activation relu --nn-dro-init-scale 1e-3 \
       --no-plot --save-json \
