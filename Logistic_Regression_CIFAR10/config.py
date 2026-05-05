@@ -78,24 +78,27 @@ class TrainConfig:
     icnn_bb_ls_shrink: float = 0.5
     icnn_bb_ls_max_steps: int = 10
 
-    # NPF knobs (BB+Armijo defaults mirror icnn_bb_* per "same parameters" spec)
-    npf_hidden: Tuple[int, ...] = (128, 128, 128, 128) #(512, 512, 256, 128, 64)
-    npf_outer_rank: int = 4
-    npf_inner_rank: int = 1
-    npf_activation: str = "elu"
+    # NPF knobs tuned for CIFAR-10 ResNet-50 features. This profile keeps the
+    # identity-start transport stable, gives the convex potential enough
+    # low-rank curvature to move feature directions, and uses a less brittle
+    # Armijo condition than the initial conservative setting.
+    npf_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
+    npf_outer_rank: int = 8
+    npf_inner_rank: int = 2
+    npf_activation: str = "softplus"
     npf_elu_alpha: float = 1.0
-    npf_softplus_beta: float = 20.0
-    npf_init_eps: float = 1e-3
-    inner_steps_npf: int = 10
+    npf_softplus_beta: float = 10.0
+    npf_init_eps: float = 1e-4
+    inner_steps_npf: int = 20
     inner_lr_npf: float = 1e-2  # deprecated (Adam) — kept for CLI back-compat
-    npf_lr_B: float = 5e-4
-    npf_weight_decay_B: float = 0.0
-    npf_bb_alpha0: float = 5e-4
-    npf_bb_alpha_min: float = 1e-6
-    npf_bb_alpha_max: float = 1.0
-    npf_bb_ls_c: float = 0.1
+    npf_lr_B: float = 1e-3
+    npf_weight_decay_B: float = 1e-4
+    npf_bb_alpha0: float = 2e-4
+    npf_bb_alpha_min: float = 1e-7
+    npf_bb_alpha_max: float = 0.25
+    npf_bb_ls_c: float = 1e-4
     npf_bb_ls_shrink: float = 0.5
-    npf_bb_ls_max_steps: int = 10
+    npf_bb_ls_max_steps: int = 15
 
     # NN-DRO knobs (vanilla-MLP adversary, no gradient-of-potential)
     nn_dro_hidden: Tuple[int, ...] = (512, 512, 256, 256, 128)
@@ -239,26 +242,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # NPF knobs
     npf = parser.add_argument_group("npf")
     npf.add_argument("--npf_hidden", type=int, nargs="+",
-                     default=[128, 128, 128, 128])
-    npf.add_argument("--npf_outer_rank", type=int, default=4)
-    npf.add_argument("--npf_inner_rank", type=int, default=1)
+                     default=[512, 512, 256, 128, 64])
+    npf.add_argument("--npf_outer_rank", type=int, default=8)
+    npf.add_argument("--npf_inner_rank", type=int, default=2)
     npf.add_argument("--npf_activation", type=str, default="softplus",
                      choices=["elu", "softplus", "relu"])
     npf.add_argument("--npf_elu_alpha", type=float, default=1.0)
-    npf.add_argument("--npf_softplus_beta", type=float, default=20.0)
-    npf.add_argument("--npf_init_eps", type=float, default=1e-3)
-    npf.add_argument("--inner_steps_npf", type=int, default=10)
+    npf.add_argument("--npf_softplus_beta", type=float, default=10.0)
+    npf.add_argument("--npf_init_eps", type=float, default=1e-4)
+    npf.add_argument("--inner_steps_npf", type=int, default=20)
     npf.add_argument("--inner_lr_npf", type=float, default=1e-2,
                      help="Deprecated: Adam lr is no longer used (now BB+Armijo).")
-    npf.add_argument("--npf_lr_B", type=float, default=5e-4)
-    npf.add_argument("--npf_weight_decay_B", type=float, default=0.0)
-    npf.add_argument("--npf_bb_alpha0", type=float, default=5e-4,
-                     help="NPF BB+Armijo alpha0 (default matches --icnn_bb_alpha0).")
-    npf.add_argument("--npf_bb_alpha_min", type=float, default=1e-6)
-    npf.add_argument("--npf_bb_alpha_max", type=float, default=1.0)
-    npf.add_argument("--npf_bb_ls_c", type=float, default=0.1)
+    npf.add_argument("--npf_lr_B", type=float, default=1e-3)
+    npf.add_argument("--npf_weight_decay_B", type=float, default=1e-4)
+    npf.add_argument("--npf_bb_alpha0", type=float, default=2e-4,
+                     help="NPF BB+Armijo initial step size.")
+    npf.add_argument("--npf_bb_alpha_min", type=float, default=1e-7)
+    npf.add_argument("--npf_bb_alpha_max", type=float, default=0.25)
+    npf.add_argument("--npf_bb_ls_c", type=float, default=1e-4)
     npf.add_argument("--npf_bb_ls_shrink", type=float, default=0.5)
-    npf.add_argument("--npf_bb_ls_max_steps", type=int, default=10)
+    npf.add_argument("--npf_bb_ls_max_steps", type=int, default=15)
 
     # NN-DRO knobs
     nn_dro = parser.add_argument_group("nn_dro")
