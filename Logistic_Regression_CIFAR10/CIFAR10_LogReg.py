@@ -3,12 +3,15 @@
 Reproduces Section 6.3 / Figure 6 of "GRADIENT FLOW SAMPLER-BASED
 DISTRIBUTIONALLY ROBUST OPTIMIZATION" on CIFAR-10 ResNet-50 features (512-dim)
 under an l2-PGD test-time attack.
+The attack is adaptive feature-space l2-PGD over the current perturbation
+delta with five restarts by default.
 
 Competitors
 -----------
   * SAA / ERM
   * Sinkhorn SDRO Dual
   * WRM (Sinha et al.)
+  * RO (Madry-style l2-PGD robust optimisation)
   * WGF / WFR / SVG samplers
   * RGO (rejection sampling)
   * ICNN-DRO (Brenier transport-map adversary, our method)
@@ -20,13 +23,13 @@ Usage
 -----
     python CIFAR10_LogReg.py --help
     python CIFAR10_LogReg.py
-    python CIFAR10_LogReg.py --methods SAA WRM ICNN NPF NN-DRO PPA
+    python CIFAR10_LogReg.py --methods SAA WRM RO ICNN NPF NN-DRO PPA
 """
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -98,19 +101,46 @@ def main() -> None:
     print(f"tau={cfg.tau:g} -> lambda={cfg.lambda_param:g}")
 
     # PGD evaluation radii: ε_attack = Δ · E[||x||_2]
+    avg_train_feature_norm = float(np.mean(np.linalg.norm(train_features_np, axis=1)))
     avg_feature_norm = float(np.mean(np.linalg.norm(test_features_np, axis=1)))
+    if cfg.ro_epsilon is None:
+        cfg = replace(
+            cfg,
+            ro_epsilon=float(cfg.ro_epsilon_level) * avg_train_feature_norm,
+        )
     perturbation_levels = list(cfg.perturbation_levels)
     epsilon_attack_values = [
         float(level) * avg_feature_norm for level in perturbation_levels
     ]
 
+    print(f"Average train feature ||x||_2: {avg_train_feature_norm:.4f}")
     print(f"Average test feature ||x||_2: {avg_feature_norm:.4f}")
+    print(
+        "Evaluation attack: adaptive feature-space l2-PGD "
+        f"with steps={cfg.pgd_steps}, restarts={cfg.pgd_restarts}"
+    )
 
     requested_methods = list(cfg.methods)
     unknown = [m for m in requested_methods if m not in ALL_ALGORITHMS]
     if unknown:
         raise ValueError(
             f"Unknown methods requested: {unknown}. Available: {list(ALL_ALGORITHMS)}"
+        )
+    if "RO" in requested_methods:
+        print(
+            "RO training radius: "
+            f"epsilon={cfg.ro_epsilon:.6g}, "
+            f"level={cfg.ro_epsilon_level:g}, "
+            f"pgd_steps={cfg.ro_pgd_steps}, "
+            f"pgd_restarts={cfg.ro_pgd_restarts}"
+        )
+    if "NPF" in requested_methods:
+        print(
+            "NPF architecture: "
+            f"hidden={list(cfg.npf_hidden)}, "
+            f"outer_rank={cfg.npf_outer_rank}, "
+            f"inner_rank={cfg.npf_inner_rank}, "
+            f"activation={cfg.npf_activation}"
         )
 
     # Train shared (ε_ent-independent) algorithms once.
@@ -169,6 +199,7 @@ def main() -> None:
                 epsilon_attack_values[1:],
                 device=device,
                 pgd_num_iter=cfg.pgd_steps,
+                pgd_restarts=cfg.pgd_restarts,
             )
             results_for_eps[name].append(res)
 
@@ -180,10 +211,37 @@ def main() -> None:
             "tau": cfg.tau,
             "lambda": cfg.lambda_param,
             "eps_ent": eps_ent,
+            "avg_train_feature_norm": avg_train_feature_norm,
             "avg_feature_norm": avg_feature_norm,
             "perturbation_levels": perturbation_levels,
             "epsilon_attack_values": epsilon_attack_values,
+            "evaluation_attack": {
+                "name": "adaptive_l2_pgd_feature_delta",
+                "pgd_steps": cfg.pgd_steps,
+                "pgd_restarts": cfg.pgd_restarts,
+                "step_size": "epsilon / max(1, pgd_steps // 2)",
+            },
             "hyperparameters": asdict(cfg),
+            "training_radii": {
+                "RO": {
+                    "epsilon": cfg.ro_epsilon,
+                    "epsilon_level": cfg.ro_epsilon_level,
+                    "scale": "epsilon_level * avg_train_feature_norm"
+                    if args.ro_epsilon is None
+                    else "absolute --ro_epsilon",
+                }
+            },
+            "architectures": {
+                "NPF": {
+                    "hidden": list(cfg.npf_hidden),
+                    "outer_rank": cfg.npf_outer_rank,
+                    "inner_rank": cfg.npf_inner_rank,
+                    "activation": cfg.npf_activation,
+                    "elu_alpha": cfg.npf_elu_alpha,
+                    "softplus_beta": cfg.npf_softplus_beta,
+                    "init_eps": cfg.npf_init_eps,
+                }
+            },
             "results": {
                 method: [_json_safe_results(run_dict) for run_dict in run_list]
                 for method, run_list in results_for_eps.items()

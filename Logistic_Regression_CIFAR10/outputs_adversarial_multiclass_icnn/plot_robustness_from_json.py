@@ -12,12 +12,13 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence,
 import numpy as np
 
 
-METHOD_ORDER = ["RGO", "WGF", "SAA", "Dual", "WRM", "WFR", "SVG", "ICNN"]
+METHOD_ORDER = ["RGO", "WGF", "SAA", "Dual", "WRM", "RO", "WFR", "SVG", "ICNN"]
 MARKER_ORDER = ["o", "s", "D", "^", "v", "<", ">", "P", "X", "*"]
 METHOD_DISPLAY_NAME: Dict[str, str] = {
     # Align display names with Least_Squares/uncertain_least_squares_icnn.py
     "SAA": "ERM",
     "WRM": "Particle Ascent",
+    "RO": "RO",
     "WGF": "WGF(Otto, 1996)",
     "WFR": "WFR(Xu, 2025)",
     "Dual": "Dual(Wang et al., 2021)",

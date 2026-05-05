@@ -40,6 +40,7 @@ class TrainConfig:
 
     # Evaluation (PGD)
     pgd_steps: int = 10
+    pgd_restarts: int = 5
     perturbation_levels: Tuple[float, ...] = (
         0.0, 0.008, 0.016, 0.024, 0.032, 0.04, 0.048, 0.056, 0.064, 0.072, 0.08,
     )
@@ -53,6 +54,14 @@ class TrainConfig:
     ppa_refine_steps: int = 15
     ppa_refine_lr: float = 5e-3
     ppa_delta_rtol: float = 1e-4
+
+    # RO knobs (Madry-style l2-PGD robust optimisation in feature space)
+    ro_epsilon_level: float = 0.04
+    ro_epsilon: Optional[float] = None
+    ro_pgd_steps: int = 10
+    ro_pgd_step_size: Optional[float] = None
+    ro_pgd_restarts: int = 1
+    ro_lr: float = 5e-3
 
     # ICNN knobs
     icnn_hidden: Tuple[int, ...] = (1024, 512, 512, 256, 128, 64)
@@ -70,7 +79,7 @@ class TrainConfig:
     icnn_bb_ls_max_steps: int = 10
 
     # NPF knobs (BB+Armijo defaults mirror icnn_bb_* per "same parameters" spec)
-    npf_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
+    npf_hidden: Tuple[int, ...] = (128, 128, 128, 128) #(512, 512, 256, 128, 64)
     npf_outer_rank: int = 4
     npf_inner_rank: int = 1
     npf_activation: str = "elu"
@@ -111,8 +120,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Figure 6 adversarial multiclass logistic regression on CIFAR-10 "
-            "(ResNet-50 features). Competitors: SAA, Dual, WRM, WGF, WFR, SVG, "
-            "RGO, ICNN, NPF, NN-DRO, PPA."
+            "(ResNet-50 features). Competitors: SAA, Dual, WRM, RO, WGF, WFR, "
+            "SVG, RGO, ICNN, NPF, NN-DRO, PPA."
         )
     )
 
@@ -157,6 +166,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Evaluation
     parser.add_argument("--pgd_steps", type=int, default=10)
+    parser.add_argument("--pgd_restarts", type=int, default=5,
+                        help="Number of restarts for adaptive l2-PGD evaluation.")
     parser.add_argument(
         "--perturbation_levels",
         type=float,
@@ -187,6 +198,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ppa.add_argument("--ppa_delta_rtol", type=float, default=1e-4,
                      help="PPA: relative Δ threshold for adaptive stopping.")
 
+    # RO knobs
+    ro = parser.add_argument_group("ro")
+    ro.add_argument("--ro_epsilon_level", type=float, default=0.04,
+                    help=(
+                        "RO training radius as a normalized feature perturbation "
+                        "level. The script converts it to --ro_epsilon_level * "
+                        "mean_train_feature_norm unless --ro_epsilon is set."
+                    ))
+    ro.add_argument("--ro_epsilon", type=float, default=None,
+                    help="Absolute l2 feature-space radius for RO training.")
+    ro.add_argument("--ro_pgd_steps", type=int, default=10,
+                    help="RO inner l2-PGD ascent steps per batch.")
+    ro.add_argument("--ro_pgd_step_size", type=float, default=None,
+                    help="RO inner l2-PGD step size. Default: ro_epsilon / max(1, ro_pgd_steps // 2).")
+    ro.add_argument("--ro_pgd_restarts", type=int, default=1,
+                    help="RO inner l2-PGD random restarts; first restart starts at x.")
+    ro.add_argument("--ro_lr", type=float, default=5e-3,
+                    help="RO outer learning rate.")
+
     # ICNN knobs
     icnn = parser.add_argument_group("icnn")
     icnn.add_argument("--icnn_hidden", type=int, nargs="+",
@@ -209,7 +239,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # NPF knobs
     npf = parser.add_argument_group("npf")
     npf.add_argument("--npf_hidden", type=int, nargs="+",
-                     default=[512, 512, 256])
+                     default=[128, 128, 128, 128])
     npf.add_argument("--npf_outer_rank", type=int, default=4)
     npf.add_argument("--npf_inner_rank", type=int, default=1)
     npf.add_argument("--npf_activation", type=str, default="softplus",

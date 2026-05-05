@@ -2,8 +2,8 @@
 
 Separates:
 
-* ``SHARED_ALGORITHMS`` — algorithms independent of ε_ent (SAA, WRM, ICNN, NPF,
-  NN-DRO, PPA). These are trained once and evaluated for every ε_ent value.
+* ``SHARED_ALGORITHMS`` — algorithms independent of ε_ent (SAA, WRM, RO, ICNN,
+  NPF, NN-DRO, PPA). These are trained once and evaluated for every ε_ent value.
 * ``EPS_ENT_ALGORITHMS`` — algorithms whose hyperparameters depend on ε_ent
   (Dual, WGF, WFR, SVG, RGO). Re-trained for each ε_ent value.
 """
@@ -16,6 +16,7 @@ import torch
 from algorithms.base import BaseLinearDRO
 from algorithms.dual import SDRO_Dual
 from algorithms.icnn import ICNNDRO
+from algorithms.madry import MadryRO
 from algorithms.nn_dro import NNDRO
 from algorithms.npf import NPF
 from algorithms.ppa import PPA
@@ -28,7 +29,7 @@ from algorithms.wrm import WRM
 
 
 # Algorithms whose training is independent of ε_ent.
-SHARED_ALGORITHMS = ("SAA", "WRM", "ICNN", "NPF", "NN-DRO", "PPA")
+SHARED_ALGORITHMS = ("SAA", "WRM", "RO", "ICNN", "NPF", "NN-DRO", "PPA")
 
 # Algorithms whose ε_ent is a training-time hyperparameter.
 EPS_ENT_ALGORITHMS = ("Dual", "WGF", "WFR", "SVG", "RGO")
@@ -38,6 +39,7 @@ ALL_ALGORITHMS = (
     "SAA",
     "Dual",
     "WRM",
+    "RO",
     "WGF",
     "WFR",
     "SVG",
@@ -75,6 +77,26 @@ def _build_wrm(cfg, input_dim: int, num_classes: int, device: torch.device, eps_
         batch_size=cfg.batch_size,
         inner_lr=cfg.inner_lr,
         inner_itr=cfg.inner_steps,
+    )
+
+
+def _build_ro(cfg, input_dim: int, num_classes: int, device: torch.device, eps_ent: float) -> BaseLinearDRO:
+    if cfg.ro_epsilon is None:
+        raise ValueError(
+            "cfg.ro_epsilon must be resolved before building RO. "
+            "CIFAR10_LogReg.py sets it from --ro_epsilon_level and the train feature norm."
+        )
+    return MadryRO(
+        input_dim,
+        num_classes,
+        device=device.type,
+        epsilon=cfg.ro_epsilon,
+        pgd_steps=cfg.ro_pgd_steps,
+        pgd_step_size=cfg.ro_pgd_step_size,
+        pgd_restarts=cfg.ro_pgd_restarts,
+        max_itr=cfg.epochs,
+        learning_rate=cfg.ro_lr,
+        batch_size=cfg.batch_size,
     )
 
 
@@ -252,6 +274,7 @@ def _build_rgo(cfg, input_dim: int, num_classes: int, device: torch.device, eps_
 BUILDERS: Dict[str, Builder] = {
     "SAA": _build_saa,
     "WRM": _build_wrm,
+    "RO": _build_ro,
     "ICNN": _build_icnn,
     "NPF": _build_npf,
     "NN-DRO": _build_nn_dro,

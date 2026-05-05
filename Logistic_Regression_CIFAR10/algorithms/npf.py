@@ -47,7 +47,7 @@ class NPF(BaseLinearDRO):
         num_classes: int,
         fit_intercept: bool = True,
         lambda_param: float = 10.0,
-        npf_hidden: Sequence[int] = (512, 512, 256, 256, 128),
+        npf_hidden: Sequence[int] = (512, 512, 256, 128, 64),
         npf_outer_rank: int = 4,
         npf_inner_rank: int = 1,
         npf_activation: str = "elu",

@@ -1,4 +1,4 @@
-"""l2-PGD attack on feature vectors (verbatim from adversarial_multiclass_icnn.py)."""
+"""Adaptive l2-PGD attack on feature-space perturbations."""
 from __future__ import annotations
 
 import torch
@@ -10,43 +10,71 @@ def pgd_attack(
     features: torch.Tensor,
     labels: torch.Tensor,
     epsilon: float,
-    alpha: float,
+    alpha: float | None,
     num_iter: int,
     device: torch.device,
+    restarts: int = 5,
 ) -> torch.Tensor:
-    """PGD adversarial attack (l2 norm)."""
-    perturbed_features = features.clone().detach().to(device)
-    perturbed_features.requires_grad = True
+    """Multi-restart adaptive l2-PGD attack on feature perturbations.
+
+    The optimisation variable is the current feature-space perturbation
+    ``delta``.  Each ascent step updates ``delta`` using a gradient normalised
+    in the l2 norm and then projects the current ``delta`` back onto the
+    radius-``epsilon`` l2 ball.  The returned adversarial features are selected
+    per sample as the highest-loss point found across all restarts.
+    """
     original_features = features.clone().detach().to(device)
     labels = labels.to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(reduction="none")
+    batch_size = original_features.shape[0]
+    flat_dim = original_features[0].numel()
+    reshape_dims = [batch_size] + [1] * (original_features.dim() - 1)
 
-    for _ in range(num_iter):
-        if perturbed_features.grad is not None:
-            perturbed_features.grad.zero_()
+    if epsilon <= 0.0 or num_iter <= 0:
+        return original_features
 
-        outputs = model(perturbed_features)
-        loss = criterion(outputs, labels)
-        loss.backward()
+    step_size = float(alpha) if alpha is not None else float(epsilon) / max(1, num_iter // 2)
+    best_adv = original_features
+    best_loss = torch.full((batch_size,), -torch.inf, device=device)
 
-        grad = perturbed_features.grad.detach()
-        grad_norm = torch.linalg.norm(
-            grad.view(grad.shape[0], -1), dim=1, keepdim=True
-        ) + 1e-12
-        normalized_grad = grad / grad_norm
+    for restart_idx in range(max(1, int(restarts))):
+        if restart_idx == 0:
+            delta = torch.zeros_like(original_features)
+        else:
+            noise = torch.randn_like(original_features)
+            noise_norm = torch.linalg.norm(noise.view(batch_size, -1), dim=1).view(
+                *reshape_dims
+            ).clamp_min(1e-12)
+            radii = torch.rand(batch_size, device=device).pow(1.0 / flat_dim).view(
+                *reshape_dims
+            )
+            delta = epsilon * radii * noise / noise_norm
 
-        reshape_dims = [grad.shape[0]] + [1] * (grad.dim() - 1)
+        for _ in range(num_iter):
+            delta = delta.detach().requires_grad_(True)
+            adv_features = original_features + delta
+            losses = criterion(model(adv_features), labels)
+            grad = torch.autograd.grad(losses.sum(), delta, create_graph=False)[0]
 
-        perturbed_features.data = perturbed_features.data + alpha * normalized_grad
-        perturbation = perturbed_features.data - original_features.data
+            with torch.no_grad():
+                grad_norm = torch.linalg.norm(
+                    grad.view(batch_size, -1), dim=1
+                ).view(*reshape_dims).clamp_min(1e-12)
+                delta = delta + step_size * grad / grad_norm
 
-        pert_norm = torch.linalg.norm(
-            perturbation.view(perturbation.shape[0], -1), dim=1, keepdim=True
-        )
-        factor = epsilon / (pert_norm + 1e-12)
-        factor = torch.min(torch.ones_like(factor), factor)
+                delta_norm = torch.linalg.norm(
+                    delta.view(batch_size, -1), dim=1
+                ).view(*reshape_dims).clamp_min(1e-12)
+                scale = torch.minimum(
+                    torch.ones_like(delta_norm), float(epsilon) / delta_norm
+                )
+                delta = delta * scale
 
-        perturbation = perturbation * factor.view(*reshape_dims)
-        perturbed_features.data = original_features.data + perturbation
+        with torch.no_grad():
+            adv_features = original_features + delta
+            losses = criterion(model(adv_features), labels)
+            improve = losses > best_loss
+            best_loss = torch.where(improve, losses, best_loss)
+            best_adv = torch.where(improve.view(*reshape_dims), adv_features, best_adv)
 
-    return perturbed_features.detach()
+    return best_adv.detach()

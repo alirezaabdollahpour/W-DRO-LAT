@@ -18,6 +18,7 @@ def evaluate_model(
     device: torch.device,
     eval_batch_size: int = 128,
     pgd_num_iter: int = 10,
+    pgd_restarts: int = 5,
 ) -> Dict[float, float]:
     """Clean accuracy at ε=0 and PGD accuracy at each ε in ``epsilon_list``."""
     pytorch_model = model_object.model.eval()
@@ -46,9 +47,10 @@ def evaluate_model(
                 features=features,
                 labels=labels,
                 epsilon=epsilon,
-                alpha=epsilon / 8,
+                alpha=None,
                 num_iter=pgd_num_iter,
                 device=device,
+                restarts=pgd_restarts,
             )
             with torch.no_grad():
                 outputs = pytorch_model(perturbed_features)
