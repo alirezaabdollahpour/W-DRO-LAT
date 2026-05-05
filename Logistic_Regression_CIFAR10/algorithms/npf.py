@@ -7,6 +7,8 @@ Adapted to the CIFAR-10 feature-space logistic-regression setting:
         max_ω  E[ CE(B(T_ω(x)), y) - λ ||T_ω(x) - x||_2^2 ]
 
 where T_ω(x) = ∇ψ_ω(x) is the NPF ICNN transport map (see models/npf.py).
+Unlike the bounded RL/least-squares settings, CIFAR feature vectors are not
+box-constrained here, so the transport is applied directly in feature space.
 
 Initialization follows the paper exactly and is *not* a choice: principled
 LogNormal draws (used inside the non-negative layers' constructor) and the
@@ -52,6 +54,7 @@ class NPF(BaseLinearDRO):
         npf_elu_alpha: float = 1.0,
         npf_softplus_beta: float = 20.0,
         npf_init_eps: float = 1e-3,
+        npf_strong_convexity: float = 1.0,
         omega_steps_per_batch: int = 10,
         bb_alpha0: float = 5e-4,
         bb_alpha_min: float = 1e-6,
@@ -90,6 +93,7 @@ class NPF(BaseLinearDRO):
             elu_alpha=npf_elu_alpha,
             softplus_beta=npf_softplus_beta,
             init_eps=npf_init_eps,
+            strong_convexity=npf_strong_convexity,
         ).to(self.device)
         # Identity init applied on top of the LogNormal draws produced inside
         # the non-negative layers' constructor.
@@ -102,6 +106,7 @@ class NPF(BaseLinearDRO):
             ls_c=bb_ls_c,
             ls_shrink=bb_ls_shrink,
             ls_max_steps=bb_ls_max_steps,
+            reject_on_armijo_failure=True,
         )
 
     def fit(

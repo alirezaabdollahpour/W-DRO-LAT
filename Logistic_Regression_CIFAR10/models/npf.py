@@ -1,9 +1,8 @@
 """NPF-style ICNN potential (Vesseron & Cuturi, 2024) + transport map.
 
-Architecture (identical to MNIST_Cuturi/models/npf.py): per-layer diagonal +
-low-rank convex quadratic injections on top of a learnable PSD outer base,
-with non-negative hidden-to-hidden weights and a convex non-decreasing
-activation (ELU by default).
+Architecture: per-layer diagonal + low-rank convex quadratic injections on
+top of a fixed strong-convexity base plus a learnable PSD residual, with
+non-negative hidden-to-hidden weights and a convex non-decreasing activation.
 """
 from __future__ import annotations
 
@@ -128,6 +127,7 @@ class NPFInputConvexPotential(nn.Module):
         elu_alpha: float = 1.0,
         softplus_beta: float = 20.0,
         init_eps: float = 1e-3,
+        strong_convexity: float = 1.0,
     ):
         super().__init__()
         if len(hidden_sizes) < 1:
@@ -140,9 +140,11 @@ class NPFInputConvexPotential(nn.Module):
         self.elu_alpha = float(elu_alpha)
         self.softplus_beta = float(softplus_beta)
         self.init_eps = float(init_eps)
+        self.strong_convexity = float(strong_convexity)
 
+        outer_delta_init = self.init_eps if self.strong_convexity > 0.0 else 1.0
         self.outer_delta_raw = nn.Parameter(
-            torch.full((self.input_dim,), _npf_softplus_inverse(1.0))
+            torch.full((self.input_dim,), _npf_softplus_inverse(outer_delta_init))
         )
         if self.outer_rank > 0:
             if self.init_eps > 0.0:
@@ -204,7 +206,8 @@ class NPFInputConvexPotential(nn.Module):
         eps = self.init_eps
         delta_raw_init = _npf_softplus_inverse(eps) if eps > 0.0 else -1e3
         with torch.no_grad():
-            self.outer_delta_raw.fill_(_npf_softplus_inverse(1.0))
+            outer_delta_init = eps if self.strong_convexity > 0.0 else 1.0
+            self.outer_delta_raw.fill_(_npf_softplus_inverse(outer_delta_init))
             if self.outer_A is not None:
                 if eps > 0.0:
                     std = eps / math.sqrt(
@@ -239,6 +242,19 @@ class NPFInputConvexPotential(nn.Module):
             if self.b_out.bias is not None:
                 self.b_out.bias.zero_()
 
+    @property
+    def outer_delta(self) -> torch.Tensor:
+        return F.softplus(self.outer_delta_raw)
+
+    def outer_P(self) -> torch.Tensor:
+        eye = torch.eye(
+            self.input_dim, dtype=self.outer_delta.dtype, device=self.outer_delta.device
+        )
+        P = self.strong_convexity * eye + torch.diag(self.outer_delta.pow(2))
+        if self.outer_A is not None:
+            P = P + self.outer_A.t() @ self.outer_A
+        return P
+
     def _act(self, u: torch.Tensor) -> torch.Tensor:
         if self.activation == "elu":
             return F.elu(u, alpha=self.elu_alpha)
@@ -253,6 +269,7 @@ class NPFInputConvexPotential(nn.Module):
         z_flat = z.view(z.size(0), -1)
 
         delta_out = F.softplus(self.outer_delta_raw)
+        fixed_q = 0.5 * self.strong_convexity * z_flat.pow(2).sum(dim=-1)
         q_diag = 0.5 * (delta_out.pow(2) * z_flat.pow(2)).sum(dim=-1)
         if self.outer_A is not None:
             Az = z_flat @ self.outer_A.t()
@@ -277,7 +294,7 @@ class NPFInputConvexPotential(nn.Module):
             + self.q_out(z_flat).squeeze(-1)
             + self.b_out(z_flat).squeeze(-1)
         )
-        return q_diag + q_lr + linear + phi
+        return fixed_q + q_diag + q_lr + linear + phi
 
 
 def npf_transport_map(
@@ -312,4 +329,8 @@ def npf_T_omega(
         grad = torch.autograd.grad(
             psi_val.sum(), z_in, create_graph=create_graph
         )[0]
+    grad = torch.where(torch.isfinite(grad), grad, z_flat)
+    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+    if not create_graph:
+        grad = grad.detach()
     return grad.view_as(z_flat)
