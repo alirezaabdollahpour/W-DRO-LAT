@@ -120,6 +120,8 @@ def bb_armijo_step_params(
     """
 
     params = list(params)
+    if len(params) == 0:
+        raise ValueError("bb_armijo_step_params received an empty parameter list.")
     params_vec = nn_utils.parameters_to_vector(params).detach()
 
     f_val = f_params(True)
@@ -137,11 +139,18 @@ def bb_armijo_step_params(
     grad_tensors = [g.detach() if g is not None else torch.zeros_like(p) for p, g in zip(params, grads)]
     grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
     grad_norm = grad_vec.norm().item()
+    f_val_float = float(f_val.detach())
+
+    if (
+        not math.isfinite(f_val_float)
+        or not torch.isfinite(grad_vec).all()
+        or not math.isfinite(grad_norm)
+    ):
+        return params, bb_state, f_val_float, grad_norm
 
     alpha = bb_state.propose(params_vec, grad_vec)
-    f_val_float = float(f_val.detach())
-    g_dot_g = float(torch.dot(grad_vec, grad_vec).item())
-    if g_dot_g == 0.0:
+    directional_derivative = float(torch.dot(grad_vec, grad_vec).item())
+    if directional_derivative <= 0.0 or not math.isfinite(directional_derivative):
         return params, bb_state, f_val_float, grad_norm
 
     alpha_k = alpha
@@ -151,7 +160,10 @@ def bb_armijo_step_params(
         with torch.no_grad():
             nn_utils.vector_to_parameters(trial_vec, params)
             f_trial = float(f_params(False).detach())
-        if f_trial >= f_val_float + bb_state.ls_c * alpha_k * g_dot_g:
+        if (
+            math.isfinite(f_trial)
+            and f_trial >= f_val_float + bb_state.ls_c * alpha_k * directional_derivative
+        ):
             armijo_succeeded = True
             break
         if i < bb_state.ls_max_steps - 1:
@@ -182,10 +194,18 @@ def bb_armijo_step_vector(
     vec_det = vec.detach().requires_grad_(True)
     f_val = f_params(vec_det, True)
     grad_vec = torch.autograd.grad(f_val, vec_det, create_graph=False)[0]
+    f_val_f = float(f_val.detach())
+    grad_flat = grad_vec.reshape(-1)
+    grad_norm = float(grad_flat.norm().item())
+    if (
+        not math.isfinite(f_val_f)
+        or not torch.isfinite(grad_flat).all()
+        or not math.isfinite(grad_norm)
+    ):
+        return vec_det.detach(), bb_state, f_val_f
     alpha = bb_state.propose(vec_det.reshape(-1), grad_vec.reshape(-1))
-    f_val_f = float(f_val.item())
-    g_dot_g = float(torch.dot(grad_vec.reshape(-1), grad_vec.reshape(-1)).item())
-    if g_dot_g == 0.0:
+    g_dot_g = float(torch.dot(grad_flat, grad_flat).item())
+    if g_dot_g <= 0.0 or not math.isfinite(g_dot_g):
         return vec_det.detach(), bb_state, f_val_f
     grad_vec_det = grad_vec.detach()
     vec_det_val = vec_det.detach()
@@ -195,7 +215,7 @@ def bb_armijo_step_vector(
         v_trial = vec_det_val + alpha_k * grad_vec_det
         with torch.no_grad():
             f_trial = f_params(v_trial, False).item()
-        if f_trial >= f_val_f + bb_state.ls_c * alpha_k * g_dot_g:
+        if math.isfinite(float(f_trial)) and f_trial >= f_val_f + bb_state.ls_c * alpha_k * g_dot_g:
             armijo_succeeded = True
             break
         if i < bb_state.ls_max_steps - 1:

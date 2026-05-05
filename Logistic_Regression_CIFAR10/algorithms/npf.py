@@ -159,7 +159,10 @@ class NPF(BaseLinearDRO):
                     logits = self.model(x_adv)
                     ce = nn.CrossEntropyLoss(reduction="none")(logits, y_batch)
                     transport_cost = torch.sum((x_adv - x_batch) ** 2, dim=1)
-                    return (ce - self.lambda_param * transport_cost).mean()
+                    obj = (ce - self.lambda_param * transport_cost).mean()
+                    return torch.nan_to_num(
+                        obj, nan=-1e12, posinf=-1e12, neginf=-1e12
+                    )
 
                 for _ in range(self.omega_steps_per_batch):
                     _, self.bb_state, _, _ = bb_armijo_step_params(
