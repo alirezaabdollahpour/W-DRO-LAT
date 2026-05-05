@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -295,7 +296,33 @@ def train(
 
     with torch.no_grad():
         hat_xi_plot = sample_hat_xi(cfg_inner, int(plot_samples), seed=seed + 99_999, device=device)
-        xi_adv_plot = adv.adversarial_xi(env_eval, policy, hat_xi_plot, seed0=seed + 88_888)
+
+    # Plot samples should not silently continue training a persistent
+    # parametric adversary after the last PPO update and before checkpointing.
+    adv_icnn = getattr(adv, "icnn", None)
+    adv_mlp = getattr(adv, "mlp", None)
+    adv_snapshot: Dict[str, Any] = {}
+    if adv_icnn is not None:
+        adv_snapshot["icnn"] = deepcopy(adv_icnn.state_dict())
+    if adv_mlp is not None:
+        adv_snapshot["mlp"] = deepcopy(adv_mlp.state_dict())
+    if hasattr(adv, "bb_state"):
+        adv_snapshot["bb_state"] = deepcopy(getattr(adv, "bb_state"))
+    if hasattr(adv, "opt"):
+        adv_snapshot["opt"] = deepcopy(getattr(adv, "opt").state_dict())
+
+    try:
+        with freeze_params(policy, value):
+            xi_adv_plot = adv.adversarial_xi(env_eval, policy, hat_xi_plot, seed0=seed + 88_888)
+    finally:
+        if adv_icnn is not None and "icnn" in adv_snapshot:
+            adv_icnn.load_state_dict(adv_snapshot["icnn"])
+        if adv_mlp is not None and "mlp" in adv_snapshot:
+            adv_mlp.load_state_dict(adv_snapshot["mlp"])
+        if "bb_state" in adv_snapshot:
+            setattr(adv, "bb_state", adv_snapshot["bb_state"])
+        if hasattr(adv, "opt") and "opt" in adv_snapshot:
+            getattr(adv, "opt").load_state_dict(adv_snapshot["opt"])
 
     return logs, to_np(hat_xi_plot), to_np(xi_adv_plot), policy, adv
 
@@ -479,6 +506,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                             "elu_alpha": float(cfg_inner.npf_elu_alpha),
                             "softplus_beta": float(cfg_inner.npf_softplus_beta),
                             "init_eps": float(cfg_inner.npf_init_eps),
+                            "strong_convexity": float(cfg_inner.npf_strong_convexity),
                         }
                     else:
                         ckpt_payload["adv_arch"] = {

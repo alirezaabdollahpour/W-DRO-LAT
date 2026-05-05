@@ -61,15 +61,15 @@ class NPFAdversary:
             elu_alpha=cfg.npf_elu_alpha,
             softplus_beta=cfg.npf_softplus_beta,
             init_eps=cfg.npf_init_eps,
+            strong_convexity=cfg.npf_strong_convexity,
         ).to(device)
         # Identity init is applied on top of the principled (LogNormal) draws
         # already produced inside the constructor's non-negative layers.
         self.icnn.init_as_identity()
 
-        # BB + Armijo state with NPF-specific knobs. Weight decay and
-        # gradient-norm clipping (cfg.npf_weight_decay, cfg.npf_grad_clip)
-        # were added after the lam=0.1 cell collapsed to corner-saturation;
-        # see InnerConfig for the rationale.
+        # BB + Armijo state with NPF-specific knobs. By default these mirror
+        # the ICNN adversary; cfg.npf_weight_decay/cfg.npf_grad_clip are
+        # optional safeguards for small-lambda corner-saturation runs.
         self.bb_state = BBArmijoState.create(
             alpha0=cfg.npf_eta,
             alpha_min=cfg.npf_bb_alpha_min,
@@ -79,6 +79,7 @@ class NPFAdversary:
             ls_max_steps=cfg.npf_bb_ls_max_steps,
             weight_decay=cfg.npf_weight_decay,
             grad_clip=cfg.npf_grad_clip,
+            reject_on_armijo_failure=True,
         )
 
     # -------- box bijection (latent u <-> physical xi) --------

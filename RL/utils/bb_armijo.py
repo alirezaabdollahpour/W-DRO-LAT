@@ -128,9 +128,9 @@ def bb_armijo_step_params(
     params = list(params)
     params_vec = nn_utils.parameters_to_vector(params).detach()
 
-    f_val = f_params(True)
+    f_val_raw = f_params(True)
     grads = torch.autograd.grad(
-        f_val,
+        f_val_raw,
         params,
         create_graph=False,
         retain_graph=False,
@@ -142,12 +142,13 @@ def bb_armijo_step_params(
     grad_tensors = [g.detach() if g is not None else torch.zeros_like(p) for p, g in zip(params, grads)]
     grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
 
-    # Weight decay: ascending on (J - 0.5*wd*||theta||^2) means subtracting
-    # wd*theta from the ascent direction. This is the standard L2-prox trick;
-    # for the NPF/ICNN convex potential it prevents weight drift to the
-    # corner-saturation regime when the cost penalty (lam) is small.
+    # Weight decay: ascend on f(theta) - 0.5*wd*||theta||^2. Keep the
+    # Armijo value and gradient tied to the same penalized objective.
+    f_val = f_val_raw
     if bb_state.weight_decay > 0.0:
+        f_val = f_val - 0.5 * bb_state.weight_decay * torch.dot(params_vec, params_vec)
         grad_vec = grad_vec - bb_state.weight_decay * params_vec
+    grad_obj_vec = grad_vec
 
     # Gradient norm clipping. Caps single-step magnitude when the policy
     # term -J spikes (e.g. on near-edge anchors); has no effect inside the
@@ -161,8 +162,8 @@ def bb_armijo_step_params(
 
     alpha = bb_state.propose(params_vec, grad_vec)
     f_val_float = float(f_val.detach())
-    g_dot_g = float(torch.dot(grad_vec, grad_vec).item())
-    if g_dot_g == 0.0:
+    directional_derivative = float(torch.dot(grad_obj_vec, grad_vec).item())
+    if directional_derivative <= 0.0:
         return params, bb_state, f_val_float, grad_norm
 
     alpha_k = alpha
@@ -171,8 +172,11 @@ def bb_armijo_step_params(
         trial_vec = params_vec + alpha_k * grad_vec
         with torch.no_grad():
             nn_utils.vector_to_parameters(trial_vec, params)
-            f_trial = float(f_params(False).detach())
-        if f_trial >= f_val_float + bb_state.ls_c * alpha_k * g_dot_g:
+            f_trial_raw = f_params(False).detach()
+            if bb_state.weight_decay > 0.0:
+                f_trial_raw = f_trial_raw - 0.5 * bb_state.weight_decay * torch.dot(trial_vec, trial_vec)
+            f_trial = float(f_trial_raw)
+        if f_trial >= f_val_float + bb_state.ls_c * alpha_k * directional_derivative:
             armijo_succeeded = True
             break
         if i < bb_state.ls_max_steps - 1:

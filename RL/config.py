@@ -89,39 +89,29 @@ class InnerConfig:
     rgo_max_trials: int = 10
 
     # --- npf (Vesseron & Cuturi, 2024): NPF ICNN potential + BB+Armijo ---
-    # Defaults below were retuned after the lam=0.1 cell collapsed to the
-    # corner-saturation regime (every anchor mapped to a box corner; |u_adv|
-    # ~ 1e11 in u-space; Monge gap ~1e19). With weak regularization (small
-    # lam), the inner objective -J - lam*cost has an unbounded sup unless
-    # psi's weights are kept finite. Two safeguards:
-    #
-    #   (1) npf_weight_decay > 0 — adds 0.5*wd*||theta||^2 to the inner
-    #       objective, so the BB+Armijo ascent direction becomes
-    #           g_eff = grad(-J - lam*cost) - wd * theta.
-    #       This bounds psi's weights and is the cleanest fix for small lam.
-    #   (2) npf_grad_clip > 0 — caps ||g_eff|| per step. Catches transient
-    #       spikes from near-edge anchors where the policy gradient explodes.
-    #
-    # Step-size ceilings (npf_eta, npf_bb_alpha_max) and init perturbation
-    # (npf_init_eps) are also tighter so the optimizer stays in the
-    # well-conditioned regime even at lam=0.1.
+    # Defaults intentionally mirror the ICNN adversary's topology/BB settings
+    # so an NPF-vs-ICNN run changes the potential parameterization, not the
+    # optimizer budget. For very small lam, the optional safeguards below can
+    # still be enabled from the CLI:
+    #   --npf-weight-decay 1e-4 --npf-grad-clip 10 --npf-eta 1e-2
     K_npf: int = 10
     lr_npf: float = 5e-2  # deprecated, kept for CLI back-compat
-    npf_hidden_sizes: Tuple[int, ...] = (512, 512, 256)
+    npf_hidden_sizes: Tuple[int, ...] = (1024, 512, 512, 256, 128, 64)
     npf_outer_rank: int = 4
     npf_inner_rank: int = 1
-    npf_activation: str = "softplus"  # ELU is the NPF paper's default
+    npf_activation: str = "elu"
     npf_elu_alpha: float = 1.0
     npf_softplus_beta: float = 20.0
-    npf_init_eps: float = 1e-4     # was 1e-3; start closer to identity
-    npf_eta: float = 1e-2          # was 5e-2; gentler initial BB+Armijo step
-    npf_bb_alpha_min: float = 1e-4 # was 5e-4
-    npf_bb_alpha_max: float = 5e-3 # was 1e-2; halved to bound single steps
+    npf_init_eps: float = 1e-3
+    npf_strong_convexity: float = 1.0
+    npf_eta: float = 5e-2
+    npf_bb_alpha_min: float = 0.0005
+    npf_bb_alpha_max: float = 0.01
     npf_bb_ls_c: float = 0.1
     npf_bb_ls_shrink: float = 0.5
     npf_bb_ls_max_steps: int = 10
-    npf_weight_decay: float = 1e-4 # NEW: prevents psi-weight drift at small lam
-    npf_grad_clip: float = 10.0    # NEW: caps single-step grad norm
+    npf_weight_decay: float = 0.0
+    npf_grad_clip: float = 0.0
 
     # --- nn_dro (vanilla MLP adversary, no gradient-of-potential) ---
     K_nn_dro: int = 10
@@ -329,6 +319,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Live-at-init scale for per-layer quadratic forms (0 to disable).",
     )
     parser.add_argument(
+        "--npf-strong-convexity", type=float,
+        default=default_inner.npf_strong_convexity,
+        help="Fixed 0.5*mu*||u||^2 base in the NPF potential. Keep at 1.0 "
+             "for an ICNN-style identity backbone; set 0.0 to recover the "
+             "older pure-learned outer PSD base.",
+    )
+    parser.add_argument(
         "--npf-eta", type=float, default=default_inner.npf_eta,
         help="NPF BB+Armijo alpha0 (default matches --eta-icnn).",
     )
@@ -476,6 +473,7 @@ def build_inner_config_from_args(args: argparse.Namespace, *, env_name: str) -> 
         npf_elu_alpha=float(args.npf_elu_alpha),
         npf_softplus_beta=float(args.npf_softplus_beta),
         npf_init_eps=float(args.npf_init_eps),
+        npf_strong_convexity=float(args.npf_strong_convexity),
         npf_eta=float(args.npf_eta),
         npf_bb_alpha_min=float(args.npf_bb_alpha_min),
         npf_bb_alpha_max=float(args.npf_bb_alpha_max),

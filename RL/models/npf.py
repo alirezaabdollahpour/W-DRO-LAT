@@ -3,12 +3,17 @@
 Faithful port of MNIST_Cuturi/models/npf.py and
 Least_Squares/models/npf.py, unchanged at the math level:
 
-    psi(z) = 0.5 z^T (diag(delta^2) + A^T A) z + a^T z + phi^{NN}(z),
+    psi(z) = 0.5*mu*||z||^2
+             + 0.5 z^T (diag(delta^2) + A^T A) z + a^T z + phi^{NN}(z),
 
 where phi^{NN} is a deep ICNN block that re-injects per-layer quadratic
 forms Q(z) = ||delta o z||^2 + ||Az||^2, uses non-negative dense layers
 with the Hoedt-Klambauer LogNormal init (negative bias offset), and is
 identity-initialised so that T(z) = grad psi(z) ≈ z at t=0.
+
+Set ``strong_convexity=0`` to recover the pure NPF outer-base convention
+used by older checkpoints; RL training uses ``strong_convexity=1`` to keep
+the ICNN identity base fixed while NPF learns additional quadratic factors.
 """
 from __future__ import annotations
 
@@ -126,6 +131,7 @@ class NPFInputConvexPotential(nn.Module):
         elu_alpha: float = 1.0,
         softplus_beta: float = 20.0,
         init_eps: float = 1e-3,
+        strong_convexity: float = 0.0,
     ):
         super().__init__()
         if len(hidden_sizes) < 1:
@@ -138,10 +144,14 @@ class NPFInputConvexPotential(nn.Module):
         self.elu_alpha = float(elu_alpha)
         self.softplus_beta = float(softplus_beta)
         self.init_eps = float(init_eps)
+        self.strong_convexity = float(strong_convexity)
 
-        # Outer PSD base P = diag(delta^2) + A^T A
+        # Fixed ICNN base plus learnable outer PSD residual
+        # P = mu*I + diag(delta^2) + A^T A.  When mu > 0, initialise the
+        # residual near zero so T(z) starts at z rather than 2z.
+        outer_delta_init = self.init_eps if self.strong_convexity > 0.0 else 1.0
         self.outer_delta_raw = nn.Parameter(
-            torch.full((self.input_dim,), _npf_softplus_inverse(1.0))
+            torch.full((self.input_dim,), _npf_softplus_inverse(outer_delta_init))
         )
         if self.outer_rank > 0:
             if self.init_eps > 0.0:
@@ -199,7 +209,8 @@ class NPFInputConvexPotential(nn.Module):
         eps = self.init_eps
         delta_raw_init = _npf_softplus_inverse(eps) if eps > 0.0 else -1e3
         with torch.no_grad():
-            self.outer_delta_raw.fill_(_npf_softplus_inverse(1.0))
+            outer_delta_init = eps if self.strong_convexity > 0.0 else 1.0
+            self.outer_delta_raw.fill_(_npf_softplus_inverse(outer_delta_init))
             if self.outer_A is not None:
                 if eps > 0.0:
                     std = eps / math.sqrt(max(self.outer_rank * self.input_dim, 1))
@@ -244,6 +255,7 @@ class NPFInputConvexPotential(nn.Module):
         z_flat = z.view(z.size(0), -1)
 
         delta_out = F.softplus(self.outer_delta_raw)
+        fixed_q = 0.5 * self.strong_convexity * z_flat.pow(2).sum(dim=-1)
         q_diag = 0.5 * (delta_out.pow(2) * z_flat.pow(2)).sum(dim=-1)
         if self.outer_A is not None:
             Az = z_flat @ self.outer_A.t()
@@ -266,4 +278,4 @@ class NPFInputConvexPotential(nn.Module):
             + self.q_out(z_flat).squeeze(-1)
             + self.b_out(z_flat).squeeze(-1)
         )
-        return q_diag + q_lr + linear + phi
+        return fixed_q + q_diag + q_lr + linear + phi

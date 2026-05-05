@@ -33,7 +33,11 @@ exec "${PYTHON_BIN}" RL_minimal.py \
   --particle-num-samples 8 --particle-inner-steps 10 --particle-inner-lr 0.05 --particle-epsilon 0.01 \
   --rgo-num-samples 8 --rgo-inner-steps 10 --rgo-inner-lr 0.05 --rgo-epsilon 0.01 --rgo-max-trials 10 \
   --k-npf 10 \
-  --npf-softplus-beta 20.0 \
+  --npf-hidden-sizes 1024 512 512 256 128 64 \
+  --npf-outer-rank 4 --npf-inner-rank 1 \
+  --npf-activation elu --npf-init-eps 1e-3 --npf-strong-convexity 1.0 --npf-softplus-beta 20.0 \
+  --npf-eta 0.05 --npf-bb-alpha-min 0.0005 --npf-bb-alpha-max 0.01 \
+  --npf-weight-decay 0.0 --npf-grad-clip 0.0 \
   --k-nn-dro 10 --lr-nn-dro 0.05 \
   --nn-dro-hidden-sizes 256 128 64 --nn-dro-activation relu --nn-dro-init-scale 1e-3 \
   --no-plot --save-json \

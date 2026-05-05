@@ -25,7 +25,22 @@ def icnn_summary_lines(icnn: nn.Module) -> list[str]:
     mib = total_bytes / (1024.0 ** 2)
 
     lines: list[str] = []
-    if hasattr(icnn, "input_dim") and hasattr(icnn, "hidden_sizes"):
+    is_npf = hasattr(icnn, "q_blocks") and hasattr(icnn, "b_linears")
+    tag = "npf" if is_npf else "icnn"
+
+    if is_npf:
+        lines.append(
+            "[npf] arch "
+            f"input_dim={getattr(icnn, 'input_dim')} "
+            f"hidden_sizes={tuple(getattr(icnn, 'hidden_sizes'))} "
+            f"activation={getattr(icnn, 'activation', 'unknown')} "
+            f"outer_rank={getattr(icnn, 'outer_rank', 'unknown')} "
+            f"inner_rank={getattr(icnn, 'inner_rank', 'unknown')} "
+            f"strong_convexity={getattr(icnn, 'strong_convexity', 'unknown')} "
+            f"init_eps={getattr(icnn, 'init_eps', 'unknown')} "
+            f"softplus_beta={getattr(icnn, 'softplus_beta', 'unknown')}"
+        )
+    elif hasattr(icnn, "input_dim") and hasattr(icnn, "hidden_sizes"):
         lines.append(
             "[icnn] arch "
             f"input_dim={getattr(icnn, 'input_dim')} "
@@ -38,15 +53,46 @@ def icnn_summary_lines(icnn: nn.Module) -> list[str]:
         lines.append("[icnn] arch (unknown module type)")
 
     lines.append(
-        "[icnn] size "
+        f"[{tag}] size "
         f"params={total_params:,} ({_format_num(total_params)}) "
         f"trainable={trainable_params:,} "
         f"bytes={total_bytes:,} (~{mib:.2f} MiB) "
         f"device={device.type} dtype={str(dtype).replace('torch.', '')}"
     )
 
-    lines.append("[icnn] layers:")
-    if hasattr(icnn, "z_linears"):
+    lines.append(f"[{tag}] layers:")
+    if is_npf:
+        q_blocks = getattr(icnn, "q_blocks")
+        b_linears = getattr(icnn, "b_linears")
+        for i, (q, lin) in enumerate(zip(q_blocks, b_linears)):
+            lines.append(
+                f"  q{i}: QuadraticForms(num_forms={getattr(q, 'num_forms', '?')}, "
+                f"rank={getattr(q, 'rank', '?')}) + "
+                f"b{i}: Linear({lin.in_features} -> {lin.out_features}, bias={lin.bias is not None})"
+            )
+        if hasattr(icnn, "w_linears"):
+            for i, lin in enumerate(getattr(icnn, "w_linears")):
+                if lin is None:
+                    continue
+                if hasattr(lin, "in_features") and hasattr(lin, "out_features"):
+                    lines.append(
+                        f"  w{i}: NPFNonNegativeDense({lin.in_features} -> {lin.out_features}, bias=False, param=exp)"
+                    )
+        if hasattr(icnn, "w_out"):
+            lin = getattr(icnn, "w_out")
+            lines.append(
+                f"  w_out: NPFNonNegativeDense({lin.in_features} -> {lin.out_features}, bias=False, param=exp)"
+            )
+        if hasattr(icnn, "q_out"):
+            q = getattr(icnn, "q_out")
+            lines.append(
+                f"  q_out: QuadraticForms(num_forms={getattr(q, 'num_forms', '?')}, rank={getattr(q, 'rank', '?')})"
+            )
+        if hasattr(icnn, "b_out"):
+            lin = getattr(icnn, "b_out")
+            lines.append(f"  b_out: Linear({lin.in_features} -> {lin.out_features}, bias={lin.bias is not None})")
+        lines.append("  outer: 0.5*mu*||z||^2 + 0.5*z^T(diag(delta^2)+A^T A)z + a^Tz")
+    elif hasattr(icnn, "z_linears"):
         for i, lin in enumerate(getattr(icnn, "z_linears")):
             if hasattr(lin, "in_features") and hasattr(lin, "out_features"):
                 lines.append(f"  z{i}: Linear({lin.in_features} -> {lin.out_features}, bias={lin.bias is not None})")
