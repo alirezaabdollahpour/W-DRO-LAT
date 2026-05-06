@@ -24,6 +24,7 @@ from typing import Any, Dict
 
 import torch
 
+from .. import distributed as dist_helpers
 from ..models.npf import NPFInputConvexPotential, npf_T_omega
 from ..utils import (
     BBArmijoState,
@@ -84,18 +85,29 @@ class NPFTrainer(BaseAdvTrainer):
         # gradients are not accumulated; bb_armijo_step_params already
         # routes gradients only to ψ_ω parameters, but the explicit
         # freeze keeps the contract robust to future refactors.
-        self.classifier.eval()
+        self._classifier_module.eval()
         self.psi_omega.train()
-        set_requires_grad(self.classifier, False)
+        set_requires_grad(self._classifier_module, False)
         set_requires_grad(self.psi_omega, True)
 
         def omega_objective(create_graph: bool) -> torch.Tensor:
             x_adv = self._transport(x, create_graph=create_graph)
-            logits = self.classifier(x_adv)
+            # Use the unwrapped classifier — DDP's reducer must not be
+            # disturbed by the many forwards in the inner ascent.
+            logits = self._classifier_module(x_adv)
             primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
             transport_cost = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1)
             obj = (primary - lambda_param * transport_cost).mean()
             return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
+
+        # Plumb the cross-rank reducers when DDP is active so every rank
+        # picks the same Armijo trial step and ω stays in sync.
+        reduce_grad_fn = (
+            dist_helpers.all_reduce_grad_list if self.dist.is_distributed else None
+        )
+        reduce_scalar_fn = (
+            dist_helpers.all_reduce_scalar if self.dist.is_distributed else None
+        )
 
         last_f_val = 0.0
         for _ in range(int(cfg.omega_steps_per_batch)):
@@ -103,6 +115,8 @@ class NPFTrainer(BaseAdvTrainer):
                 self.psi_omega.parameters(),
                 omega_objective,
                 self.bb_state,
+                reduce_grad_fn=reduce_grad_fn,
+                reduce_scalar_fn=reduce_scalar_fn,
             )
         self._last_inner_loss = last_f_val
 

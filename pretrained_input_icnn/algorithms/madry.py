@@ -71,7 +71,7 @@ class MadryTrainer(BaseAdvTrainer):
             for _ in range(self.pgd_steps):
                 x_adv = x_adv.detach().requires_grad_(True)
                 loss_per_sample = adversary_loss_per_sample(
-                    self.classifier(x_adv), y, use_margin=use_margin
+                    self._classifier_module(x_adv), y, use_margin=use_margin
                 )
                 grad = torch.autograd.grad(loss_per_sample.sum(), x_adv, create_graph=False)[0]
                 with torch.no_grad():
@@ -81,7 +81,7 @@ class MadryTrainer(BaseAdvTrainer):
 
             with torch.no_grad():
                 final_loss = adversary_loss_per_sample(
-                    self.classifier(x_adv), y, use_margin=use_margin
+                    self._classifier_module(x_adv), y, use_margin=use_margin
                 )
                 improve = final_loss > best_loss
                 best_loss = torch.where(improve, final_loss, best_loss)
@@ -89,14 +89,12 @@ class MadryTrainer(BaseAdvTrainer):
         return best_adv.detach()
 
     def step(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        self.classifier.eval()
-        set_requires_grad(self.classifier, False)
+        self._classifier_module.eval()
+        set_requires_grad(self._classifier_module, False)
         x_adv = self._pgd_attack(x, y)
-        # Reset gradient flag; base trainer will toggle requires_grad back on
-        # the classifier in classifier_update.
-        set_requires_grad(self.classifier, True)
+        set_requires_grad(self._classifier_module, True)
         with torch.no_grad():
-            ce = F.cross_entropy(self.classifier(x_adv), y).item()
+            ce = F.cross_entropy(self._classifier_module(x_adv), y).item()
         self._last_inner_loss = float(ce)
         return x_adv
 

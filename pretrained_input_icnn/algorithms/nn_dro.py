@@ -13,6 +13,7 @@ from typing import Any, Dict
 import torch
 import torch.optim as optim
 
+from .. import distributed as dist_helpers
 from ..models.nn_dro import MLPAdversary
 from ..utils import (
     adversary_loss_per_sample,
@@ -48,20 +49,23 @@ class NNDROTrainer(BaseAdvTrainer):
         use_margin = bool(cfg.use_margin_loss)
 
         # Inner loop: Adam ascent on ω with the classifier frozen.
-        self.classifier.eval()
+        self._classifier_module.eval()
         self.adversary.train()
-        set_requires_grad(self.classifier, False)
+        set_requires_grad(self._classifier_module, False)
         set_requires_grad(self.adversary, True)
 
         last_obj = 0.0
         for _ in range(int(cfg.omega_steps_per_batch)):
             self.inner_opt.zero_grad(set_to_none=True)
             x_adv = self._transport(x)
-            logits = self.classifier(x_adv)
+            logits = self._classifier_module(x_adv)
             primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
             cost = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1)
             obj = (primary - lam * cost).mean()
             (-obj).backward()
+            # All-reduce ω gradients before Adam.step() — Adam's update
+            # is local, so without this each rank would diverge in ω.
+            dist_helpers.all_reduce_grads_(self.adversary.parameters())
             self.inner_opt.step()
             last_obj = float(obj.detach().item())
         self._last_inner_loss = last_obj
@@ -76,7 +80,7 @@ class NNDROTrainer(BaseAdvTrainer):
         was_training = self.adversary.training
         self.adversary.eval()
         try:
-            x_adv = self._transport(x)
+            x_adv = clamped_normalized_copy(self.adversary(x))
         finally:
             self.adversary.train(was_training)
         return x_adv.detach()

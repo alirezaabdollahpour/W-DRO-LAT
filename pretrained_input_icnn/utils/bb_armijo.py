@@ -102,8 +102,17 @@ def bb_armijo_step_params(
     params,
     f_params,
     bb_state: BBArmijoState,
+    reduce_grad_fn=None,
+    reduce_scalar_fn=None,
 ) -> Tuple[List[torch.nn.Parameter], BBArmijoState, float, float]:
     """Single BB+Armijo gradient-ascent step on a parameter collection.
+
+    ``reduce_grad_fn`` and ``reduce_scalar_fn`` are optional hooks for
+    DDP. When provided they receive (a) the per-rank gradient tensor list
+    and (b) a per-rank objective scalar respectively, and must return the
+    cross-rank averaged versions. With both ``None`` (single-GPU) the
+    function behaves exactly as before. Plumbing both reducers ensures
+    every rank picks the same Armijo trial step and stays in lockstep.
 
     The returned ``grad_norm`` is the gradient norm at the START of this
     call. The next call recomputes the gradient at the new iterate, so an
@@ -129,9 +138,14 @@ def bb_armijo_step_params(
         g.detach() if g is not None else torch.zeros_like(p)
         for p, g in zip(params, grads)
     ]
+    if reduce_grad_fn is not None:
+        grad_tensors = reduce_grad_fn(grad_tensors)
     grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
     grad_norm = grad_vec.norm().item()
-    f_val_float = float(f_val.detach())
+    if reduce_scalar_fn is not None:
+        f_val_float = float(reduce_scalar_fn(f_val.detach()))
+    else:
+        f_val_float = float(f_val.detach())
 
     if (
         not math.isfinite(f_val_float)
@@ -151,7 +165,11 @@ def bb_armijo_step_params(
         trial_vec = params_vec + alpha_k * grad_vec
         with torch.no_grad():
             nn_utils.vector_to_parameters(trial_vec, params)
-            f_trial = float(f_params(False).detach())
+            f_trial_t = f_params(False).detach()
+            if reduce_scalar_fn is not None:
+                f_trial = float(reduce_scalar_fn(f_trial_t))
+            else:
+                f_trial = float(f_trial_t)
         if (
             math.isfinite(f_trial)
             and f_trial >= f_val_float + bb_state.ls_c * alpha_k * directional_derivative

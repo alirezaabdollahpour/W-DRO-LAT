@@ -6,7 +6,7 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from .utils.transforms import CIFAR10_MEAN, CIFAR10_STD
 
@@ -53,7 +53,18 @@ def get_cifar10_loaders(
     pin_memory: bool = True,
     download: bool = True,
     seed: Optional[int] = None,
-) -> Tuple[DataLoader, DataLoader]:
+    world_size: int = 1,
+    rank: int = 0,
+) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler]]:
+    """Returns ``(train_loader, test_loader, train_sampler)``.
+
+    When ``world_size > 1``, the train loader uses a
+    :class:`DistributedSampler` so each rank sees a non-overlapping
+    shard. The sampler is also returned so the caller can call
+    ``set_epoch(epoch)`` between epochs to vary the shuffle. The test
+    loader is NOT sharded — eval is rank-0-only in this pipeline, since
+    PGD restarts are awkward to shard correctly.
+    """
     import torchvision
 
     train_dataset = torchvision.datasets.CIFAR10(
@@ -70,15 +81,40 @@ def get_cifar10_loaders(
         train_gen, train_init = _dataloader_seed(seed, 0)
         test_gen, test_init = _dataloader_seed(seed, 1)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        generator=train_gen,
-        worker_init_fn=train_init,
-    )
+    train_sampler: Optional[DistributedSampler] = None
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=int(seed) if seed is not None else 0,
+            drop_last=True,  # equal local batch sizes simplify gradient averaging
+        )
+        # Per-rank batch size = batch_size / world_size so the global
+        # effective batch matches the single-GPU configuration.
+        local_batch = max(1, batch_size // world_size)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=local_batch,
+            shuffle=False,  # sampler handles shuffling
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            worker_init_fn=train_init,
+            drop_last=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            generator=train_gen,
+            worker_init_fn=train_init,
+        )
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
@@ -88,4 +124,4 @@ def get_cifar10_loaders(
         generator=test_gen,
         worker_init_fn=test_init,
     )
-    return train_loader, test_loader
+    return train_loader, test_loader, train_sampler

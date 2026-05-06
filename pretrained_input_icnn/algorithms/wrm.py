@@ -26,14 +26,14 @@ class WRMTrainer(BaseAdvTrainer):
         lam = float(cfg.lambda_param)
         use_margin = bool(cfg.use_margin_loss)
 
-        self.classifier.eval()
-        set_requires_grad(self.classifier, False)
+        self._classifier_module.eval()
+        set_requires_grad(self._classifier_module, False)
 
         z = x.clone().detach()
         for _ in range(int(cfg.wrm_inner_steps)):
             z.requires_grad_(True)
             primary = adversary_loss_per_sample(
-                self.classifier(z), y, use_margin=use_margin
+                self._classifier_module(z), y, use_margin=use_margin
             )
             grads = torch.autograd.grad(primary.sum(), z, create_graph=False)[0]
             with torch.no_grad():
@@ -41,8 +41,10 @@ class WRMTrainer(BaseAdvTrainer):
                 z = clamped_normalized_copy(z)
         z = z.detach()
         with torch.no_grad():
-            self._last_inner_loss = float(F.cross_entropy(self.classifier(z), y).item())
-        set_requires_grad(self.classifier, True)
+            self._last_inner_loss = float(
+                F.cross_entropy(self._classifier_module(z), y).item()
+            )
+        set_requires_grad(self._classifier_module, True)
         return z
 
     def transport_for_eval(self, x: torch.Tensor) -> torch.Tensor:

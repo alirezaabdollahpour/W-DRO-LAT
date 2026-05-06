@@ -26,9 +26,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
+from .. import distributed as dist_helpers
 from ..utils import (
     cuda_sync,
     evaluate_clean,
@@ -70,12 +72,34 @@ class BaseAdvTrainer:
         test_loader: DataLoader,
         device: torch.device,
         config,
+        train_sampler: Optional[DistributedSampler] = None,
     ) -> None:
-        self.classifier = classifier
+        self.config = config
+        self.dist = dist_helpers.info()
+        self.device = device
+
+        # Wrap classifier in DDP when distributed. The unwrapped module is
+        # kept as ``classifier_module`` for inner adversary forwards: those
+        # forwards run many times without a matching backward, which would
+        # corrupt DDP's reducer state if they went through the wrapper.
+        # The DDP wrapper is only used on the outer classifier_update path
+        # so its all-reduce fires exactly once per outer step.
+        if self.dist.is_distributed:
+            self._classifier_module = classifier
+            self.classifier = DDP(
+                classifier,
+                device_ids=[self.dist.local_rank] if device.type == "cuda" else None,
+                output_device=self.dist.local_rank if device.type == "cuda" else None,
+                find_unused_parameters=False,
+                broadcast_buffers=False,
+            )
+        else:
+            self._classifier_module = classifier
+            self.classifier = classifier
+
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.device = device
-        self.config = config
+        self.train_sampler = train_sampler
 
         self.optimizer = self._make_classifier_optimizer()
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -87,6 +111,23 @@ class BaseAdvTrainer:
         self.best_robust_acc: Optional[float] = None
         self.best_robust_epoch: Optional[int] = None
         self.last_completed_epoch: int = 0
+
+    # ------------------------------------------------------------------
+    # Distributed helpers (no-op in single-GPU mode)
+    # ------------------------------------------------------------------
+    @property
+    def classifier_module(self) -> nn.Module:
+        """Unwrapped classifier — use this for inner-loop forwards.
+
+        DDP's reducer must NOT see forward-without-backward; algorithms
+        bypass the wrapper here and only hit the wrapper on the final
+        ``classifier_update`` path where the all-reduce fires.
+        """
+        return self._classifier_module
+
+    @property
+    def is_main_rank(self) -> bool:
+        return self.dist.is_main
 
     # ------------------------------------------------------------------
     # Subclass extension points
@@ -120,7 +161,10 @@ class BaseAdvTrainer:
     # ------------------------------------------------------------------
     def _make_classifier_optimizer(self) -> optim.Optimizer:
         cfg = self.config
-        params = [p for p in self.classifier.parameters() if p.requires_grad]
+        # Optimise the unwrapped module's params — DDP only forwards
+        # gradients to ``module.parameters()`` so this is the same set,
+        # but avoids any wrapper-introduced parameter shuffling.
+        params = [p for p in self._classifier_module.parameters() if p.requires_grad]
         return optim.SGD(
             params,
             lr=cfg.lr_theta,
@@ -165,6 +209,8 @@ class BaseAdvTrainer:
 
         # ICNN warmup phase: train only the adversary, freeze the classifier.
         for warmup_idx in range(1, warmup_epochs + 1):
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(warmup_idx)
             metrics = self._train_one_epoch(
                 epoch=warmup_idx,
                 total_epochs=total_epochs,
@@ -192,6 +238,8 @@ class BaseAdvTrainer:
         # Standard adversarial training phase.
         for adv_idx in range(1, adv_epochs + 1):
             epoch = warmup_epochs + adv_idx
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(warmup_epochs + adv_idx)
             metrics = self._train_one_epoch(
                 epoch=epoch,
                 total_epochs=total_epochs,
@@ -293,10 +341,19 @@ class BaseAdvTrainer:
     # ------------------------------------------------------------------
     def _evaluate(self, epoch: int) -> Dict[str, Any]:
         cfg = self.config
-        clean_loss, clean_acc = evaluate_clean(self.classifier, self.test_loader, self.device)
+        # Eval is rank-0-only — sharding PGD restarts cleanly across ranks
+        # adds complexity for marginal speedup at this scale (~1k samples).
+        # Other ranks still hit the dist barrier so timing measurements
+        # stay aligned across ranks.
+        if not self.is_main_rank:
+            dist_helpers.barrier()
+            return {}
+        clean_loss, clean_acc = evaluate_clean(
+            self.classifier_module, self.test_loader, self.device
+        )
 
         adv_loss, adv_acc, adv_pen = evaluate_under_transport(
-            self.classifier,
+            self.classifier_module,
             lambda x: self.transport_for_eval(x),
             self.test_loader,
             self.device,
@@ -330,7 +387,7 @@ class BaseAdvTrainer:
                 max_batches = max(1, math.ceil(sample_limit / batch_size))
             p_input = 2 if cfg.inp_p == "2" else float("inf")
             pgd_acc, pgd_info = evaluate_under_input_pgd(
-                self.classifier,
+                self.classifier_module,
                 self.test_loader,
                 self.device,
                 p=p_input,
@@ -344,10 +401,13 @@ class BaseAdvTrainer:
             result["input_pgd_avg_l2"] = pgd_info["avg_l2"]
             result["input_pgd_avg_linf"] = pgd_info["avg_linf"]
             result["input_pgd_samples"] = pgd_info["samples"]
+        dist_helpers.barrier()
         return result
 
     def _maybe_checkpoint_best(self, epoch: int, robust_acc: Optional[float]) -> None:
         cfg = self.config
+        if not self.is_main_rank:
+            return
         if robust_acc is None or not cfg.save_best_robust:
             return
         if self.best_robust_acc is None or robust_acc > self.best_robust_acc:
@@ -357,7 +417,7 @@ class BaseAdvTrainer:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "algorithm": self.name,
-                "classifier": self.classifier.state_dict(),
+                "classifier": self._classifier_module.state_dict(),
                 "epoch": epoch,
                 "robust_input_pgd_acc": robust_acc,
                 "config": cfg.to_dict() if hasattr(cfg, "to_dict") else None,
@@ -367,13 +427,15 @@ class BaseAdvTrainer:
 
     def save_final(self) -> None:
         cfg = self.config
+        if not self.is_main_rank:
+            return
         if not cfg.save:
             return
         path = Path(cfg.save)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "algorithm": self.name,
-            "classifier": self.classifier.state_dict(),
+            "classifier": self._classifier_module.state_dict(),
             "epoch": self.last_completed_epoch,
             "robust_input_pgd_acc": self.best_robust_acc,
             "config": cfg.to_dict() if hasattr(cfg, "to_dict") else None,

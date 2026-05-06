@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable
 
 import torch
 
+from . import distributed as dist_helpers
 from .algorithms import ALGORITHMS
 from .config import build_arg_parser, config_from_args
 from .data import get_cifar10_loaders
@@ -64,23 +65,39 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     cfg = config_from_args(args)
 
+    # Initialise DDP if torchrun set the env vars; safe no-op otherwise.
+    dist_info = dist_helpers.init_distributed()
+    is_main = dist_info.is_main
+
     if cfg.benchmark_mode:
         set_seed_benchmark_mode(cfg.seed)
-        print(
-            f"[input-icnn] BENCHMARK MODE — cudnn.benchmark=True, "
-            f"determinism off, seed={cfg.seed}"
-        )
+        if is_main:
+            print(
+                f"[input-icnn] BENCHMARK MODE — cudnn.benchmark=True, "
+                f"determinism off, seed={cfg.seed}"
+            )
     else:
         set_deterministic(cfg.seed)
-    device = get_device()
-    print(f"[input-icnn] device={device}, algorithm={cfg.algorithm}, lambda={cfg.lambda_param}")
 
-    train_loader, test_loader = get_cifar10_loaders(
+    if dist_info.is_distributed and torch.cuda.is_available():
+        device = torch.device(f"cuda:{dist_info.local_rank}")
+    else:
+        device = get_device()
+
+    if is_main:
+        print(
+            f"[input-icnn] device={device}, algorithm={cfg.algorithm}, "
+            f"lambda={cfg.lambda_param}, world_size={dist_info.world_size}"
+        )
+
+    train_loader, test_loader, train_sampler = get_cifar10_loaders(
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         data_root=cfg.data_dir,
         augment_train=cfg.augment_train,
         seed=cfg.seed,
+        world_size=dist_info.world_size,
+        rank=dist_info.rank,
     )
 
     classifier = load_pretrained_classifier(
@@ -90,8 +107,10 @@ def main() -> None:
         device=device,
     ).to(device)
 
-    sanity_loss, sanity_acc = evaluate_clean(classifier, test_loader, device)
-    print(f"[sanity] clean test  loss={sanity_loss:.4f}  acc={sanity_acc*100:.2f}%")
+    if is_main:
+        sanity_loss, sanity_acc = evaluate_clean(classifier, test_loader, device)
+        print(f"[sanity] clean test  loss={sanity_loss:.4f}  acc={sanity_acc*100:.2f}%")
+    dist_helpers.barrier()
 
     trainer_cls = ALGORITHMS[cfg.algorithm]
     trainer = trainer_cls(
@@ -100,10 +119,16 @@ def main() -> None:
         test_loader=test_loader,
         device=device,
         config=cfg,
+        train_sampler=train_sampler,
     )
 
     history = trainer.fit()
     trainer.save_final()
+
+    # Only rank 0 writes CSV / summary; other ranks finalise DDP and exit.
+    if not is_main:
+        dist_helpers.cleanup_distributed()
+        return
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     rows = []
@@ -166,6 +191,7 @@ def main() -> None:
     if cfg.save:
         Path(cfg.save).with_suffix(".summary.json").write_text(json.dumps(summary, indent=2))
     print(f"[input-icnn] done. log={cfg.log_csv}  best_robust={trainer.best_robust_acc}")
+    dist_helpers.cleanup_distributed()
 
 
 if __name__ == "__main__":

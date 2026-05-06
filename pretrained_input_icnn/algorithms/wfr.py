@@ -52,14 +52,14 @@ class WFRTrainer(BaseAdvTrainer):
 
         for _ in range(self.inner_steps):
             z.requires_grad_(True)
-            losses = criterion(self.classifier(z), y_rep)
+            losses = criterion(self._classifier_module(z), y_rep)
             grads = torch.autograd.grad(losses.sum(), z, create_graph=False)[0]
             with torch.no_grad():
                 mean = z.detach() + self.inner_lr * (grads - 2.0 * lam * (z.detach() - x_anchor))
                 noise = torch.randn_like(mean) * std_dev if std_dev > 0 else 0.0
                 z = clamped_normalized_copy(mean + noise) if std_dev > 0 else clamped_normalized_copy(mean)
 
-                cur_loss = criterion(self.classifier(z), y_rep).view(bs, m)
+                cur_loss = criterion(self._classifier_module(z), y_rep).view(bs, m)
                 dist_sq = (z - x_anchor).reshape(bs * m, -1).pow(2).sum(dim=1).view(bs, m)
                 energy = cur_loss - 2.0 * lam * dist_sq
 
@@ -92,18 +92,18 @@ class WFRTrainer(BaseAdvTrainer):
         return z.detach(), weights.detach(), y_rep
 
     def step(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        self.classifier.eval()
-        set_requires_grad(self.classifier, False)
+        self._classifier_module.eval()
+        set_requires_grad(self._classifier_module, False)
         z, weights, y_rep = self._sampler(x, y)
         # Stash for the WFR-specific outer update below.
         self._wfr_z = z
         self._wfr_w = weights
         self._wfr_y_rep = y_rep
         with torch.no_grad():
-            ce = F.cross_entropy(self.classifier(z), y_rep, reduction="none")
+            ce = F.cross_entropy(self._classifier_module(z), y_rep, reduction="none")
             obj = (ce.view(weights.size(0), self.num_samples) * weights).sum(dim=1).mean()
             self._last_inner_loss = float(obj.item())
-        set_requires_grad(self.classifier, True)
+        set_requires_grad(self._classifier_module, True)
         # Return the highest-weight particle per sample so the base trainer
         # can compute MSE / clean-vs-adv accuracy. The actual classifier
         # update overrides that path via ``classifier_update`` below.

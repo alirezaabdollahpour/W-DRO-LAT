@@ -50,11 +50,11 @@ class SDRODualTrainer(BaseAdvTrainer):
         self._dual_lam_reg = float(cfg.lambda_param) * self.epsilon
 
         with torch.no_grad():
-            ce = nn.CrossEntropyLoss()(self.classifier(z), y_rep)
+            ce = nn.CrossEntropyLoss()(self._classifier_module(z), y_rep)
             self._last_inner_loss = float(ce.item())
         # Return per-sample top-CE z for diagnostics.
         with torch.no_grad():
-            ce_each = nn.CrossEntropyLoss(reduction="none")(self.classifier(z), y_rep)
+            ce_each = nn.CrossEntropyLoss(reduction="none")(self._classifier_module(z), y_rep)
             ce_view = ce_each.view(x.size(0), m)
             top = ce_view.argmax(dim=1, keepdim=True)
             z_view = z.view(x.size(0), m, *x.shape[1:])

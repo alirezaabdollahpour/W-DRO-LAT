@@ -57,12 +57,13 @@ class NewPPATrainer(BaseAdvTrainer):
         cfg = self.config
         lam = float(cfg.lambda_param)
         use_margin = bool(cfg.use_margin_loss)
-        self.classifier.eval()
-        set_requires_grad(self.classifier, False)
+        clf = self._classifier_module
+        clf.eval()
+        set_requires_grad(clf, False)
 
         # Round 0: diminishing-LR WRM ascent.
         z = _wrm_ascent(
-            x, x, self.classifier, y, lam,
+            x, x, clf, y, lam,
             num_steps=int(cfg.ppa_round0_steps),
             lr=float(cfg.ppa_round0_lr),
             diminishing=True,
@@ -73,7 +74,7 @@ class NewPPATrainer(BaseAdvTrainer):
         # WRM ascent, with adaptive early stopping on the projection gain.
         for round_idx in range(1, max(1, int(cfg.ppa_num_rounds))):
             z, _y_proj, gain, obj_scale, _ = free_weight_projection_images(
-                z, x, y, self.classifier, lam, use_margin=use_margin
+                z, x, y, clf, lam, use_margin=use_margin
             )
             if (
                 round_idx >= int(cfg.ppa_min_rounds)
@@ -81,7 +82,7 @@ class NewPPATrainer(BaseAdvTrainer):
             ):
                 break
             z = _wrm_ascent(
-                z, x, self.classifier, y, lam,
+                z, x, clf, y, lam,
                 num_steps=int(cfg.ppa_refine_steps),
                 lr=float(cfg.ppa_refine_lr),
                 diminishing=False,
@@ -91,12 +92,12 @@ class NewPPATrainer(BaseAdvTrainer):
         # Final projection so the outer step sees within-class best
         # responses (matches MNIST_Cuturi's contract).
         z, _y_proj, _, _, _ = free_weight_projection_images(
-            z, x, y, self.classifier, lam, use_margin=use_margin
+            z, x, y, clf, lam, use_margin=use_margin
         )
 
         with torch.no_grad():
-            self._last_inner_loss = float(F.cross_entropy(self.classifier(z), y).item())
-        set_requires_grad(self.classifier, True)
+            self._last_inner_loss = float(F.cross_entropy(clf(z), y).item())
+        set_requires_grad(clf, True)
         return z.detach()
 
     def transport_for_eval(self, x: torch.Tensor) -> torch.Tensor:
