@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -62,8 +61,8 @@ class PolicyNet(nn.Module):
         return self.net(obs)
 
 
-def load_policy(ckpt_path: Path, device: torch.device) -> PolicyNet:
-    """Load a PolicyNet from a checkpoint saved by RL_minimal.py."""
+def load_policy_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[PolicyNet, dict[str, Any]]:
+    """Load a PolicyNet plus metadata from a checkpoint saved by RL_minimal.py."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     policy = PolicyNet(
         obs_dim=int(ckpt["obs_dim"]),
@@ -72,7 +71,7 @@ def load_policy(ckpt_path: Path, device: torch.device) -> PolicyNet:
     ).to(device)
     policy.load_state_dict(ckpt["policy_state_dict"])
     policy.eval()
-    return policy
+    return policy, ckpt
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +164,9 @@ def evaluate_episode_lengths(
     """
     Run n_trials episodes and return an array of episode lengths.
 
-    Episode length = number of timesteps before termination (or max_steps
-    if the pole never falls).  This equals the undiscounted return since
-    CartPole gives reward=1 per surviving step.
+    Episode length = number of environment transitions until termination
+    (including the terminating transition), or max_steps if the pole never
+    falls. This is the conventional CartPole episode length.
     """
     env = CartPoleEval(max_steps=max_steps, gravity=gravity, masscart=masscart, device=device)
     xi = torch.tensor([[masspole, length]], device=device).expand(n_trials, -1).float()
@@ -211,10 +210,10 @@ DEFAULT_VARIANTS = [
     EnvVariant("Original",  masspole=0.1,  length=0.5,  gravity=9.8),
     EnvVariant("Light",     masspole=0.05, length=0.5,  gravity=9.8,  category="easier"),
     EnvVariant("Long",      masspole=0.1,  length=1.0,  gravity=9.8,  category="easier"),
-    EnvVariant("Soft $g$",  masspole=0.1,  length=0.5,  gravity=5.0,  category="easier"),
+    EnvVariant("Soft Gravity",  masspole=0.1,  length=0.5,  gravity=5.0,  category="easier"),
     EnvVariant("Heavy",     masspole=0.5,  length=0.5,  gravity=9.8,  category="harder"),
     EnvVariant("Short",     masspole=0.1,  length=0.25, gravity=9.8,  category="harder"),
-    EnvVariant("Strong $g$",masspole=0.1,  length=0.5,  gravity=15.0, category="harder"),
+    EnvVariant("Strong Gravity",masspole=0.1,  length=0.5,  gravity=15.0, category="harder"),
 ]
 
 
@@ -247,6 +246,11 @@ def _fmt_latex_cell(lengths: np.ndarray) -> str:
     mean = np.mean(lengths)
     se = np.std(lengths, ddof=1) / np.sqrt(len(lengths))
     return f"${mean:.1f} \\pm {se:.1f}$"
+
+
+def _fmt_latex_mean_se(mean: float, se: float, *, bold: bool = False) -> str:
+    body = f"{mean:.1f} \\pm {se:.1f}"
+    return f"$\\mathbf{{{mean:.1f}}} \\pm {se:.1f}$" if bold else f"${body}$"
 
 
 def print_text_table(
@@ -328,6 +332,89 @@ def generate_latex_table(
     return "\n".join(lines)
 
 
+def generate_latex_table_method_rows(
+    results: dict[str, dict[str, np.ndarray]],
+    variants: list[EnvVariant],
+    columns: list[str],
+    *,
+    max_steps: int = 500,
+    n_trials: int = 1000,
+    bold_best: bool = True,
+) -> str:
+    """Generate the paper-style table: methods as rows, variants as columns."""
+    if len(variants) != 7:
+        raise ValueError(
+            "method-rows layout expects exactly 7 variants: Original, three easier, three harder."
+        )
+
+    variant_names = [v.name for v in variants]
+    means: dict[str, dict[str, float]] = {}
+    ses: dict[str, dict[str, float]] = {}
+    for method in columns:
+        means[method] = {}
+        ses[method] = {}
+        for v in variants:
+            arr = results[method][v.name]
+            means[method][v.name] = float(np.mean(arr))
+            ses[method][v.name] = float(np.std(arr, ddof=1) / np.sqrt(len(arr)))
+
+    best_by_variant: dict[str, float] = {}
+    if bold_best and len(columns) > 1:
+        for v_name in variant_names:
+            best_by_variant[v_name] = max(means[m][v_name] for m in columns)
+
+    lines: list[str] = []
+    lines.append(r"\begin{table}[!t]")
+    lines.append(r"    \centering")
+    lines.append(r"    \renewcommand{\arraystretch}{1.15}")
+    lines.append(
+        r"    \caption{Mean episode length $\pm$~standard error over "
+        + str(n_trials)
+        + r" deterministic rollouts. Max episode length = "
+        + str(max_steps)
+        + r".}"
+    )
+    lines.append(r"    \resizebox{\linewidth}{!}{")
+    lines.append(r"        \begin{tabular}{l c ccc ccc}")
+    lines.append(r"            \toprule")
+    lines.append(
+        r"            \multirow{2.5}{*}{Method} & \multicolumn{1}{c}{Original} "
+        r"& \multicolumn{3}{c}{Easier Environments} "
+        r"& \multicolumn{3}{c}{Harder Environments} \\"
+    )
+    lines.append(r"            \cmidrule(lr){2-2} \cmidrule(lr){3-5} \cmidrule(lr){6-8}")
+    lines.append(
+        r"            & Original & Light & Long & Soft Gravity "
+        r"& Heavy & Short & Strong Gravity \\"
+    )
+    lines.append(r"            \midrule")
+
+    ours_labels = {"MPA", "ICNN-DRO"}
+    inserted_ours_rule = False
+    for method in columns:
+        if method in ours_labels and not inserted_ours_rule:
+            lines.append(r"            \midrule")
+            inserted_ours_rule = True
+        row_cells = [method]
+        for v_name in variant_names:
+            mean = means[method][v_name]
+            se = ses[method][v_name]
+            is_best = (
+                bold_best
+                and len(columns) > 1
+                and abs(mean - best_by_variant[v_name]) <= 1e-9
+            )
+            row_cells.append(_fmt_latex_mean_se(mean, se, bold=is_best))
+        lines.append("            " + " & ".join(row_cells) + r" \\")
+
+    lines.append(r"            \bottomrule")
+    lines.append(r"        \end{tabular}")
+    lines.append(r"    }")
+    lines.append(r"    \label{tab:eval_lambda_sensitivity}")
+    lines.append(r"\end{table}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -361,6 +448,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Save LaTeX table to file.")
     parser.add_argument("--out-json", type=Path, default=None,
                         help="Save raw results to JSON.")
+    parser.add_argument(
+        "--layout",
+        choices=["variant-rows", "method-rows"],
+        default="variant-rows",
+        help="LaTeX table orientation. Use method-rows for the paper-style table.",
+    )
+    parser.add_argument(
+        "--no-bold-best",
+        dest="bold_best",
+        action="store_false",
+        default=True,
+        help="Do not bold the best mean in each variant column for method-rows layout.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -372,23 +472,24 @@ def main(argv: list[str] | None = None) -> int:
     # Build column list
     columns: list[str] = []
     policies: dict[str, PolicyNet] = {}
+    checkpoint_meta: dict[str, dict[str, Any]] = {}
 
     if args.regular is not None:
         columns.append("Regular")
-        policies["Regular"] = load_policy(args.regular, device)
+        policies["Regular"], checkpoint_meta["Regular"] = load_policy_checkpoint(args.regular, device)
     if args.particle is not None:
         columns.append("Particle")
-        policies["Particle"] = load_policy(args.particle, device)
+        policies["Particle"], checkpoint_meta["Particle"] = load_policy_checkpoint(args.particle, device)
     if args.robust is not None:
         columns.append("Robust (ICNN)")
-        policies["Robust (ICNN)"] = load_policy(args.robust, device)
+        policies["Robust (ICNN)"], checkpoint_meta["Robust (ICNN)"] = load_policy_checkpoint(args.robust, device)
     if args.checkpoints is not None:
         names = args.column_names or [p.stem for p in args.checkpoints]
         if len(names) != len(args.checkpoints):
             parser.error("--column-names count must match --checkpoints count.")
         for name, ckpt_path in zip(names, args.checkpoints):
             columns.append(name)
-            policies[name] = load_policy(ckpt_path, device)
+            policies[name], checkpoint_meta[name] = load_policy_checkpoint(ckpt_path, device)
 
     if not policies:
         parser.error("Provide at least one of --regular, --particle, --robust, or --checkpoints.")
@@ -401,6 +502,18 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Evaluating {len(policies)} policies across {len(variants)} variants "
           f"({args.trials} trials, max_steps={args.max_steps}, seed={args.seed})")
+    for col in columns:
+        meta = checkpoint_meta.get(col, {})
+        ckpt_env = meta.get("env")
+        ckpt_method = meta.get("method")
+        ckpt_seed = meta.get("seed")
+        ckpt_lam = meta.get("lam")
+        if ckpt_env is not None and str(ckpt_env) != "cartpole":
+            raise ValueError(f"Checkpoint for column {col!r} was trained on env={ckpt_env!r}, not cartpole.")
+        print(
+            f"  [ckpt] {col}: method={ckpt_method} seed={ckpt_seed} "
+            f"lam={ckpt_lam}"
+        )
     print()
 
     # Evaluate
@@ -428,8 +541,17 @@ def main(argv: list[str] | None = None) -> int:
     print_text_table(results, variants, columns)
 
     # LaTeX
-    latex = generate_latex_table(results, variants, columns,
-                                 max_steps=args.max_steps, n_trials=args.trials)
+    if args.layout == "method-rows":
+        latex = generate_latex_table_method_rows(
+            results, variants, columns,
+            max_steps=args.max_steps, n_trials=args.trials,
+            bold_best=bool(args.bold_best),
+        )
+    else:
+        latex = generate_latex_table(
+            results, variants, columns,
+            max_steps=args.max_steps, n_trials=args.trials,
+        )
     print(f"\n{'='*60}")
     print("LaTeX:")
     print(f"{'='*60}")
@@ -446,6 +568,17 @@ def main(argv: list[str] | None = None) -> int:
                 "trials": args.trials,
                 "max_steps": args.max_steps,
                 "seed": args.seed,
+                "layout": args.layout,
+            },
+            "checkpoints": {
+                col: {
+                    "method": checkpoint_meta.get(col, {}).get("method"),
+                    "seed": checkpoint_meta.get(col, {}).get("seed"),
+                    "lam": checkpoint_meta.get(col, {}).get("lam"),
+                    "env": checkpoint_meta.get(col, {}).get("env"),
+                    "iters": checkpoint_meta.get(col, {}).get("iters"),
+                }
+                for col in columns
             },
             "variants": [
                 {"name": v.name, "masspole": v.masspole, "length": v.length,

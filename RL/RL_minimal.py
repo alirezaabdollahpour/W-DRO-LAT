@@ -2,7 +2,7 @@
 
 Runs one or more adversary algorithms against PPO on vectorized CartPole or
 swing-up pendulum. Supported methods (see `algorithms/registry.py`):
-    nominal, particle, icnn, algo1, npf, ppa, new_ppa,
+    nominal, ro, particle, icnn, algo1, npf, ppa, new_ppa,
     dual, wgf, wfr, svg, rgo, nn_dro.
 
 Convenience groups:
@@ -204,7 +204,10 @@ def train(
         with freeze_params(policy, value):
             xi_adv = adv.adversarial_xi(env_eval, policy, hat_xi, seed0=seed + 20_000 + t)
 
-        xi_mixed = torch.cat([hat_xi, xi_adv], dim=0)
+        if bool(getattr(adv, "outer_uses_adv_only", False)):
+            xi_mixed = xi_adv
+        else:
+            xi_mixed = torch.cat([hat_xi, xi_adv], dim=0)
         data = rollout_batch(
             env_roll, policy, value, xi_mixed, steps_per_xi,
             seed0=seed + 30_000 + t, gamma=cfg_ppo.gamma, gae_lambda=cfg_ppo.gae_lambda,
@@ -484,6 +487,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "seed": int(args.seed),
                     "lam": float(args.lam),
                     "iters": int(args.iters),
+                    "cfg_inner": asdict(cfg_inner),
                 }
                 # Persist the trained parametric-adversary state so the Monge-gap
                 # eval (monge_gap_sweep.py rl_cartpole backend) can reload the

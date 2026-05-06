@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 from envs import ENV_SPECS, canonical_env_name
 from utils.common import IntListAction
@@ -24,6 +24,13 @@ class InnerConfig:
     # --- particle ascent ---
     K_part: int = 10
     eta_part: float = 0.05
+
+    # --- RO / Madry PGD ---
+    # Radius is in normalized xi-space: ||xi - hat_xi||_M <= ro_epsilon.
+    ro_epsilon: float = 0.25
+    ro_pgd_steps: int = 10
+    ro_pgd_step_size: Optional[float] = None
+    ro_pgd_restarts: int = 1
 
     # --- ICNN ascent ---
     K_icnn: int = 10
@@ -144,6 +151,7 @@ class PPOConfig:
 
 ALL_ALGORITHMS = (
     "nominal",
+    "ro",
     "particle",
     "icnn",
     "algo1",
@@ -233,6 +241,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--k-part", type=int, default=default_inner.K_part)
     parser.add_argument("--eta-part", type=float, default=default_inner.eta_part)
+    parser.add_argument(
+        "--ro-epsilon", type=float, default=default_inner.ro_epsilon,
+        help="RO/Madry L2-PGD radius in normalized xi-space "
+             "(||xi-hat_xi||_M <= ro_epsilon).",
+    )
+    parser.add_argument("--ro-pgd-steps", type=int, default=default_inner.ro_pgd_steps)
+    parser.add_argument(
+        "--ro-pgd-step-size", type=float, default=default_inner.ro_pgd_step_size,
+        help="RO/Madry PGD step size in normalized xi-space. "
+             "Default: ro_epsilon / max(1, ro_pgd_steps // 2).",
+    )
+    parser.add_argument("--ro-pgd-restarts", type=int, default=default_inner.ro_pgd_restarts)
     parser.add_argument("--k-icnn", type=int, default=default_inner.K_icnn)
     parser.add_argument("--eta-icnn", type=float, default=default_inner.eta_icnn)
     parser.add_argument("--grad-method", choices=["pathwise", "spsa", "fd"], default=default_inner.grad_method)
@@ -414,6 +434,12 @@ def build_inner_config_from_args(args: argparse.Namespace, *, env_name: str) -> 
         xi_high=xi_high,
         K_part=int(args.k_part),
         eta_part=float(args.eta_part),
+        ro_epsilon=float(args.ro_epsilon),
+        ro_pgd_steps=int(args.ro_pgd_steps),
+        ro_pgd_step_size=(
+            None if args.ro_pgd_step_size is None else float(args.ro_pgd_step_size)
+        ),
+        ro_pgd_restarts=int(args.ro_pgd_restarts),
         K_icnn=int(args.k_icnn),
         eta_icnn=float(args.eta_icnn),
         icnn_hidden_sizes=tuple(int(v) for v in args.icnn_hidden_sizes),
@@ -511,6 +537,8 @@ def resolve_methods(requested: list[str]) -> list[str]:
         key = str(tok).strip().lower()
         if key == "":
             continue
+        if key == "madry":
+            key = "ro"
         if key == "all":
             for m in ALL_ALGORITHMS:
                 if m not in seen:

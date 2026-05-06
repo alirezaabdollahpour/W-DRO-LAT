@@ -12,7 +12,7 @@ PYTHON_BIN="${PYTHON:-python}"
 #   bash run_RL_minimal_cuturi_baselines_swingup_pendulum.sh --method nn_dro
 #   bash run_RL_minimal_cuturi_baselines_swingup_pendulum.sh --iters 200
 #
-# Methods: nominal, particle, icnn, algo1, npf, ppa, new_ppa, dual, wgf, wfr, svg, rgo, nn_dro.
+# Methods: nominal, ro, particle, icnn, algo1, npf, ppa, new_ppa, dual, wgf, wfr, svg, rgo, nn_dro.
 
 exec "${PYTHON_BIN}" RL_minimal.py \
   --method all \
@@ -23,6 +23,7 @@ exec "${PYTHON_BIN}" RL_minimal.py \
   --lam 2.0 \
   --pendulum-dt 0.1 --pendulum-u-max 8.0 --pendulum-max-speed 8.0 \
   --pendulum-theta-tol 0.2 --pendulum-vel-tol 1.0 --pendulum-actions 3 \
+  --ro-epsilon 0.25 --ro-pgd-steps 10 --ro-pgd-restarts 1 \
   --k-icnn 10 --eta-icnn 0.05 \
   --icnn-hidden-sizes 1024 512 512 256 128 64 \
   --icnn-init identity --icnn-nonneg-init principled --icnn-softplus-beta 20.0 \

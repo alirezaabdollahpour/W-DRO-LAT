@@ -11,10 +11,9 @@ PYTHON_BIN="${PYTHON:-python}"
 # checkpoints stored in a sibling dir, e.g. monge_gap_runs/horizon_1000/.
 CKPT_DIR="${CKPT_DIR:-${SCRIPT_DIR}}"
 
-# Eval-time episode cap and trial count. Default mirrors the paper table
-# (max_steps=500, trials=1000). Override MAX_STEPS for longer-horizon
-# stress tests of policies trained with a shorter training horizon.
-MAX_STEPS="${MAX_STEPS:-500}"
+# Eval-time episode cap and trial count. For the H=1000 table, leave
+# MAX_STEPS at 1000. Override if you intentionally want a different cap.
+MAX_STEPS="${MAX_STEPS:-1000}"
 TRIALS="${TRIALS:-1000}"
 
 # Where to write the per-prefix .tex/.json. Defaults to CKPT_DIR so eval
@@ -23,20 +22,21 @@ OUT_DIR="${OUT_DIR:-${CKPT_DIR}}"
 mkdir -p "${OUT_DIR}"
 
 # ---- Configuration ----
-# Evaluate ALL method checkpoints produced by a single training run of
+# Evaluate method checkpoints produced by a single training run of
 # RL_minimal.py, so the comparison is fair (same seed, same environment,
-# same eval settings, same timestamp prefix => same training schedule).
+# same eval settings, same prefix => same training schedule).
 #
 # Each training run produces files of the form
 #   RL_minimal_cartpole_<tag>_seed<S>_lam_<L>_softplusbeta_<B>_<TS>_<method>_policy.pt
 # where <TS> is a UTC timestamp shared across all methods in that run.
 #
-# We auto-discover the most recent timestamp that has at least one policy
-# and include every *_<method>_policy.pt file sharing that prefix.
+# We auto-discover the most recent prefix that has at least one policy and
+# include the methods in $METHODS sharing that prefix.
 
-# Preferred presentation order. Nominal first (baseline), then particle-family
-# and WDRO baselines, ending with the paper's main method (ICNN).
-ORDER=(nominal particle svg wgf wfr rgo ppa new_ppa dual npf nn_dro algo1 icnn)
+# Paper-table presentation order:
+# ERM, PA, RO, WFR, SDRO, NN-DRO, MPA, ICNN-DRO.
+# Override, e.g. METHODS="nominal ro" bash run_eval_table.sh
+METHODS="${METHODS:-nominal particle ro wfr dual nn_dro new_ppa npf}"
 
 # Optional: pin a specific run prefix (everything before "_<method>_policy.pt").
 # Example: PREFIX="RL_minimal_cartpole_custom_seed0_lam_3.0_softplusbeta_20.0_20260419T163436Z"
@@ -55,7 +55,7 @@ if [ -z "$PREFIX" ]; then
     BASE=$(basename "$LATEST" .pt)        # strip .pt
     BASE="${BASE%_policy}"                 # strip trailing _policy
     # Try longest method names first so e.g. "new_ppa" beats "ppa".
-    CANDIDATES=(new_ppa nn_dro nominal particle icnn algo1 dual svg wgf wfr rgo npf ppa)
+    CANDIDATES=(new_ppa nn_dro nominal particle icnn algo1 dual svg wgf wfr rgo npf ppa ro)
     for m in "${CANDIDATES[@]}"; do
         if [[ "$BASE" == *_"$m" ]]; then
             PREFIX="${BASE%_"$m"}"
@@ -71,27 +71,32 @@ fi
 
 echo "Run prefix: ${PREFIX}"
 
-# Human-readable column labels used in the printed / LaTeX table.
+# Human-readable method labels used in the printed / LaTeX table.
 declare -A LABEL=(
-    [nominal]="Nominal"
-    [particle]="Particle"
+    [nominal]="ERM"
+    [ro]="RO"
+    [particle]="PA"
     [svg]="SVGD"
     [wgf]="WGF"
     [wfr]="WFR"
     [rgo]="RGO"
     [ppa]="PPA"
-    [new_ppa]="PPA*"
-    [dual]="Dual"
-    [npf]="NPF"
+    [new_ppa]="MPA"
+    [dual]="SDRO"
+    [npf]="ICNN-DRO"
     [nn_dro]="NN-DRO"
-    [algo1]="Algo1"
-    [icnn]="ICNN (WDRO)"
+    [algo1]="WRM"
+    [icnn]="ICNN"
 )
 
 CKPTS=()
 NAMES=()
 
-for m in "${ORDER[@]}"; do
+for m in ${METHODS}; do
+    if [ -z "${LABEL[$m]+x}" ]; then
+        echo "ERROR: unknown method key in METHODS: ${m}" >&2
+        exit 1
+    fi
     f="${CKPT_DIR}/${PREFIX}_${m}_policy.pt"
     if [ -f "$f" ]; then
         CKPTS+=("$f")
@@ -119,6 +124,7 @@ exec "${PYTHON_BIN}" RL_eval_table.py \
     --trials "${TRIALS}" \
     --max-steps "${MAX_STEPS}" \
     --seed 42 \
+    --layout method-rows \
     --out-latex "${OUT_DIR}/eval_table_${OUT_TAG}.tex" \
     --out-json  "${OUT_DIR}/eval_table_${OUT_TAG}.json" \
     "$@"

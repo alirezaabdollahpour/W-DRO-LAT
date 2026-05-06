@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Train RL_minimal.py once per (seed, lam) cell, with one invocation producing
-# a checkpoint for each method in $METHODS (default: the seven paper-table
-# rows — ERM=nominal, PA=particle, WFR=wfr, SDRO=dual, NN-DRO=nn_dro,
+# a checkpoint for each method in $METHODS (default: the paper-table
+# rows — ERM=nominal, RO=ro, PA=particle, WFR=wfr, SDRO=dual, NN-DRO=nn_dro,
 # MPA=new_ppa, ICNN-DRO=npf). Each checkpoint persists the trained parametric
 # adversary state (icnn / npf / nn_dro), which monge_gap_sweep.py's
 # rl_cartpole backend reads back to apply the *trained* transport map
@@ -13,8 +13,9 @@
 #
 #   bash run_RL_train_for_monge_gap.sh                       # default grid
 #   LAMS="0.1 0.5 1.0 2.0 5.0" SEEDS="0 1 2" bash run_RL_train_for_monge_gap.sh
-#   METHODS="nominal particle new_ppa npf" bash run_RL_train_for_monge_gap.sh
+#   METHODS="nominal ro particle new_ppa npf" bash run_RL_train_for_monge_gap.sh
 #   HORIZON=1000 bash run_RL_train_for_monge_gap.sh         # stress-test beyond 500
+#   FORCE_RETRAIN=1 METHODS="ro" HORIZON=1000 LAMS="1.0" bash run_RL_train_for_monge_gap.sh
 #   HORIZON=2000 FD_HORIZON=500 bash run_RL_train_for_monge_gap.sh
 #   bash run_RL_train_for_monge_gap.sh --iters 100 --env cartpole
 #
@@ -44,15 +45,19 @@ LAMS_DEFAULT="3.0 5.0"
 SEEDS_DEFAULT="0"
 ENV_DEFAULT="cartpole"
 # Paper-table methods only (matches LR-CIFAR10 row set):
-#   ERM=nominal, PA=particle, WFR=wfr, SDRO=dual, NN-DRO=nn_dro,
+#   ERM=nominal, RO=ro, PA=particle, WFR=wfr, SDRO=dual, NN-DRO=nn_dro,
 #   MPA=new_ppa, ICNN-DRO=npf  (npf, NOT older icnn; new_ppa, NOT older ppa)
-METHODS_DEFAULT="nominal particle wfr dual nn_dro new_ppa npf"
+METHODS_DEFAULT="nominal ro particle wfr dual nn_dro new_ppa npf"
 
 LAMS="${LAMS:-${LAMS_DEFAULT}}"
 SEEDS="${SEEDS:-${SEEDS_DEFAULT}}"
 METHODS="${METHODS:-${METHODS_DEFAULT}}"
 ENV_NAME="${ENV_NAME:-${ENV_DEFAULT}}"
 HORIZON="${HORIZON:-500}"
+RO_EPSILON="${RO_EPSILON:-0.25}"
+RO_PGD_STEPS="${RO_PGD_STEPS:-10}"
+RO_PGD_RESTARTS="${RO_PGD_RESTARTS:-1}"
+FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
 # Validate HORIZON is a positive integer. The arithmetic comparison below
 # relies on -lt, which silently aborts under set -e on non-integer input.
 if ! [[ "${HORIZON}" =~ ^[1-9][0-9]*$ ]]; then
@@ -80,23 +85,25 @@ echo "[run] SEEDS=${SEEDS}"
 echo "[run] METHODS=${METHODS}"
 echo "[run] ENV=${ENV_NAME}"
 echo "[run] HORIZON=${HORIZON}  FD_HORIZON=${FD_HORIZON}"
+echo "[run] RO_EPSILON=${RO_EPSILON}  RO_PGD_STEPS=${RO_PGD_STEPS}  RO_PGD_RESTARTS=${RO_PGD_RESTARTS}"
+echo "[run] FORCE_RETRAIN=${FORCE_RETRAIN}"
 echo "[run] OUT_DIR=${OUT_DIR}"
 
 for seed in ${SEEDS}; do
   for lam in ${LAMS}; do
     json_path="${OUT_DIR}/RL_minimal_${ENV_NAME}_paper_seed${seed}_lam_${lam}_npf_softplusbeta_10.0.json"
-    ckpt_prefix="${json_path%.json}"
     # Skip a cell only if every requested method already has a checkpoint
-    # for this exact run profile (so partial-failure cells get retried, and
-    # older NPF profiles do not mask the CIFAR-aligned NPF checkpoints).
+    # for this seed/lam/env cell. This also handles adding a new method such
+    # as RO to an existing directory without retraining forever under a
+    # choose_nonexisting_path suffix.
     all_present=1
     for m in ${METHODS}; do
-      if [ ! -f "${ckpt_prefix}_${m}_policy.pt" ]; then
+      if ! compgen -G "${OUT_DIR}/RL_minimal_${ENV_NAME}_paper_seed${seed}_lam_${lam}_*_${m}_policy.pt" > /dev/null; then
         all_present=0
         break
       fi
     done
-    if [ "${all_present}" -eq 1 ]; then
+    if [ "${FORCE_RETRAIN}" != "1" ] && [ "${all_present}" -eq 1 ]; then
       echo "[skip] seed=${seed} lam=${lam} (checkpoints for all methods already exist)"
       continue
     fi
@@ -112,6 +119,7 @@ for seed in ${SEEDS}; do
       --eval-nom-horizon "${HORIZON}" \
       --eval-worst-horizon "${HORIZON}" \
       --fd-horizon "${FD_HORIZON}" \
+      --ro-epsilon "${RO_EPSILON}" --ro-pgd-steps "${RO_PGD_STEPS}" --ro-pgd-restarts "${RO_PGD_RESTARTS}" \
       --k-icnn 10 --eta-icnn 0.05 \
       --icnn-hidden-sizes 1024 512 512 256 128 64 \
       --icnn-init identity --icnn-nonneg-init principled --icnn-softplus-beta 20.0 \

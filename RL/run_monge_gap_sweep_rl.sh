@@ -13,7 +13,7 @@
 #     (per-horizon subdir produced by run_RL_train_for_monge_gap.sh).
 #   - OUT_CSV / OUT_TEX placed alongside the checkpoints.
 #   - METHODS = paper-table rows
-#       ERM=nominal, PA=particle, WFR=wfr, SDRO=dual,
+#       ERM=nominal, RO=ro, PA=particle, WFR=wfr, SDRO=dual,
 #       NN-DRO=nn_dro, MPA=new_ppa, ICNN-DRO=npf.
 #   - EVAL_SIZE = 4096 (statistically tight in 2D xi-space; tractable for
 #     non-parametric pushes; bypasses new_ppa's O(B^2) memory cliff).
@@ -23,7 +23,7 @@
 # Override:
 #   LAMS="0.1 0.5 1.0 2.0 5.0" SEEDS="0 1 2" bash run_monge_gap_sweep_rl.sh
 #   HORIZON=1000 bash run_monge_gap_sweep_rl.sh        # eval at horizon 1000
-#   METHODS="nominal particle new_ppa npf" bash run_monge_gap_sweep_rl.sh
+#   METHODS="nominal ro particle new_ppa npf" bash run_monge_gap_sweep_rl.sh
 #   EVAL_SIZE=8192 GAP_MODE=hungarian bash run_monge_gap_sweep_rl.sh
 #
 # Stress-test pattern (eval pre-trained policies at a longer horizon):
@@ -87,7 +87,7 @@ SEEDS="${SEEDS:-0 1 2}"
 # Paper-table methods. MPA row uses new_ppa (multi-start particle ascent
 # with batch-wide reassignment, Algorithm 1 in the paper). ICNN-DRO row uses
 # npf (NPF / Vesseron-Cuturi), matching the LR-CIFAR10 paper convention.
-METHODS="${METHODS:-nominal particle wfr dual nn_dro new_ppa npf}"
+METHODS="${METHODS:-nominal ro particle wfr dual nn_dro new_ppa npf}"
 EVAL_SIZE="${EVAL_SIZE:-4096}"
 ENV_NAME="${ENV_NAME:-cartpole}"
 GAP_MODE="${GAP_MODE:-sinkhorn}"

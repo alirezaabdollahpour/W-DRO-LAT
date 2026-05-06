@@ -11,8 +11,8 @@ PYTHON_BIN="${PYTHON:-python}"
 #   bash run_RL_minimal_icnn.sh --env swingup_pendulum --iters 300
 #   bash run_RL_minimal_icnn.sh --icnn-softplus-beta 10.0 --k-icnn 15
 #
-# --method accepts any subset of {nominal, particle, icnn, algo1, npf, ppa,
-#   new_ppa, dual, wgf, wfr, svg, rgo} plus the groups {both, all}.
+# --method accepts any subset of {nominal, ro, particle, icnn, algo1, npf,
+#   ppa, new_ppa, dual, wgf, wfr, svg, rgo, nn_dro} plus the groups {both, all}.
 
 exec "${PYTHON_BIN}" RL_minimal.py \
   --method nominal particle icnn \

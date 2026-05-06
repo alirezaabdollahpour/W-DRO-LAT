@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Dict, List
@@ -145,10 +146,12 @@ def main() -> None:
 
     # Train shared (ε_ent-independent) algorithms once.
     shared_models: Dict[str, Any] = {}
+    train_timings: Dict[str, float] = {}
     for name in SHARED_ALGORITHMS:
         if name not in requested_methods:
             continue
         print(f"\n--- Training {name} ---")
+        train_t0 = time.perf_counter()
         model_obj = build_algorithm(
             name, cfg, input_dim, num_classes, device, eps_ent=0.0
         )
@@ -158,6 +161,8 @@ def main() -> None:
             checkpoint_dir=str(checkpoint_dir),
             run_id=0,
         )
+        train_timings[name] = time.perf_counter() - train_t0
+        print(f"Training time {name}: {train_timings[name]:.3f} seconds")
         shared_models[name] = model_obj
 
     # ε_ent sweep (Figure 6 panels)
@@ -173,6 +178,7 @@ def main() -> None:
             if name not in requested_methods:
                 continue
             print(f"\n--- Training {name} (ε_ent={eps_ent:g}) ---")
+            train_t0 = time.perf_counter()
             model_obj = build_algorithm(
                 name, cfg, input_dim, num_classes, device, eps_ent=eps_ent
             )
@@ -182,15 +188,19 @@ def main() -> None:
                 checkpoint_dir=str(checkpoint_dir),
                 run_id=0,
             )
+            train_timings[name] = time.perf_counter() - train_t0
+            print(f"Training time {name}: {train_timings[name]:.3f} seconds")
             models_to_evaluate[name] = model_obj
 
         # Evaluation (l2 PGD on features)
         results_for_eps: Dict[str, List[Dict[float, float]]] = {
             name: [] for name in models_to_evaluate.keys()
         }
+        eval_timings_for_eps: Dict[str, float] = {}
 
         for name, model_obj in models_to_evaluate.items():
             print(f"\n--- Evaluating {name} (ε_ent={eps_ent:g}) ---")
+            eval_t0 = time.perf_counter()
             res = evaluate_model(
                 model_obj,
                 test_features_np,
@@ -200,6 +210,11 @@ def main() -> None:
                 device=device,
                 pgd_num_iter=cfg.pgd_steps,
                 pgd_restarts=cfg.pgd_restarts,
+            )
+            eval_timings_for_eps[name] = time.perf_counter() - eval_t0
+            print(
+                f"Evaluation time {name} (ε_ent={eps_ent:g}): "
+                f"{eval_timings_for_eps[name]:.3f} seconds"
             )
             results_for_eps[name].append(res)
 
@@ -241,6 +256,20 @@ def main() -> None:
                     "softplus_beta": cfg.npf_softplus_beta,
                     "init_eps": cfg.npf_init_eps,
                 }
+            },
+            "method_timings": {
+                method: {
+                    "train_seconds": float(train_timings.get(method, 0.0)),
+                    "eval_seconds": float(eval_timings_for_eps.get(method, 0.0)),
+                    "total_seconds": float(train_timings.get(method, 0.0))
+                    + float(eval_timings_for_eps.get(method, 0.0)),
+                    "definition": (
+                        "train_seconds includes algorithm construction and fit(); "
+                        "eval_seconds includes clean accuracy and all configured PGD "
+                        "attack radii for this eps_ent panel."
+                    ),
+                }
+                for method in results_for_eps.keys()
             },
             "results": {
                 method: [_json_safe_results(run_dict) for run_dict in run_list]

@@ -11,7 +11,7 @@ Usage:
         --csv RL/monge_gap_runs/monge_gap_rl_cartpole.csv \\
         --out RL/monge_gap_runs/monge_gap_rl_cartpole.tex \\
         --lams 0.1 0.5 1.0 2.0 5.0 \\
-        --methods nominal particle wfr dual nn_dro ppa icnn
+        --methods nominal ro particle wfr dual nn_dro ppa icnn
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ import pandas as pd
 # is *not* MPA.
 ROW_SPECS = {
     "nominal":  {"label": "ERM",      "group": "ref"},
+    "ro":       {"label": "RO",       "group": "baseline"},
     "particle": {"label": "PA",       "group": "baseline"},
     "algo1":    {"label": "WRM",      "group": "baseline"},
     "wfr":      {"label": "WFR",      "group": "baseline"},
