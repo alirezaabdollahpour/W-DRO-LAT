@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import statistics
 from pathlib import Path
@@ -139,6 +140,18 @@ def _collect_one(
                 peak_rss_mb = float(t_summary.get("Maximum resident set size (kbytes)", "nan")) / 1024
             except ValueError:
                 peak_rss_mb = float("nan")
+            # GPU peak (the meaningful number for adversarial training): main.py
+            # writes a summary.json next to the per-epoch CSV with rank-0's
+            # ``torch.cuda.max_memory_allocated``. Older runs (before this
+            # patch) won't have it; we silently report NaN in that case.
+            peak_gpu_mb = float("nan")
+            summary_path = csv_path.with_name("summary.json")
+            if summary_path.exists():
+                try:
+                    payload = json.loads(summary_path.read_text())
+                    peak_gpu_mb = float(payload.get("peak_gpu_alloc_mb", "nan"))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    peak_gpu_mb = float("nan")
             # Wallclock: prefer /usr/bin/time -v output; fall back to the
             # manifest's elapsed_seconds (always written by the bash
             # dispatcher, even when /usr/bin/time is unavailable).
@@ -156,6 +169,7 @@ def _collect_one(
                 "max_ep_s":      max(ep_secs) if ep_secs else float("nan"),
                 "wallclock_s":   wallclock,
                 "peak_rss_mb":   peak_rss_mb,
+                "peak_gpu_mb":   peak_gpu_mb,
                 "final_train_loss": _final_metric(adv, "train_loss"),
                 "final_train_acc":  _final_metric(adv, "train_acc"),
                 "final_test_loss":  _final_metric(adv, "test_loss"),
@@ -173,7 +187,8 @@ def _aggregate(by_algo: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]
     for algo, runs in by_algo.items():
         agg: Dict[str, Any] = {"algorithm": algo, "seeds": len(runs)}
         for k in (
-            "median_ep_s", "min_ep_s", "max_ep_s", "wallclock_s", "peak_rss_mb",
+            "median_ep_s", "min_ep_s", "max_ep_s",
+            "wallclock_s", "peak_rss_mb", "peak_gpu_mb",
             "final_train_loss", "final_train_acc",
             "final_test_loss",  "final_test_acc",
             "final_adv_loss",   "final_adv_acc",
@@ -197,6 +212,7 @@ _PRESENT_ORDER = (
     "min_ep_s",
     "max_ep_s",
     "wallclock_s",
+    "peak_gpu_mb",
     "peak_rss_mb",
     "final_train_loss",
     "final_train_acc",
@@ -211,7 +227,7 @@ _PRESENT_ORDER = (
 def _print_console_table(rows: List[Dict[str, Any]]) -> None:
     hdr = (
         f"{'algorithm':<10}  {'seeds':>5}  {'med ep (s)':>11}  {'min ep':>8}  "
-        f"{'max ep':>8}  {'wall (s)':>9}  {'RSS (MB)':>9}  "
+        f"{'max ep':>8}  {'wall (s)':>9}  {'GPU (MB)':>9}  {'RSS (MB)':>9}  "
         f"{'train ℓ':>9}  {'train %':>9}  "
         f"{'test ℓ':>8}  {'test %':>8}  "
         f"{'adv ℓ':>8}  {'adv %':>8}  {'PGD %':>7}"
@@ -226,6 +242,7 @@ def _print_console_table(rows: List[Dict[str, Any]]) -> None:
             f"{_fmt(r['min_ep_s']):>8}  "
             f"{_fmt(r['max_ep_s']):>8}  "
             f"{_fmt(r['wallclock_s'], '{:.1f}'):>9}  "
+            f"{_fmt(r['peak_gpu_mb'], '{:.0f}'):>9}  "
             f"{_fmt(r['peak_rss_mb'], '{:.1f}'):>9}  "
             f"{_fmt(r['final_train_loss']):>9}  "
             f"{_fmt(r['final_train_acc'], '{:.2%}'):>9}  "

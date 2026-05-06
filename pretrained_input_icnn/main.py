@@ -136,6 +136,17 @@ def main() -> None:
     history = trainer.fit()
     trainer.save_final()
 
+    # Capture the GPU peak memory from THIS rank's view. ``max_memory_allocated``
+    # is per-device, so each rank reports its own peak — they should be near-
+    # identical in DDP since each rank holds an identical model + per-rank
+    # batch. We record rank 0's number in the summary; that's the
+    # representative single-GPU memory footprint for the algorithm.
+    peak_gpu_alloc_mb: float = float("nan")
+    peak_gpu_reserved_mb: float = float("nan")
+    if torch.cuda.is_available():
+        peak_gpu_alloc_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        peak_gpu_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+
     # Only rank 0 writes CSV / summary; other ranks finalise DDP and exit.
     if not is_main:
         dist_helpers.cleanup_distributed()
@@ -197,11 +208,21 @@ def main() -> None:
         "best_robust_acc": trainer.best_robust_acc,
         "best_robust_epoch": trainer.best_robust_epoch,
         "epochs_completed": trainer.last_completed_epoch,
+        "peak_gpu_alloc_mb": peak_gpu_alloc_mb,
+        "peak_gpu_reserved_mb": peak_gpu_reserved_mb,
         "config": cfg.to_dict(),
     }
+    # Always write a summary next to the CSV so the analyzer can find it
+    # even when --save was empty (GPU memory is the new RSS replacement).
+    summary_path = Path(cfg.log_csv).with_name("summary.json")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2))
     if cfg.save:
         Path(cfg.save).with_suffix(".summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"[input-icnn] done. log={cfg.log_csv}  best_robust={trainer.best_robust_acc}")
+    print(
+        f"[input-icnn] done. log={cfg.log_csv}  best_robust={trainer.best_robust_acc}  "
+        f"gpu_peak={peak_gpu_alloc_mb:.1f} MB"
+    )
     dist_helpers.cleanup_distributed()
 
 
