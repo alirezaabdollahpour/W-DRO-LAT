@@ -883,6 +883,18 @@ def _parse_hidden_units(token: str) -> int:
         raise argparse.ArgumentTypeError(f"Invalid integer value: {token!r}") from exc
 
 
+def _format_float_for_filename(value: float) -> str:
+    """Format floats into filesystem-friendly tokens without extra '.' suffix segments."""
+    if not math.isfinite(value):
+        return "nonfinite"
+    text = format(float(value), "g")
+    text = text.replace("+", "")
+    text = text.replace(".", "p")
+    if text.startswith("-"):
+        text = f"m{text[1:]}"
+    return text
+
+
 # def _clamp_penalty_lambda(value: float) -> float:
 #     if not math.isfinite(value):
 #         return PENALTY_LAMBDA_MIN
@@ -2669,6 +2681,47 @@ def parse_args():
         help="Fixed λ multiplying the quadratic transport penalty.",
     )
     parser.add_argument(
+        "--hybrid-training",
+        action="store_true",
+        help=(
+            "Enable hybrid minimax training: run multiple minimax stages with a decreasing "
+            "penalty_lambda schedule, saving a checkpoint at the end of each stage and "
+            "warm-starting the ICNN from the previous stage. When disabled, the script "
+            "behaves exactly like the standard single-lambda training."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-lambdas",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Sequence of penalty_lambda values to use in hybrid mode (high → low).",
+    )
+    parser.add_argument(
+        "--hybrid-epochs-adv-rest",
+        type=int,
+        default=None,
+        help=(
+            "Number of minimax epochs to run for every hybrid lambda stage after the first. "
+            "The first stage uses --epochs-adv; when unset, later stages also use --epochs-adv."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-freeze-theta-lambda",
+        type=float,
+        default=None,
+        help=(
+            "Lambda value (must appear in --hybrid-lambdas) after which classifier θ is frozen; "
+            "subsequent smaller lambdas train the ICNN only."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-run-dir",
+        type=str,
+        default="hybrid run",
+        help="Directory used to store hybrid stage checkpoints.",
+    )
+    parser.add_argument(
         "--use-margin-loss",
         action="store_true",
         help="Use the log-sum-exp margin objective for the ICNN adversary (non-zero-sum view).",
@@ -3147,6 +3200,90 @@ def determine_schedule(args) -> Tuple[int, List[str]]:
     return total_epochs, schedule
 
 
+def determine_hybrid_schedule(
+    args,
+) -> Tuple[int, List[str], List[float], List[Dict[str, Any]]]:
+    if not args.hybrid_lambdas:
+        raise ValueError("--hybrid-training requires --hybrid-lambdas.")
+    lambdas = [float(v) for v in args.hybrid_lambdas]
+    if not all(math.isfinite(v) for v in lambdas):
+        raise ValueError("All values in --hybrid-lambdas must be finite.")
+    for idx in range(len(lambdas) - 1):
+        if lambdas[idx] < lambdas[idx + 1]:
+            raise ValueError("--hybrid-lambdas must be provided in decreasing order (high → low).")
+
+    stage_epochs_first = int(args.epochs_adv) if int(args.epochs_adv) > 0 else int(args.epochs)
+    if stage_epochs_first <= 0:
+        raise ValueError("Hybrid training requires positive --epochs-adv (or legacy --epochs).")
+    stage_epochs_rest = stage_epochs_first
+    if args.hybrid_epochs_adv_rest is not None:
+        stage_epochs_rest = int(args.hybrid_epochs_adv_rest)
+        if stage_epochs_rest <= 0:
+            raise ValueError("--hybrid-epochs-adv-rest must be a positive integer.")
+
+    freeze_lambda = args.hybrid_freeze_theta_lambda
+    freeze_index: Optional[int] = None
+    if freeze_lambda is not None:
+        freeze_value = float(freeze_lambda)
+        for idx, lam in enumerate(lambdas):
+            if math.isclose(lam, freeze_value, rel_tol=1e-6, abs_tol=1e-12):
+                freeze_index = idx
+                break
+        if freeze_index is None:
+            raise ValueError(
+                "--hybrid-freeze-theta-lambda must match one of the values passed to --hybrid-lambdas."
+            )
+
+    pretrain_epochs = max(0, int(args.epochs_icnn_pretrain))
+    finetune_epochs = max(0, int(args.epochs_adv_finetune))
+    clean_epochs = max(0, int(args.epochs_clean))
+
+    schedule: List[str] = []
+    lambda_by_epoch: List[float] = []
+    stage_records: List[Dict[str, Any]] = []
+
+    initial_lambda = lambdas[0]
+    if pretrain_epochs > 0:
+        schedule += ["icnn_pretrain"] * pretrain_epochs
+        lambda_by_epoch += [initial_lambda] * pretrain_epochs
+    if finetune_epochs > 0:
+        schedule += ["adv_finetune"] * finetune_epochs
+        lambda_by_epoch += [initial_lambda] * finetune_epochs
+
+    epoch_cursor = len(schedule)
+    minimax_epochs_total = 0
+    for stage_idx, stage_lambda in enumerate(lambdas, start=1):
+        stage_epochs = stage_epochs_first if stage_idx == 1 else stage_epochs_rest
+        should_update_theta = freeze_index is None or (stage_idx - 1) <= freeze_index
+        stage_method = "icnn" if should_update_theta else "icnn_pretrain"
+        stage_start = epoch_cursor + 1
+        stage_end = epoch_cursor + stage_epochs
+        schedule += [stage_method] * stage_epochs
+        lambda_by_epoch += [stage_lambda] * stage_epochs
+        minimax_epochs_total += stage_epochs
+        stage_records.append(
+            {
+                "stage": stage_idx,
+                "lambda": stage_lambda,
+                "method": stage_method,
+                "stage_epochs": stage_epochs,
+                "start_epoch": stage_start,
+                "end_epoch": stage_end,
+                "minimax_epoch_end": minimax_epochs_total,
+            }
+        )
+        epoch_cursor = stage_end
+
+    if clean_epochs > 0:
+        schedule += ["erm"] * clean_epochs
+        lambda_by_epoch += [lambdas[-1]] * clean_epochs
+
+    total_epochs = len(schedule)
+    if total_epochs == 0:
+        raise ValueError("Training schedule is empty; provide positive epoch counts.")
+    return total_epochs, schedule, lambda_by_epoch, stage_records
+
+
 def main():
     args = parse_args()
     if args.use_redlr_loss and args.use_margin_loss:
@@ -3175,10 +3312,36 @@ def main():
         global_rng = torch.Generator()
     global_rng.manual_seed(int(args.seed))
 
-    total_epochs, schedule = determine_schedule(args)
+    hybrid_lambda_by_epoch: Optional[List[float]] = None
+    hybrid_stage_records: Optional[List[Dict[str, Any]]] = None
+    if args.hybrid_training:
+        if args.calibrate_penalty:
+            warnings.warn(
+                "--calibrate-penalty is incompatible with --hybrid-training; disabling calibration.",
+                RuntimeWarning,
+            )
+            args.calibrate_penalty = False
+        total_epochs, schedule, hybrid_lambda_by_epoch, hybrid_stage_records = determine_hybrid_schedule(args)
+        args.penalty_lambda = float(hybrid_lambda_by_epoch[0])
+        print(f"Hybrid λ schedule: {[rec['lambda'] for rec in hybrid_stage_records]}")
+        if args.hybrid_freeze_theta_lambda is not None:
+            print(f"Hybrid θ freeze after λ={args.hybrid_freeze_theta_lambda}")
+    else:
+        total_epochs, schedule = determine_schedule(args)
     print(f"Training schedule: {' → '.join(schedule)}")
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    hybrid_output_dir: Optional[Path] = None
+    hybrid_stage_end_map: Dict[int, Dict[str, Any]] = {}
+    if args.hybrid_training:
+        hybrid_output_dir = Path(args.hybrid_run_dir) / run_id
+        hybrid_output_dir.mkdir(parents=True, exist_ok=True)
+        if hybrid_stage_records is not None:
+            hybrid_stage_end_map = {int(rec["end_epoch"]): rec for rec in hybrid_stage_records}
+            (hybrid_output_dir / "hybrid_stages.json").write_text(
+                json.dumps(hybrid_stage_records, indent=2)
+            )
+
     wandb_enabled = args.use_wandb and args.wandb_mode != "disabled"
     wandb_config = {}
     for key, value in vars(args).items():
@@ -3196,7 +3359,10 @@ def main():
     )
     best_checkpoint_path = args.save_best_robust
     if not best_checkpoint_path:
-        best_checkpoint_path = str(Path("results") / f"input_icnn_best_{run_id}.pth")
+        if args.hybrid_training and hybrid_output_dir is not None:
+            best_checkpoint_path = str(hybrid_output_dir / "best_robust.pth")
+        else:
+            best_checkpoint_path = str(Path("results") / f"input_icnn_best_{run_id}.pth")
     args.save_best_robust = best_checkpoint_path
     early_stop_enabled = bool(getattr(args, "early_stop", False))
     early_stop_patience = max(0, int(args.early_stop_patience))
@@ -3477,6 +3643,8 @@ def main():
     final_epoch_log: Optional[Dict[str, Any]] = None
 
     for epoch, phase in enumerate(schedule, start=1):
+        if args.hybrid_training and hybrid_lambda_by_epoch is not None:
+            args.penalty_lambda = float(hybrid_lambda_by_epoch[epoch - 1])
         print(f"\n=== Epoch {epoch:02d}/{total_epochs} | Phase: {phase.upper()} ===")
         tracker.start_epoch(epoch, phase)
 
@@ -3802,6 +3970,21 @@ def main():
                     )
         tracker.finish_epoch()
         last_epoch_completed = epoch
+        if args.hybrid_training and hybrid_output_dir is not None and epoch in hybrid_stage_end_map:
+            stage_rec = hybrid_stage_end_map[epoch]
+            stage_idx = int(stage_rec["stage"])
+            stage_lambda = float(stage_rec["lambda"])
+            minimax_end = int(stage_rec["minimax_epoch_end"])
+            lambda_tag = _format_float_for_filename(stage_lambda)
+            stage_path = hybrid_output_dir / f"stage{stage_idx:02d}_lambda{lambda_tag}_minimax{minimax_end}.pth"
+            stage_label = f"hybrid-stage{stage_idx}-lambda{stage_lambda}"
+            stage_robust = None if input_pgd_acc is None else float(input_pgd_acc)
+            save_model_checkpoint(
+                str(stage_path),
+                epoch_idx=epoch,
+                robust_acc=stage_robust,
+                label=stage_label,
+            )
         if early_stop_enabled and early_stop_triggered:
             break
 
