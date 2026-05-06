@@ -45,6 +45,28 @@ def _cifar10_transform(train: bool, augment_train: bool):
     return T.Compose(transforms)
 
 
+def _ddp_safe_cifar10_prepare(data_root: str, world_size: int, rank: int) -> None:
+    """Download CIFAR-10 from rank 0 and barrier the rest.
+
+    All ranks racing ``CIFAR10(download=True)`` triggers a race on the
+    extracted directory: rank 1+ may see a half-written tree while rank 0
+    is still un-tarring and fail with "Dataset not found or corrupted".
+    Downloading only on rank 0 + a torch.distributed barrier ensures the
+    archive is fully extracted before any non-zero rank tries to load.
+    """
+    import torch.distributed as dist
+    import torchvision
+
+    if world_size <= 1:
+        return
+    if rank == 0:
+        # Touch both splits so the archive is fully extracted before barrier.
+        torchvision.datasets.CIFAR10(root=data_root, train=True, download=True)
+        torchvision.datasets.CIFAR10(root=data_root, train=False, download=True)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
 def get_cifar10_loaders(
     batch_size: int = 256,
     num_workers: int = 2,
@@ -67,12 +89,20 @@ def get_cifar10_loaders(
     """
     import torchvision
 
+    # DDP-safe download: rank 0 fetches/extracts, others wait at barrier.
+    if download:
+        _ddp_safe_cifar10_prepare(data_root, world_size=world_size, rank=rank)
+
+    # After the rank-0 download + barrier, every rank passes download=False
+    # — the archive is on disk, no extra HTTP requests, no race risk.
+    download_each_rank = download if world_size <= 1 else False
+
     train_dataset = torchvision.datasets.CIFAR10(
-        root=data_root, train=True, download=download,
+        root=data_root, train=True, download=download_each_rank,
         transform=_cifar10_transform(True, augment_train),
     )
     test_dataset = torchvision.datasets.CIFAR10(
-        root=data_root, train=False, download=download,
+        root=data_root, train=False, download=download_each_rank,
         transform=_cifar10_transform(False, augment_train),
     )
 
