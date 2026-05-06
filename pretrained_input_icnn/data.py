@@ -111,6 +111,13 @@ def get_cifar10_loaders(
         train_gen, train_init = _dataloader_seed(seed, 0)
         test_gen, test_init = _dataloader_seed(seed, 1)
 
+    # ``persistent_workers=True`` keeps the worker processes alive across
+    # epochs. Without it, each ``iter(loader)`` call respawns workers and
+    # allocates fresh SemLocks in /dev/shm — on cluster containers with a
+    # 64 MB /dev/shm, that fills up after a handful of epochs and kills
+    # training mid-loop. Only valid when num_workers > 0.
+    persistent = num_workers > 0
+
     train_sampler: Optional[DistributedSampler] = None
     if world_size > 1:
         train_sampler = DistributedSampler(
@@ -133,6 +140,7 @@ def get_cifar10_loaders(
             pin_memory=pin_memory,
             worker_init_fn=train_init,
             drop_last=True,
+            persistent_workers=persistent,
         )
     else:
         train_loader = DataLoader(
@@ -143,6 +151,7 @@ def get_cifar10_loaders(
             pin_memory=pin_memory,
             generator=train_gen,
             worker_init_fn=train_init,
+            persistent_workers=persistent,
         )
 
     test_loader = DataLoader(
@@ -153,5 +162,6 @@ def get_cifar10_loaders(
         pin_memory=pin_memory,
         generator=test_gen,
         worker_init_fn=test_init,
+        persistent_workers=persistent,
     )
     return train_loader, test_loader, train_sampler

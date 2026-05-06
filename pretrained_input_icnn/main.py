@@ -9,6 +9,17 @@ from typing import Any, Dict, Iterable
 
 import torch
 
+# Cluster containers often ship with a tiny /dev/shm (Docker default 64 MB),
+# which the default 'file_descriptor' sharing strategy exhausts via the
+# DataLoader workers' SemLock + shared-tensor allocations once a few epochs
+# have passed. 'file_system' uses regular files in the working tree
+# instead — slightly slower but never hits "[Errno 28] No space left on
+# device". Set BEFORE the first DataLoader spawns workers.
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except (RuntimeError, AttributeError):
+    pass
+
 from . import distributed as dist_helpers
 from .algorithms import ALGORITHMS
 from .config import build_arg_parser, config_from_args
