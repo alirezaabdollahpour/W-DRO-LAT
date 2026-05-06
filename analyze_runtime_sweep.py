@@ -110,16 +110,23 @@ def _fmt(v: Optional[float], spec: str = "{:.3f}", default: str = "—") -> str:
     return spec.format(v)
 
 
-def _collect_one(result_root: Path) -> Tuple[Dict[str, List[Dict[str, Any]]], int]:
+def _collect_one(
+    result_root: Path,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], int, List[Dict[str, str]]]:
     manifest = result_root / "run_manifest.tsv"
     if not manifest.exists():
         raise SystemExit(f"No manifest at {manifest}")
 
     by_algo: Dict[str, List[Dict[str, Any]]] = {}
+    failed: List[Dict[str, str]] = []
     n_completed = 0
     with manifest.open() as f:
         for row in csv.DictReader(f, delimiter="\t"):
-            if not row.get("status", "").startswith("completed"):
+            status = row.get("status", "")
+            if status.startswith("failed"):
+                failed.append(row)
+                continue
+            if not status.startswith("completed"):
                 continue
             n_completed += 1
             algo = row["algorithm"]
@@ -132,14 +139,22 @@ def _collect_one(result_root: Path) -> Tuple[Dict[str, List[Dict[str, Any]]], in
                 peak_rss_mb = float(t_summary.get("Maximum resident set size (kbytes)", "nan")) / 1024
             except ValueError:
                 peak_rss_mb = float("nan")
+            # Wallclock: prefer /usr/bin/time -v output; fall back to the
+            # manifest's elapsed_seconds (always written by the bash
+            # dispatcher, even when /usr/bin/time is unavailable).
+            wallclock = _wallclock_seconds(t_summary)
+            if wallclock != wallclock:  # NaN
+                try:
+                    wallclock = float(row.get("elapsed_seconds", "nan"))
+                except ValueError:
+                    wallclock = float("nan")
             entry: Dict[str, Any] = {
                 "seed":          int(row["seed"]),
                 "n_epochs":      len(ep_secs),
                 "median_ep_s":   statistics.median(ep_secs) if ep_secs else float("nan"),
                 "min_ep_s":      min(ep_secs) if ep_secs else float("nan"),
                 "max_ep_s":      max(ep_secs) if ep_secs else float("nan"),
-                "wallclock_s":   _wallclock_seconds(t_summary),
-                "wallclock_raw": t_summary.get("Elapsed (wall clock) time (h:mm:ss or m:ss)", "—"),
+                "wallclock_s":   wallclock,
                 "peak_rss_mb":   peak_rss_mb,
                 "final_train_loss": _final_metric(adv, "train_loss"),
                 "final_train_acc":  _final_metric(adv, "train_acc"),
@@ -150,7 +165,7 @@ def _collect_one(result_root: Path) -> Tuple[Dict[str, List[Dict[str, Any]]], in
                 "final_pgd_acc":    _final_metric(adv, "input_pgd_acc"),
             }
             by_algo.setdefault(algo, []).append(entry)
-    return by_algo, n_completed
+    return by_algo, n_completed, failed
 
 
 def _aggregate(by_algo: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -268,8 +283,16 @@ def main() -> None:
                         help="Write summary CSV to this path.")
     args = parser.parse_args()
 
-    by_algo, n_completed = _collect_one(args.result_root)
-    print(f"\n[summary] {n_completed} completed runs across {len(by_algo)} algorithms.\n")
+    by_algo, n_completed, failed = _collect_one(args.result_root)
+    print(f"\n[summary] {n_completed} completed runs across {len(by_algo)} algorithms.")
+    if failed:
+        print(f"[summary] {len(failed)} FAILED rows in manifest:")
+        for row in failed:
+            print(
+                f"  {row['status']:>16}  algo={row['algorithm']:<8}  seed={row['seed']}  "
+                f"log={row['log_file']}"
+            )
+    print()
     if not by_algo:
         raise SystemExit("Nothing to summarise yet.")
 
