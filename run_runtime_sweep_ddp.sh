@@ -9,6 +9,8 @@
 #
 # Adversaries:
 #   * NPF      — NPF ICNN potential, BB+Armijo on ω parameters
+#   * NPF-LastQuad — NPF variant with only the final rank-0 diagonal
+#                quadratic layer trainable
 #   * NN-DRO   — vanilla MLP adversary, BB+Armijo on ω parameters
 #                (replaces the legacy Adam ascent)
 #   * Madry/RO — fixed-step pixel-space l2-PGD threat model with
@@ -89,6 +91,10 @@
 #   SPLIT 2  — nn_dro, madry
 #   SPLIT 3  — wrm, wfr
 #   SPLIT 4  — dual, new_ppa
+#
+# To run only the last-quadratic NPF variant, set
+#   RUN_ONLY_ALGO=npf_lastquad
+# and use SPLIT=1 (or keep the old 1..4 loop; splits 2..4 will no-op).
 #
 # Cluster submission example (one 4-GPU job per split, splits in parallel):
 #   for i in 1 2 3 4; do
@@ -174,12 +180,59 @@ DUAL_MALA=${DUAL_MALA:-1}
 DUAL_BURN_IN=${DUAL_BURN_IN:-0}
 DUAL_SAMPLE_LEVEL=${DUAL_SAMPLE_LEVEL:-3}  # m=8 — keeps wallclock comparable
 
+# ---- NPF last-quadratic-only architecture knobs ----
+RUN_ONLY_ALGO=${RUN_ONLY_ALGO:-}
+NPF_LASTQUAD_HIDDEN=${NPF_LASTQUAD_HIDDEN:-1024 512 512 256 128 64}
+NPF_LASTQUAD_ACTIVATION=${NPF_LASTQUAD_ACTIVATION:-softplus}
+NPF_LASTQUAD_ELU_ALPHA=${NPF_LASTQUAD_ELU_ALPHA:-1.0}
+NPF_LASTQUAD_SOFTPLUS_BETA=${NPF_LASTQUAD_SOFTPLUS_BETA:-10.0}
+NPF_LASTQUAD_INIT_EPS=${NPF_LASTQUAD_INIT_EPS:-1e-4}
+NPF_LASTQUAD_STRONG_CONVEXITY=${NPF_LASTQUAD_STRONG_CONVEXITY:-1.0}
+
+DEFAULT_ALGOS=(npf nn_dro madry wrm wfr dual new_ppa)
+KNOWN_ALGOS=(npf npf_lastquad nn_dro madry wrm wfr dual new_ppa)
+
+is_known_algo() {
+    local needle="$1" algo
+    for algo in "${KNOWN_ALGOS[@]}"; do
+        if [ "$algo" = "$needle" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+join_by_comma() {
+    local first=1 item
+    for item in "$@"; do
+        if [ "$first" -eq 1 ]; then
+            printf "%s" "$item"
+            first=0
+        else
+            printf ",%s" "$item"
+        fi
+    done
+}
+
+if [ -n "$RUN_ONLY_ALGO" ] && ! is_known_algo "$RUN_ONLY_ALGO"; then
+    echo "[FATAL] Unknown RUN_ONLY_ALGO=${RUN_ONLY_ALGO}. Known: ${KNOWN_ALGOS[*]}"
+    exit 1
+fi
+
+if [ -n "$RUN_ONLY_ALGO" ]; then
+    ACTIVE_ALGOS=("$RUN_ONLY_ALGO")
+else
+    ACTIVE_ALGOS=("${DEFAULT_ALGOS[@]}")
+fi
+ACTIVE_ALGOS_CSV="$(join_by_comma "${ACTIVE_ALGOS[@]}")"
+
 # ---- Pre-flight ----
 echo ""
 echo "================================================================"
 echo "  Input-ICNN Runtime Sweep — DDP"
 echo "  SPLIT=${SPLIT}  SEED=${SEED}  NPROC=${NPROC}  K=${K}"
 echo "  Epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
+echo "  Active algos: ${ACTIVE_ALGOS[*]}"
 echo "  Margin loss: ${USE_MARGIN_LOSS}"
 echo "  BB+Armijo:   alpha0=${BB_ALPHA0}  alpha=[${BB_ALPHA_MIN}, ${BB_ALPHA_MAX}]"
 echo "                ls_c=${BB_LS_C}  shrink=${BB_LS_SHRINK}  ls_max=${BB_LS_MAX_STEPS}"
@@ -190,6 +243,11 @@ if [ "${DUAL_LANGEVIN_STEPS}" -gt 0 ]; then
     echo "                eta=${DUAL_LANGEVIN_STEP_SIZE}  MALA=${DUAL_MALA}  burn_in=${DUAL_BURN_IN}"
 else
     echo "  Dual mode:   one-shot Gaussian (closed-form Sinkhorn)"
+fi
+if [[ " ${ACTIVE_ALGOS[*]} " == *" npf_lastquad "* ]]; then
+    echo "  NPF-LastQuad: hidden=${NPF_LASTQUAD_HIDDEN}"
+    echo "                activation=${NPF_LASTQUAD_ACTIVATION} beta=${NPF_LASTQUAD_SOFTPLUS_BETA}"
+    echo "                init_eps=${NPF_LASTQUAD_INIT_EPS} strong_convexity=${NPF_LASTQUAD_STRONG_CONVEXITY}"
 fi
 echo "  Results: ${RESULTS_DIR}"
 echo "  Started: $(date)"
@@ -224,6 +282,15 @@ algo_args() {
                 --npf-outer-rank 8 --npf-inner-rank 2 \
                 --npf-activation softplus --npf-softplus-beta 10.0 \
                 --npf-init-eps 1e-4 --npf-strong-convexity 1.0"
+            ;;
+        npf_lastquad)
+            echo "--omega-steps-per-batch ${k} \
+                --npf-lastquad-hidden ${NPF_LASTQUAD_HIDDEN} \
+                --npf-lastquad-activation ${NPF_LASTQUAD_ACTIVATION} \
+                --npf-lastquad-elu-alpha ${NPF_LASTQUAD_ELU_ALPHA} \
+                --npf-lastquad-softplus-beta ${NPF_LASTQUAD_SOFTPLUS_BETA} \
+                --npf-lastquad-init-eps ${NPF_LASTQUAD_INIT_EPS} \
+                --npf-lastquad-strong-convexity ${NPF_LASTQUAD_STRONG_CONVEXITY}"
             ;;
         nn_dro)
             echo "--omega-steps-per-batch ${k} \
@@ -390,37 +457,59 @@ run_algo() {
 # ======================================================================
 # Split dispatcher
 # ======================================================================
-case $SPLIT in
-    0)
-        run_algo "npf"
-        run_algo "nn_dro"
-        run_algo "madry"
-        run_algo "wrm"
-        run_algo "wfr"
-        run_algo "dual"
-        run_algo "new_ppa"
-        ;;
-    1) run_algo "npf" ;;
-    2) run_algo "nn_dro"; run_algo "madry" ;;
-    3) run_algo "wrm";    run_algo "wfr"   ;;
-    4) run_algo "dual";   run_algo "new_ppa" ;;
-    *)
-        echo "[FATAL] Unknown SPLIT=${SPLIT}. Use 0 (sequential) or 1-4."
-        exit 1
-        ;;
-esac
+DID_RUN_ALGO=0
+if [ -n "$RUN_ONLY_ALGO" ]; then
+    case $SPLIT in
+        0|1)
+            run_algo "$RUN_ONLY_ALGO"
+            DID_RUN_ALGO=1
+            ;;
+        2|3|4)
+            echo "[SKIP] RUN_ONLY_ALGO=${RUN_ONLY_ALGO}; split ${SPLIT} has no assigned work."
+            ;;
+        *)
+            echo "[FATAL] Unknown SPLIT=${SPLIT}. Use 0 (sequential) or 1-4."
+            exit 1
+            ;;
+    esac
+else
+    case $SPLIT in
+        0)
+            run_algo "npf"
+            run_algo "nn_dro"
+            run_algo "madry"
+            run_algo "wrm"
+            run_algo "wfr"
+            run_algo "dual"
+            run_algo "new_ppa"
+            DID_RUN_ALGO=1
+            ;;
+        1) run_algo "npf"; DID_RUN_ALGO=1 ;;
+        2) run_algo "nn_dro"; run_algo "madry"; DID_RUN_ALGO=1 ;;
+        3) run_algo "wrm";    run_algo "wfr";   DID_RUN_ALGO=1 ;;
+        4) run_algo "dual";   run_algo "new_ppa"; DID_RUN_ALGO=1 ;;
+        *)
+            echo "[FATAL] Unknown SPLIT=${SPLIT}. Use 0 (sequential) or 1-4."
+            exit 1
+            ;;
+    esac
+fi
 
 echo ""
 echo "================================================================"
 echo "  Split ${SPLIT} complete at $(date)"
 echo "================================================================"
 
+if [ "$DID_RUN_ALGO" -eq 0 ]; then
+    exit 0
+fi
 
 # ======================================================================
-# Aggregator: prints a clean comparison table + LaTeX, only when all 7
+# Aggregator: prints a clean comparison table + LaTeX once all active
 # algorithms in the current seed have finished.
 # ======================================================================
 SPLIT="$SPLIT" SEED="$SEED" RESULTS_DIR="$RESULTS_DIR" K="$K" \
+ACTIVE_ALGOS="$ACTIVE_ALGOS_CSV" \
 NPROC="$NPROC" EPOCHS_ADV="$EPOCHS_ADV" python - << 'PYTHON_COLLECTOR'
 import csv, json, os, statistics
 from pathlib import Path
@@ -430,7 +519,13 @@ SEED        = int(os.environ["SEED"])
 K           = int(os.environ["K"])
 NPROC       = int(os.environ["NPROC"])
 EPOCHS_ADV  = int(os.environ["EPOCHS_ADV"])
-ALGOS       = ["npf", "nn_dro", "madry", "wrm", "wfr", "dual", "new_ppa"]
+ALGOS       = [
+    a for a in os.environ.get(
+        "ACTIVE_ALGOS",
+        "npf,nn_dro,madry,wrm,wfr,dual,new_ppa",
+    ).replace(",", " ").split()
+    if a
+]
 
 manifest = RESULTS_DIR / "run_manifest.tsv"
 done = set()
