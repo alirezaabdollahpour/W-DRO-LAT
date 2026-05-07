@@ -1,18 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# Input-ICNN Runtime Sweep — DDP edition (BB+Armijo across-the-board)
+# Input-ICNN Runtime Sweep — DDP edition
 # =============================================================================
 #
 # Fair runtime comparison across 7 input-space adversarial training
 # algorithms on CIFAR-10, with each run distributed across NPROC GPUs
 # via torchrun + DistributedDataParallel.
 #
-# Adversaries (all using the SAME BB+Armijo step rule for fair comparison):
+# Adversaries:
 #   * NPF      — NPF ICNN potential, BB+Armijo on ω parameters
 #   * NN-DRO   — vanilla MLP adversary, BB+Armijo on ω parameters
 #                (replaces the legacy Adam ascent)
-#   * Madry    — l2-PGD threat model, BB+Armijo on z + post-step
-#                projection back to the eps-ball + clamp
+#   * Madry/RO — fixed-step pixel-space l2-PGD threat model with
+#                epsilon-ball projection + clamp; no lambda penalty
 #   * WRM      — WRM inner objective on z, BB+Armijo step rule
 #                (replaces constant-LR ascent)
 #   * WFR      — particle ensemble + reweighting, BB+Armijo on the
@@ -21,8 +21,8 @@
 #   * New_PPA  — BB+Armijo ascent inside each round (replaces WRM ascent),
 #                free-weight projection rounds unchanged
 #   * Dual     — Sinkhorn entropic dual. Two operating modes:
-#                  – DUAL_LANGEVIN_STEPS=0: legacy closed-form estimator
-#                    (one-shot Gaussian particles around x). Fast but the
+#                  – DUAL_LANGEVIN_STEPS=0: one-shot Gaussian estimator
+#                    (Gaussian particles around x). Fast but the
 #                    samples come from the prior, not the Gibbs target,
 #                    so the inner integral isn't actually solved.
 #                  – DUAL_LANGEVIN_STEPS>0: Option-D rigorous inner
@@ -30,12 +30,14 @@
 #                    chain on the Gibbs target π(z|x) ∝ exp(U(z)),
 #                    optionally MH-corrected (DUAL_MALA=1, default) for
 #                    unbiased samples. The Sinkhorn dual loss is then
-#                    computed on the refined particles. The legacy
-#                    closed-form is recovered exactly at K=0.
+#                    computed on the refined particles. The one-shot
+#                    estimator is recovered at K=0.
 #
 # All BB+Armijo hyperparameters (alpha0, alpha_min, alpha_max, ls_c,
-# ls_shrink, ls_max_steps) are SHARED across the 6 inner-ascent
+# ls_shrink, ls_max_steps) are SHARED across the DRO inner-ascent
 # methods, defaulting to NPF's settings from the LR-CIFAR10 reference.
+# Madry/RO is intentionally excluded: it is standard pixel-space l2-PGD with
+# epsilon, not a lambda-penalised DRO objective.
 #
 # ---- Parallelism strategy ----
 #
@@ -46,7 +48,7 @@
 #
 # For the parametric adversaries (NPF, NN-DRO) the BB+Armijo step
 # all-reduces ω-gradients across ranks so every rank picks the same
-# Armijo trial step. For the input-space adversaries (WRM/Madry/WFR/PPA)
+# Armijo trial step. For the input-space DRO adversaries (WRM/WFR/PPA)
 # each rank runs an independent BB+Armijo ascent on its local batch
 # shard — no cross-rank sync is meaningful since z lives on the shard.
 #
@@ -58,15 +60,15 @@
 #
 # ---- Fairness rules baked in ----
 #
-#   * Same outer hyperparameters (epochs, lr_theta, λ, global batch).
+#   * Same outer hyperparameters (epochs, lr_theta, λ for DRO methods,
+#     global batch). Madry/RO uses epsilon instead of λ.
 #   * Same K=20 inner-iteration budget (per-algorithm interpretation
-#     applied: NPF/NN-DRO omega_steps=K, WRM/WFR inner_steps=K, Madry
-#     pgd_steps=K, New_PPA round0_steps=refine_steps=K, Dual
+#     applied: NPF/NN-DRO omega_steps=K, WRM/WFR inner_steps=K,
+#     Madry/RO pgd_steps=K, New_PPA round0_steps=refine_steps=K, Dual
 #     langevin_steps=K via the Option-D MALA sampler).
-#   * Same BB+Armijo step rule and hyperparameters across all six
-#     inner-ascent methods (Dual uses the Langevin/MALA sampler, not
-#     BB+Armijo, since its inner objective is a Gibbs density to sample
-#     from rather than an adversarial loss to maximise per-sample).
+#   * Same BB+Armijo step rule and hyperparameters across the DRO
+#     inner-ascent methods. Madry/RO uses pixel-space l2-PGD; Dual uses the
+#     Langevin/MALA sampler for its entropic Gibbs target.
 #   * --skip-pgd-during-train: PGD eval would otherwise dominate.
 #   * --benchmark-mode: cuDNN autotune + TF32, identical for all algos.
 #   * Sequential (no in-script concurrency on the same GPUs).
@@ -132,6 +134,7 @@ PENALTY_LAMBDA=${PENALTY_LAMBDA:-30}
 LR_THETA=${LR_THETA:-0.1}
 INP_P=${INP_P:-2}
 INP_EPS=${INP_EPS:-0.5}
+MADRY_PGD_STEP_SIZE=${MADRY_PGD_STEP_SIZE:-0}  # 0 => trainer default 2*epsilon/K
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 # Conservative default — cluster containers typically ship with a tiny
 # /dev/shm (Docker's 64 MB default) and 4 workers/rank × 4 ranks = 16
@@ -158,7 +161,7 @@ BB_ARGS=(
 )
 
 # ---- Dual Option-D Langevin / MALA inner sampler ----
-# DUAL_LANGEVIN_STEPS=0 keeps the legacy one-shot Gaussian estimator
+# DUAL_LANGEVIN_STEPS=0 keeps the one-shot Gaussian estimator
 # (closed-form Sinkhorn dual). >0 enables iterative MCMC refinement of
 # each particle on the Gibbs target. Defaults below assume DUAL_EPSILON=0.05;
 # η ≈ ε is a good starting point — MALA's accept rate is the right
@@ -174,18 +177,19 @@ DUAL_SAMPLE_LEVEL=${DUAL_SAMPLE_LEVEL:-3}  # m=8 — keeps wallclock comparable
 # ---- Pre-flight ----
 echo ""
 echo "================================================================"
-echo "  Input-ICNN Runtime Sweep — DDP (BB+Armijo across all methods)"
+echo "  Input-ICNN Runtime Sweep — DDP"
 echo "  SPLIT=${SPLIT}  SEED=${SEED}  NPROC=${NPROC}  K=${K}"
 echo "  Epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
 echo "  Margin loss: ${USE_MARGIN_LOSS}"
 echo "  BB+Armijo:   alpha0=${BB_ALPHA0}  alpha=[${BB_ALPHA_MIN}, ${BB_ALPHA_MAX}]"
 echo "                ls_c=${BB_LS_C}  shrink=${BB_LS_SHRINK}  ls_max=${BB_LS_MAX_STEPS}"
+echo "  Madry/RO:    pixel l2-PGD eps=${INP_EPS}  step_size=${MADRY_PGD_STEP_SIZE:-0} (0=auto)"
 if [ "${DUAL_LANGEVIN_STEPS}" -gt 0 ]; then
     echo "  Dual mode:   Option-D Langevin/MALA sampler"
     echo "                eps=${DUAL_EPSILON}  m=2^${DUAL_SAMPLE_LEVEL}  K_langevin=${DUAL_LANGEVIN_STEPS}"
     echo "                eta=${DUAL_LANGEVIN_STEP_SIZE}  MALA=${DUAL_MALA}  burn_in=${DUAL_BURN_IN}"
 else
-    echo "  Dual mode:   legacy one-shot Gaussian (closed-form Sinkhorn)"
+    echo "  Dual mode:   one-shot Gaussian (closed-form Sinkhorn)"
 fi
 echo "  Results: ${RESULTS_DIR}"
 echo "  Started: $(date)"
@@ -209,10 +213,9 @@ fi
 algo_args() {
     # Per-algorithm flags. The shared --bb-* hyperparameters are added
     # by the runner outside of this function so every adversary uses
-    # the SAME BB+Armijo step rule. Note that legacy step-size flags
-    # like --wrm-inner-lr / --madry-pgd-step-size / --nn-dro-inner-lr
-    # are passed but IGNORED in BB+Armijo mode — the inner step size is
-    # picked adaptively by the line search.
+    # the SAME BB+Armijo step rule for DRO ascent methods. Madry/RO is
+    # standard pixel-space l2-PGD, so --madry-pgd-step-size is honoured when set
+    # (>0) and otherwise defaults to 2*epsilon/K.
     local algo="$1" k="$2"
     case "$algo" in
         npf)
@@ -229,7 +232,8 @@ algo_args() {
                 --nn-dro-init-scale 1e-3"
             ;;
         madry)
-            echo "--madry-epsilon ${INP_EPS} --madry-pgd-steps ${k} --madry-pgd-restarts 1"
+            echo "--madry-epsilon ${INP_EPS} --madry-pgd-steps ${k} \
+                --madry-pgd-step-size ${MADRY_PGD_STEP_SIZE} --madry-pgd-restarts 1"
             ;;
         wrm)
             echo "--wrm-inner-steps ${k}"
@@ -241,7 +245,7 @@ algo_args() {
             # Option-D rigorous inner sampling: each particle is refined
             # via a Langevin chain on the Gibbs target before the
             # Sinkhorn dual loss. With DUAL_LANGEVIN_STEPS=0 the run
-            # falls back to the legacy one-shot closed-form estimator
+            # falls back to the one-shot closed-form estimator
             # (no inner ascent — Dual is then the only method without
             # iterative inner work, kept for back-compat and as a
             # fast-but-biased reference).
@@ -313,8 +317,8 @@ run_algo() {
 
         # The shared --bb-* knobs are passed to every algorithm. They
         # are consumed only by methods using BB+Armijo (NPF, NN-DRO,
-        # WRM, Madry, WFR, New_PPA); Dual parses them and ignores them
-        # since it uses the Langevin/MALA sampler instead.
+        # WRM, WFR, New_PPA); Madry/RO and Dual parse them and ignore
+        # them because they use PGD and Langevin/MALA respectively.
         $TIME_CMD torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC} \
             -m pretrained_input_icnn.main \
             --algorithm "$ALGO" \
