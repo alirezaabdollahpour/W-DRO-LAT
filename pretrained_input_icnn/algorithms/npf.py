@@ -46,17 +46,9 @@ class NPFTrainer(BaseAdvTrainer):
         cfg = self.config
         # Input dim = product of image dims (3 * 32 * 32 for CIFAR).
         self.input_dim = int(3 * 32 * 32)
-        self.psi_omega = NPFInputConvexPotential(
-            input_dim=self.input_dim,
-            hidden_sizes=cfg.npf_hidden,
-            outer_rank=cfg.npf_outer_rank,
-            inner_rank=cfg.npf_inner_rank,
-            activation=cfg.npf_activation,
-            elu_alpha=cfg.npf_elu_alpha,
-            softplus_beta=cfg.npf_softplus_beta,
-            init_eps=cfg.npf_init_eps,
-            strong_convexity=cfg.npf_strong_convexity,
-        ).to(self.device)
+        self.psi_omega = NPFInputConvexPotential(**self._potential_kwargs()).to(
+            self.device
+        )
         # Identity init applied on top of the LogNormal draws produced inside
         # the non-negative layers' constructor.
         self.psi_omega.init_as_identity()
@@ -73,6 +65,22 @@ class NPFTrainer(BaseAdvTrainer):
             ls_max_steps=cfg.bb_ls_max_steps,
             reject_on_armijo_failure=True,
         )
+
+    def _potential_kwargs(self) -> Dict[str, Any]:
+        cfg = self.config
+        return {
+            "input_dim": self.input_dim,
+            "hidden_sizes": cfg.npf_hidden,
+            "outer_rank": cfg.npf_outer_rank,
+            "inner_rank": cfg.npf_inner_rank,
+            "quadratic_mode": "all_layers",
+            "trainable_outer_quadratic": True,
+            "activation": cfg.npf_activation,
+            "elu_alpha": cfg.npf_elu_alpha,
+            "softplus_beta": cfg.npf_softplus_beta,
+            "init_eps": cfg.npf_init_eps,
+            "strong_convexity": cfg.npf_strong_convexity,
+        }
 
     # ------------------------------------------------------------------
     def _transport(self, x: torch.Tensor, *, create_graph: bool) -> torch.Tensor:
@@ -143,3 +151,25 @@ class NPFTrainer(BaseAdvTrainer):
 
     def adversary_state_dicts(self) -> Dict[str, Any]:
         return {"psi_omega": self.psi_omega.state_dict()}
+
+
+class NPFLastQuadTrainer(NPFTrainer):
+    """NPF variant with only the final trainable rank-0 diagonal quadratic."""
+
+    name = "npf_lastquad"
+
+    def _potential_kwargs(self) -> Dict[str, Any]:
+        cfg = self.config
+        return {
+            "input_dim": self.input_dim,
+            "hidden_sizes": cfg.npf_lastquad_hidden,
+            "outer_rank": 0,
+            "inner_rank": 0,
+            "quadratic_mode": "last_layer_diagonal",
+            "trainable_outer_quadratic": False,
+            "activation": cfg.npf_lastquad_activation,
+            "elu_alpha": cfg.npf_lastquad_elu_alpha,
+            "softplus_beta": cfg.npf_lastquad_softplus_beta,
+            "init_eps": cfg.npf_lastquad_init_eps,
+            "strong_convexity": cfg.npf_lastquad_strong_convexity,
+        }

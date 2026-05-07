@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ALL_ALGORITHMS: Tuple[str, ...] = (
     "npf",
+    "npf_lastquad",
     "nn_dro",
     "madry",
     "wrm",
@@ -107,6 +108,17 @@ class TrainConfig:
     npf_bb_ls_c: float = 1e-4
     npf_bb_ls_shrink: float = 0.5
     npf_bb_ls_max_steps: int = 15
+
+    # --- NPF last-quadratic-only variant ---
+    # This shares the NPF trainer, BB+Armijo rule, LogNormal non-negative
+    # layers, and identity initialization. Its potential removes all hidden
+    # quadratic injections and keeps only q_out with rank 0 (diagonal).
+    npf_lastquad_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
+    npf_lastquad_activation: str = "softplus"
+    npf_lastquad_elu_alpha: float = 1.0
+    npf_lastquad_softplus_beta: float = 10.0
+    npf_lastquad_init_eps: float = 1e-4
+    npf_lastquad_strong_convexity: float = 1.0
 
     # --- NN-DRO hyperparameters ---
     nn_dro_hidden: Tuple[int, ...] = (512, 512, 256, 256, 128)
@@ -309,6 +321,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     npf.add_argument("--npf-bb-ls-shrink", type=float, default=0.5)
     npf.add_argument("--npf-bb-ls-max-steps", type=int, default=15)
 
+    # NPF last-quadratic-only variant
+    npf_lq = parser.add_argument_group("npf_lastquad")
+    npf_lq.add_argument(
+        "--npf-lastquad-hidden",
+        type=int,
+        nargs="+",
+        default=[512, 512, 256, 128, 64],
+    )
+    npf_lq.add_argument(
+        "--npf-lastquad-activation",
+        type=str,
+        default="softplus",
+        choices=["elu", "softplus", "relu"],
+    )
+    npf_lq.add_argument("--npf-lastquad-elu-alpha", type=float, default=1.0)
+    npf_lq.add_argument("--npf-lastquad-softplus-beta", type=float, default=10.0)
+    npf_lq.add_argument("--npf-lastquad-init-eps", type=float, default=1e-4)
+    npf_lq.add_argument("--npf-lastquad-strong-convexity", type=float, default=1.0)
+
     # NN-DRO
     nn_dro = parser.add_argument_group("nn_dro")
     nn_dro.add_argument("--nn-dro-hidden", type=int, nargs="+", default=[512, 512, 256, 256, 128])
@@ -458,6 +489,12 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "npf_bb_ls_c": "npf_bb_ls_c",
         "npf_bb_ls_shrink": "npf_bb_ls_shrink",
         "npf_bb_ls_max_steps": "npf_bb_ls_max_steps",
+        "npf_lastquad_hidden": "npf_lastquad_hidden",
+        "npf_lastquad_activation": "npf_lastquad_activation",
+        "npf_lastquad_elu_alpha": "npf_lastquad_elu_alpha",
+        "npf_lastquad_softplus_beta": "npf_lastquad_softplus_beta",
+        "npf_lastquad_init_eps": "npf_lastquad_init_eps",
+        "npf_lastquad_strong_convexity": "npf_lastquad_strong_convexity",
         "nn_dro_hidden": "nn_dro_hidden",
         "nn_dro_activation": "nn_dro_activation",
         "nn_dro_softplus_beta": "nn_dro_softplus_beta",
@@ -499,7 +536,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         if not hasattr(args, cli):
             continue
         val = getattr(args, cli)
-        if dest in {"npf_hidden", "nn_dro_hidden"}:
+        if dest in {"npf_hidden", "npf_lastquad_hidden", "nn_dro_hidden"}:
             val = tuple(val)
         kwargs[dest] = val
 
