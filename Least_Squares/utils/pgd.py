@@ -17,6 +17,8 @@ def pgd_attack_l2(
     b: torch.Tensor,
     dim_m: int,
 ) -> torch.Tensor:
+    if epsilon <= 0.0 or pgd_steps <= 0 or pgd_restarts <= 0:
+        return xi_nominal.clamp(-1.0, 1.0).detach()
     step_size = 2.5 * epsilon / float(pgd_steps)
     best_z = xi_nominal.clone()
     best_loss = loss_function(theta, xi_nominal, A0, A1, b, dim_m)

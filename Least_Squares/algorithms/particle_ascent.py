@@ -17,7 +17,8 @@ def _solve_Particle_Ascent_with_zstar(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> Dict[str, Any]:
-    theta = torch.zeros(cfg.dim_n, device=xi_train.device)
+    xi_train = xi_train.to(device=A0.device, dtype=A0.dtype)
+    theta = torch.zeros(cfg.dim_n, device=A0.device, dtype=A0.dtype)
     z = xi_train.clone()
     for _epoch in range(cfg.epochs):
         z = xi_train.clone()

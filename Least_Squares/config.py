@@ -80,6 +80,22 @@ class ULSConfig:
     npf_bb_ls_shrink: float = 0.5
     npf_bb_ls_max_steps: int = 10
 
+    # NPF variant: no hidden-layer quadratic injections and one trainable
+    # rank-0 diagonal quadratic form at the output layer only.
+    npf_lastquad_hidden: Sequence[int] = (64, 64, 64, 64)
+    npf_lastquad_activation: str = "elu"
+    npf_lastquad_elu_alpha: float = 1.0
+    npf_lastquad_softplus_beta: float = 20.0
+    npf_lastquad_init_eps: float = 1e-3
+    npf_lastquad_strong_convexity: float = 1.0
+    npf_lastquad_omega_steps_per_epoch: int = 500
+    npf_lastquad_bb_alpha0: float = 1e-1
+    npf_lastquad_bb_alpha_min: float = 1e-6
+    npf_lastquad_bb_alpha_max: float = 10.0
+    npf_lastquad_bb_ls_c: float = 1e-4
+    npf_lastquad_bb_ls_shrink: float = 0.5
+    npf_lastquad_bb_ls_max_steps: int = 10
+
     # NN-DRO (vanilla MLP adversary)
     nn_dro_hidden: Sequence[int] = (64, 64, 64, 64)
     nn_dro_activation: str = "softplus"
@@ -103,6 +119,7 @@ ALL_ALGORITHMS = (
     "madry",
     "ppa",
     "npf",
+    "npf_lastquad",
     "nn_dro",
 )
 
@@ -115,7 +132,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Uncertain least squares (Fig. 8) comparison suite: "
-            "ERM / Particle Ascent / WGF / WFR / Dual / ICNN / Madry PGD / PPA / NPF / NN-DRO"
+            "ERM / Particle Ascent / WGF / WFR / Dual / ICNN / Madry PGD / "
+            "PPA / NPF / NPF-LastQuad / NN-DRO"
         )
     )
     parser.add_argument(
@@ -202,6 +220,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     npf.add_argument("--npf-bb-ls-shrink", type=float, default=0.5, dest="npf_bb_ls_shrink")
     npf.add_argument("--npf-bb-ls-max-steps", type=int, default=10, dest="npf_bb_ls_max_steps")
 
+    npf_lq = parser.add_argument_group("npf_lastquad")
+    npf_lq.add_argument(
+        "--npf-lastquad-hidden",
+        type=_int_tuple,
+        default=(64, 64, 64, 64),
+        dest="npf_lastquad_hidden",
+    )
+    npf_lq.add_argument(
+        "--npf-lastquad-activation",
+        choices=["elu", "softplus", "relu"],
+        default="elu",
+        dest="npf_lastquad_activation",
+    )
+    npf_lq.add_argument("--npf-lastquad-elu-alpha", type=float, default=1.0, dest="npf_lastquad_elu_alpha")
+    npf_lq.add_argument("--npf-lastquad-softplus-beta", type=float, default=20.0, dest="npf_lastquad_softplus_beta")
+    npf_lq.add_argument("--npf-lastquad-init-eps", type=float, default=1e-3, dest="npf_lastquad_init_eps")
+    npf_lq.add_argument(
+        "--npf-lastquad-strong-convexity",
+        type=float,
+        default=1.0,
+        dest="npf_lastquad_strong_convexity",
+    )
+    npf_lq.add_argument(
+        "--npf-lastquad-omega-steps-per-epoch",
+        type=int,
+        default=500,
+        dest="npf_lastquad_omega_steps_per_epoch",
+    )
+    npf_lq.add_argument("--npf-lastquad-bb-alpha0", type=float, default=1e-1, dest="npf_lastquad_bb_alpha0")
+    npf_lq.add_argument("--npf-lastquad-bb-alpha-min", type=float, default=1e-6, dest="npf_lastquad_bb_alpha_min")
+    npf_lq.add_argument("--npf-lastquad-bb-alpha-max", type=float, default=10.0, dest="npf_lastquad_bb_alpha_max")
+    npf_lq.add_argument("--npf-lastquad-bb-ls-c", type=float, default=1e-4, dest="npf_lastquad_bb_ls_c")
+    npf_lq.add_argument("--npf-lastquad-bb-ls-shrink", type=float, default=0.5, dest="npf_lastquad_bb_ls_shrink")
+    npf_lq.add_argument("--npf-lastquad-bb-ls-max-steps", type=int, default=10, dest="npf_lastquad_bb_ls_max_steps")
+
     nn_dro = parser.add_argument_group("nn_dro")
     nn_dro.add_argument("--nn-dro-hidden", type=_int_tuple, default=(64, 64, 64, 64), dest="nn_dro_hidden")
     nn_dro.add_argument(
@@ -225,4 +278,47 @@ def config_from_args(args: argparse.Namespace) -> ULSConfig:
             if isinstance(val, list):
                 val = tuple(val)
             kwargs[name] = val
-    return ULSConfig(**kwargs)
+    cfg = ULSConfig(**kwargs)
+    _validate_config(cfg)
+    return cfg
+
+
+def _validate_config(cfg: ULSConfig) -> None:
+    positive_ints = {
+        "dim_m": cfg.dim_m,
+        "dim_n": cfg.dim_n,
+        "n_train": cfg.n_train,
+        "n_test": cfg.n_test,
+        "delta_steps": cfg.delta_steps,
+        "epochs": cfg.epochs,
+        "m_particles": cfg.m_particles,
+    }
+    for name, value in positive_ints.items():
+        if int(value) <= 0:
+            raise ValueError(f"{name} must be positive, got {value}.")
+    if cfg.sinkhorn_sample_level < 0:
+        raise ValueError(
+            f"sinkhorn_sample_level must be non-negative, got {cfg.sinkhorn_sample_level}."
+        )
+
+    nonnegative_ints = {
+        "inner_steps": cfg.inner_steps,
+        "pgd_steps": cfg.pgd_steps,
+        "pgd_restarts": cfg.pgd_restarts,
+        "ppa_num_rounds": cfg.ppa_num_rounds,
+        "ppa_refine_steps": cfg.ppa_refine_steps,
+        "icnn_omega_steps_per_epoch": cfg.icnn_omega_steps_per_epoch,
+        "npf_omega_steps_per_epoch": cfg.npf_omega_steps_per_epoch,
+        "npf_lastquad_omega_steps_per_epoch": cfg.npf_lastquad_omega_steps_per_epoch,
+        "nn_dro_omega_steps_per_epoch": cfg.nn_dro_omega_steps_per_epoch,
+    }
+    for name, value in nonnegative_ints.items():
+        if int(value) < 0:
+            raise ValueError(f"{name} must be non-negative, got {value}.")
+
+    if cfg.delta_max < cfg.delta_min:
+        raise ValueError("delta_max must be greater than or equal to delta_min.")
+    if cfg.lam < 0.0:
+        raise ValueError(f"lam must be non-negative, got {cfg.lam}.")
+    if cfg.epsilon < 0.0:
+        raise ValueError(f"epsilon must be non-negative, got {cfg.epsilon}.")

@@ -18,16 +18,27 @@ def _solve_wfr_with_zstar(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> Dict[str, Any]:
-    theta = torch.zeros(cfg.dim_n, device=xi_train.device)
+    xi_train = xi_train.to(device=A0.device, dtype=A0.dtype)
+    theta = torch.zeros(cfg.dim_n, device=A0.device, dtype=A0.dtype)
     n_train = xi_train.numel()
     m = cfg.m_particles
     noise_scale = math.sqrt(2.0 * cfg.inner_step_size * cfg.lam * cfg.epsilon)
     particles = xi_train.view(-1, 1).repeat(1, m)
-    weights = torch.full((n_train, m), 1.0 / float(m), device=xi_train.device)
+    weights = torch.full(
+        (n_train, m),
+        1.0 / float(m),
+        device=A0.device,
+        dtype=A0.dtype,
+    )
 
     for _epoch in range(cfg.epochs):
         particles = xi_train.view(-1, 1).repeat(1, m)
-        weights = torch.full((n_train, m), 1.0 / float(m), device=xi_train.device)
+        weights = torch.full(
+            (n_train, m),
+            1.0 / float(m),
+            device=A0.device,
+            dtype=A0.dtype,
+        )
 
         for _ in range(cfg.inner_steps):
             particles_flat = particles.reshape(-1)
@@ -45,10 +56,11 @@ def _solve_wfr_with_zstar(
             f_bar = f_bar - cfg.lam * (particles - xi_train.view(-1, 1)) ** 2
 
             power = 1.0 - cfg.lam * cfg.epsilon * cfg.wfr_weight_step_size
-            weights = (weights.clamp_min(1e-12) ** power) * torch.exp(
-                cfg.wfr_weight_step_size * f_bar
-            )
-            weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-12)
+            log_weights = power * torch.log(weights.clamp_min(1e-12))
+            log_weights = log_weights + cfg.wfr_weight_step_size * f_bar
+            log_weights = log_weights - log_weights.max(dim=1, keepdim=True).values
+            weights = torch.exp(log_weights)
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
             thr = cfg.wfr_low_weight_threshold
             low_mask = weights < thr

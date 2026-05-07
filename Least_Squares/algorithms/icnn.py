@@ -20,8 +20,9 @@ def solve_icnn_map(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> Tuple[torch.Tensor, InputConvexPotential]:
-    device = xi_train.device
-    theta = torch.zeros(cfg.dim_n, device=device)
+    device = A0.device
+    xi_train = xi_train.to(device=device, dtype=A0.dtype)
+    theta = torch.zeros(cfg.dim_n, device=device, dtype=A0.dtype)
     psi_omega = InputConvexPotential(
         input_dim=1,
         hidden_sizes=tuple(cfg.icnn_hidden),
@@ -38,6 +39,7 @@ def solve_icnn_map(
         ls_c=cfg.icnn_bb_ls_c,
         ls_shrink=cfg.icnn_bb_ls_shrink,
         ls_max_steps=cfg.icnn_bb_ls_max_steps,
+        reject_on_armijo_failure=True,
     )
 
     xi_2d = xi_train.view(-1, 1)

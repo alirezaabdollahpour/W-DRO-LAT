@@ -32,13 +32,14 @@ STYLE = {
     "wfr":             dict(label="WFR",      color="#e07a1c", linestyle=(0, (1, 1)),       linewidth=1.7),
     "dual":            dict(label="SDRO",     color="#d99c2b", linestyle=(0, (5, 1, 1, 1)), linewidth=1.7),
     "npf":             dict(label="ICNN-DRO", color="#c8202b", linestyle="-",                linewidth=2.4),
+    "npf_lastquad":    dict(label="ICNN-DRO-LQ", color="#0072B2", linestyle=(0, (4, 1)),      linewidth=2.2),
 }
 
 # Default plot order. SDRO ("dual") is excluded by default per the paper
 # discussion: its W_2^2 is set by the fixed Sinkhorn noise and does not
 # trace a real Pareto curve in lambda, so plotting it as a curve is
 # misleading.
-DEFAULT_PLOT_ORDER = ["particle_ascent", "ppa", "wfr", "npf"]
+DEFAULT_PLOT_ORDER = ["particle_ascent", "ppa", "wfr", "npf", "npf_lastquad"]
 
 
 # ---------------------------------------------------------------------------

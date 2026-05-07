@@ -1,8 +1,9 @@
 """Least_Squares entry point.
 
-Runs any subset of {ERM, Particle Ascent, WGF, WFR, Dual, ICNN, Madry PGD, PPA,
-WDRO-NPF} on the uncertain least squares Fig. 8 benchmark, saves per-method
-JSON results, and optionally produces the Fig. 8 PDFs.
+Runs any subset of {ERM, Particle Ascent, WGF, WFR, Dual, ICNN, Madry PGD,
+PPA, WDRO-NPF, WDRO-NPF-LastQuad} on the uncertain least squares Fig. 8
+benchmark, saves per-method JSON results, and optionally produces the
+Fig. 8 PDFs.
 """
 from __future__ import annotations
 
@@ -93,7 +94,8 @@ def main() -> None:
             plot_order=[
                 "ERM", "WGF(Otto, 1996)", "WFR(Xu, 2025)",
                 "Particle Ascent", "Dual(Wang et al., 2021)",
-                "ICNN", "Madry PGD", "PPA", "WDRO-NPF", "NN-DRO",
+                "ICNN", "Madry PGD", "PPA", "WDRO-NPF",
+                "WDRO-NPF-LastQuad", "NN-DRO",
             ],
         )
         print(f"Saved: {all_plot}")

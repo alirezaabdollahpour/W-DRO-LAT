@@ -29,7 +29,12 @@ def loss_grad_theta(
     xi = xi.reshape(-1)
     A_z = A0.unsqueeze(0) + xi.view(-1, 1, 1) * A1.unsqueeze(0)
     residual = torch.matmul(A_z, theta) - b.view(1, -1)
-    return 2.0 * torch.matmul(A_z.transpose(1, 2), residual.unsqueeze(2)).squeeze(2)
+    dim_m = float(A0.size(0))
+    grad = 2.0 * torch.matmul(
+        A_z.transpose(1, 2),
+        residual.unsqueeze(2),
+    ).squeeze(2)
+    return grad / dim_m
 
 
 def loss_grad_xi(
@@ -43,4 +48,5 @@ def loss_grad_xi(
     A_z = A0.unsqueeze(0) + xi.view(-1, 1, 1) * A1.unsqueeze(0)
     residual = torch.matmul(A_z, theta) - b.view(1, -1)
     grad_Az = torch.matmul(A1, theta)
-    return 2.0 * (residual * grad_Az.view(1, -1)).sum(dim=1)
+    dim_m = float(A0.size(0))
+    return 2.0 * (residual * grad_Az.view(1, -1)).sum(dim=1) / dim_m

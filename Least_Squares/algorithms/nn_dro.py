@@ -21,8 +21,9 @@ def solve_nn_dro(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    device = xi_train.device
-    theta = torch.zeros(cfg.dim_n, device=device)
+    device = A0.device
+    xi_train = xi_train.to(device=device, dtype=A0.dtype)
+    theta = torch.zeros(cfg.dim_n, device=device, dtype=A0.dtype)
 
     adversary = MLPAdversary(
         input_dim=1,

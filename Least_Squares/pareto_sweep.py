@@ -33,7 +33,10 @@ import pandas as pd
 import torch
 
 from algorithms.dual import _solve_dual_with_zstar
-from algorithms.npf import _solve_npf_icnn_map_with_zstar
+from algorithms.npf import (
+    _solve_npf_icnn_map_with_zstar,
+    _solve_npf_lastquad_icnn_map_with_zstar,
+)
 from algorithms.particle_ascent import _solve_Particle_Ascent_with_zstar
 from algorithms.ppa import _solve_ppa_with_zstar
 from algorithms.wfr import _solve_wfr_with_zstar
@@ -55,6 +58,7 @@ METHODS = {
     "npf":             _solve_npf_icnn_map_with_zstar,
     "wfr":             _solve_wfr_with_zstar,
     "dual":            _solve_dual_with_zstar,
+    "npf_lastquad":    _solve_npf_lastquad_icnn_map_with_zstar,
 }
 
 # Round lam to this many digits when matching against an existing CSV, so

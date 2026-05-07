@@ -126,7 +126,7 @@ class InputConvexPotential(nn.Module):
         raise ValueError(f"Unsupported ICNN activation '{self.activation}'.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = x.view(x.size(0), -1)
+        z = x.reshape(x.size(0), -1)
         act = self._activation()
 
         h = act(self.z_linears[0](z))

@@ -17,7 +17,8 @@ def solve_wgf(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    theta = torch.zeros(cfg.dim_n, device=xi_train.device)
+    xi_train = xi_train.to(device=A0.device, dtype=A0.dtype)
+    theta = torch.zeros(cfg.dim_n, device=A0.device, dtype=A0.dtype)
     n_train = xi_train.numel()
     m = cfg.m_particles
     noise_scale = math.sqrt(2.0 * cfg.inner_step_size * cfg.lam * cfg.epsilon)

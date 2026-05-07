@@ -16,7 +16,8 @@ def solve_madry_pgd(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    theta = torch.zeros(cfg.dim_n, device=xi_train.device)
+    xi_train = xi_train.to(device=A0.device, dtype=A0.dtype)
+    theta = torch.zeros(cfg.dim_n, device=A0.device, dtype=A0.dtype)
 
     for _epoch in range(cfg.epochs):
         z_adv = pgd_attack_l2(

@@ -15,6 +15,7 @@ theta update, but gradients are not killed by a hard clamp.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Tuple
 
 import torch
@@ -29,6 +30,7 @@ from utils.loss import loss_function, loss_grad_theta
 _XI_LOW = -1.0
 _XI_HIGH = 1.0
 _BOX_EPS = 1e-6
+_BOX_LOGIT_LIMIT = math.log((1.0 - _BOX_EPS) / _BOX_EPS)
 
 
 def _encode_box(z: torch.Tensor) -> torch.Tensor:
@@ -38,6 +40,12 @@ def _encode_box(z: torch.Tensor) -> torch.Tensor:
 
 
 def _decode_box(u: torch.Tensor) -> torch.Tensor:
+    u = torch.nan_to_num(
+        u,
+        nan=0.0,
+        posinf=_BOX_LOGIT_LIMIT,
+        neginf=-_BOX_LOGIT_LIMIT,
+    ).clamp(-_BOX_LOGIT_LIMIT, _BOX_LOGIT_LIMIT)
     return _XI_LOW + (_XI_HIGH - _XI_LOW) * torch.sigmoid(u)
 
 
@@ -52,7 +60,6 @@ def _npf_box_transport(
     with torch.set_grad_enabled(True):
         phi = psi(u_in)
         u_adv = torch.autograd.grad(phi.sum(), u_in, create_graph=create_graph)[0]
-    u_adv = torch.nan_to_num(u_adv, nan=0.0, posinf=0.0, neginf=0.0)
     z_adv = _decode_box(u_adv).view_as(xi)
     z_adv = torch.where(torch.isfinite(z_adv), z_adv, xi)
     if not create_graph:
@@ -66,34 +73,58 @@ def _solve_npf_icnn_map_with_zstar(
     A0: torch.Tensor,
     A1: torch.Tensor,
     b: torch.Tensor,
+    *,
+    hidden_attr: str = "npf_hidden",
+    activation_attr: str = "npf_activation",
+    elu_alpha_attr: str = "npf_elu_alpha",
+    softplus_beta_attr: str = "npf_softplus_beta",
+    init_eps_attr: str = "npf_init_eps",
+    strong_convexity_attr: str = "npf_strong_convexity",
+    omega_steps_attr: str = "npf_omega_steps_per_epoch",
+    bb_alpha0_attr: str = "npf_bb_alpha0",
+    bb_alpha_min_attr: str = "npf_bb_alpha_min",
+    bb_alpha_max_attr: str = "npf_bb_alpha_max",
+    bb_ls_c_attr: str = "npf_bb_ls_c",
+    bb_ls_shrink_attr: str = "npf_bb_ls_shrink",
+    bb_ls_max_steps_attr: str = "npf_bb_ls_max_steps",
+    outer_rank: int | None = None,
+    inner_rank: int | None = None,
+    quadratic_mode: str = "all_layers",
+    trainable_outer_quadratic: bool = True,
 ) -> Dict[str, Any]:
-    device = xi_train.device
+    device = A0.device
     xi_train = xi_train.to(device=device, dtype=A0.dtype)
     theta = torch.zeros(cfg.dim_n, device=device, dtype=A0.dtype)
 
     strong_convexity = float(
-        getattr(cfg, "npf_strong_convexity", getattr(cfg, "icnn_strong_convexity", 1.0))
+        getattr(
+            cfg,
+            strong_convexity_attr,
+            getattr(cfg, "icnn_strong_convexity", 1.0),
+        )
     )
     psi = NPFInputConvexPotential(
         input_dim=1,
-        hidden_sizes=tuple(cfg.npf_hidden),
-        outer_rank=cfg.npf_outer_rank,
-        inner_rank=cfg.npf_inner_rank,
-        activation=cfg.npf_activation,
-        elu_alpha=cfg.npf_elu_alpha,
-        softplus_beta=cfg.npf_softplus_beta,
-        init_eps=cfg.npf_init_eps,
+        hidden_sizes=tuple(getattr(cfg, hidden_attr)),
+        outer_rank=cfg.npf_outer_rank if outer_rank is None else int(outer_rank),
+        inner_rank=cfg.npf_inner_rank if inner_rank is None else int(inner_rank),
+        quadratic_mode=quadratic_mode,
+        trainable_outer_quadratic=trainable_outer_quadratic,
+        activation=getattr(cfg, activation_attr),
+        elu_alpha=getattr(cfg, elu_alpha_attr),
+        softplus_beta=getattr(cfg, softplus_beta_attr),
+        init_eps=getattr(cfg, init_eps_attr),
         strong_convexity=strong_convexity,
     ).to(device).to(A0.dtype)
     psi.init_as_identity()
 
     bb_state = BBArmijoState.create(
-        alpha0=cfg.npf_bb_alpha0,
-        alpha_min=cfg.npf_bb_alpha_min,
-        alpha_max=cfg.npf_bb_alpha_max,
-        ls_c=cfg.npf_bb_ls_c,
-        ls_shrink=cfg.npf_bb_ls_shrink,
-        ls_max_steps=cfg.npf_bb_ls_max_steps,
+        alpha0=getattr(cfg, bb_alpha0_attr),
+        alpha_min=getattr(cfg, bb_alpha_min_attr),
+        alpha_max=getattr(cfg, bb_alpha_max_attr),
+        ls_c=getattr(cfg, bb_ls_c_attr),
+        ls_shrink=getattr(cfg, bb_ls_shrink_attr),
+        ls_max_steps=getattr(cfg, bb_ls_max_steps_attr),
         reject_on_armijo_failure=True,
     )
 
@@ -107,7 +138,7 @@ def _solve_npf_icnn_map_with_zstar(
     z_adv = xi_train.detach().clone()
 
     for _epoch in range(cfg.epochs):
-        for _ in range(cfg.npf_omega_steps_per_epoch):
+        for _ in range(getattr(cfg, omega_steps_attr)):
 
             def omega_objective(create_graph: bool) -> torch.Tensor:
                 z_a = _npf_box_transport(xi_2d, psi, create_graph=create_graph).view(-1)
@@ -158,4 +189,48 @@ def solve_npf_icnn_map(
     b: torch.Tensor,
 ) -> Tuple[torch.Tensor, NPFInputConvexPotential, Dict[str, list]]:
     out = _solve_npf_icnn_map_with_zstar(xi_train, cfg, A0, A1, b)
+    return out["theta"], out["psi"], out["diagnostics"]
+
+
+def _solve_npf_lastquad_icnn_map_with_zstar(
+    xi_train: torch.Tensor,
+    cfg: ULSConfig,
+    A0: torch.Tensor,
+    A1: torch.Tensor,
+    b: torch.Tensor,
+) -> Dict[str, Any]:
+    return _solve_npf_icnn_map_with_zstar(
+        xi_train,
+        cfg,
+        A0,
+        A1,
+        b,
+        hidden_attr="npf_lastquad_hidden",
+        activation_attr="npf_lastquad_activation",
+        elu_alpha_attr="npf_lastquad_elu_alpha",
+        softplus_beta_attr="npf_lastquad_softplus_beta",
+        init_eps_attr="npf_lastquad_init_eps",
+        strong_convexity_attr="npf_lastquad_strong_convexity",
+        omega_steps_attr="npf_lastquad_omega_steps_per_epoch",
+        bb_alpha0_attr="npf_lastquad_bb_alpha0",
+        bb_alpha_min_attr="npf_lastquad_bb_alpha_min",
+        bb_alpha_max_attr="npf_lastquad_bb_alpha_max",
+        bb_ls_c_attr="npf_lastquad_bb_ls_c",
+        bb_ls_shrink_attr="npf_lastquad_bb_ls_shrink",
+        bb_ls_max_steps_attr="npf_lastquad_bb_ls_max_steps",
+        outer_rank=0,
+        inner_rank=0,
+        quadratic_mode="last_layer_diagonal",
+        trainable_outer_quadratic=False,
+    )
+
+
+def solve_npf_lastquad_icnn_map(
+    xi_train: torch.Tensor,
+    cfg: ULSConfig,
+    A0: torch.Tensor,
+    A1: torch.Tensor,
+    b: torch.Tensor,
+) -> Tuple[torch.Tensor, NPFInputConvexPotential, Dict[str, list]]:
+    out = _solve_npf_lastquad_icnn_map_with_zstar(xi_train, cfg, A0, A1, b)
     return out["theta"], out["psi"], out["diagnostics"]

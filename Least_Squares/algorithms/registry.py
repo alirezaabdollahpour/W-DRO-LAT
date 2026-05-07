@@ -8,7 +8,7 @@ from algorithms.erm import solve_erm_closed_form
 from algorithms.icnn import solve_icnn_map
 from algorithms.madry import solve_madry_pgd
 from algorithms.nn_dro import solve_nn_dro
-from algorithms.npf import solve_npf_icnn_map
+from algorithms.npf import solve_npf_icnn_map, solve_npf_lastquad_icnn_map
 from algorithms.particle_ascent import solve_Particle_Ascent
 from algorithms.ppa import solve_ppa
 from algorithms.wfr import solve_wfr
@@ -16,7 +16,7 @@ from algorithms.wgf import solve_wgf
 
 
 # Algorithms whose solver returns more than just theta (theta, psi[, diagnostics]).
-EXTENDED_RETURN_ALGORITHMS = {"icnn", "npf"}
+EXTENDED_RETURN_ALGORITHMS = {"icnn", "npf", "npf_lastquad"}
 
 
 RegistryEntry = Tuple[str, Callable[..., Any]]
@@ -33,5 +33,6 @@ def build_registry() -> Dict[str, RegistryEntry]:
         "madry": ("Madry PGD", solve_madry_pgd),
         "ppa": ("PPA", solve_ppa),
         "npf": ("WDRO-NPF", solve_npf_icnn_map),
+        "npf_lastquad": ("WDRO-NPF-LastQuad", solve_npf_lastquad_icnn_map),
         "nn_dro": ("NN-DRO", solve_nn_dro),
     }

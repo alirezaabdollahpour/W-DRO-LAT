@@ -18,19 +18,28 @@ def _solve_dual_with_zstar(
     A1: torch.Tensor,
     b: torch.Tensor,
 ) -> Dict[str, Any]:
-    theta = torch.zeros(cfg.dim_n, device=xi_train.device)
+    if cfg.lam <= 0.0:
+        raise ValueError("Dual solver requires cfg.lam > 0.")
+    if cfg.epsilon <= 0.0:
+        raise ValueError("Dual solver requires cfg.epsilon > 0.")
+    xi_train = xi_train.to(device=A0.device, dtype=A0.dtype)
+    theta = torch.zeros(cfg.dim_n, device=A0.device, dtype=A0.dtype)
     n_train = xi_train.numel()
-    levels = torch.arange(cfg.sinkhorn_sample_level + 1, device=xi_train.device)
-    numerators = 2.0 ** (-levels.to(torch.float64))
+    levels = torch.arange(cfg.sinkhorn_sample_level + 1, device=A0.device)
+    numerators = 2.0 ** (-levels.to(A0.dtype))
     denominator = 2.0 - 2.0 ** (-float(cfg.sinkhorn_sample_level))
-    probs = (numerators / denominator).to(torch.float64)
+    probs = numerators / denominator
     z_samples = xi_train.view(-1, 1)
 
     for _epoch in range(cfg.epochs):
         sampled_level = int(torch.multinomial(probs, num_samples=1).item())
         m = 2 ** sampled_level
 
-        noise = torch.randn((n_train, m), device=xi_train.device) * math.sqrt(cfg.epsilon)
+        noise = torch.randn(
+            (n_train, m),
+            device=A0.device,
+            dtype=A0.dtype,
+        ) * math.sqrt(cfg.epsilon)
         z_samples = xi_train.view(-1, 1) + noise
 
         v = loss_function(theta, z_samples.reshape(-1), A0, A1, b, cfg.dim_m).view(n_train, m)

@@ -58,7 +58,7 @@ class MLPAdversary(nn.Module):
 
     def forward(self, xi: torch.Tensor) -> torch.Tensor:
         act = _make_activation(self.activation_name, self.softplus_beta)
-        x = xi.view(xi.size(0), -1)
+        x = xi.reshape(xi.size(0), -1)
         h = x
         for layer in self.hidden:
             h = act(layer(h))

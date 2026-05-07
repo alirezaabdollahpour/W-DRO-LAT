@@ -17,6 +17,7 @@ STYLES = {
     "Madry PGD": {"color": "#e67300", "linestyle": (0, (1, 1))},
     "PPA": {"color": "#00ced1", "linestyle": (0, (3, 1, 1, 1, 1, 1))},
     "WDRO-NPF": {"color": "#1f77b4", "linestyle": "-"},
+    "WDRO-NPF-LastQuad": {"color": "#0072B2", "linestyle": (0, (4, 1))},
     "NN-DRO": {"color": "#8a2be2", "linestyle": (0, (5, 2, 1, 2))},
 }
 
