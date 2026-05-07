@@ -1,6 +1,6 @@
 """Wasserstein-Fisher-Rao (WFR) sampler in normalized CIFAR-10 input space.
 
-Mirrors ``Logistic_Regression_CIFAR10/algorithms/wfr.py``. Maintains
+Adapted from ``Logistic_Regression_CIFAR10/algorithms/wfr.py``. Maintains
 ``num_samples`` particles per data point and reweights them by the inner
 energy each step. The base trainer's outer loss uses the importance-
 weighted CE on the final particle ensemble (computed inside ``step``).
@@ -8,10 +8,9 @@ weighted CE on the final particle ensemble (computed inside ``step``).
 For uniform comparison with the other adversaries, the deterministic
 gradient component of the Langevin step is taken via the SAME
 BB+Armijo step rule as NPF. The Gaussian noise (the Fisher-Rao part)
-is then added on top, and the importance-reweighting / particle
-revival logic is unchanged. With ``cfg.bb_alpha_max`` matching the
-classical WFR step size, the deterministic component recovers the
-original behaviour up to BB's adaptive scaling.
+is then added on top. The deterministic drift and the particle
+reweighting use the same primary - lambda * ||z - x||^2 energy so the
+lambda convention matches the other DRO trainers.
 """
 from __future__ import annotations
 
@@ -23,8 +22,10 @@ import torch.nn.functional as F
 
 from ..utils import (
     BBArmijoState,
+    adversary_loss_per_sample,
     bb_armijo_step_tensor,
     clamped_normalized_copy,
+    frozen_module,
     set_requires_grad,
 )
 from .base import BaseAdvTrainer
@@ -44,6 +45,7 @@ class WFRTrainer(BaseAdvTrainer):
     def _sampler(self, x_orig: torch.Tensor, y: torch.Tensor):
         cfg = self.config
         lam = float(cfg.lambda_param)
+        use_margin = bool(cfg.use_margin_loss)
         eps = self.epsilon
         m = self.num_samples
         bs = x_orig.size(0)
@@ -60,7 +62,6 @@ class WFRTrainer(BaseAdvTrainer):
         wt_lr = self.inner_lr
         weight_exponent = 1.0 - lam * eps * wt_lr
         std_dev = math.sqrt(max(2.0 * self.inner_lr * lam * eps, 0.0))
-        criterion = nn.CrossEntropyLoss(reduction="none")
         low_weight_threshold = 1e-4
 
         # WFR's deterministic step is gradient ascent on
@@ -79,7 +80,9 @@ class WFRTrainer(BaseAdvTrainer):
         )
 
         def f_obj(z_var: torch.Tensor, create_graph: bool) -> torch.Tensor:
-            ce = criterion(self._classifier_module(z_var), y_rep)
+            ce = adversary_loss_per_sample(
+                self._classifier_module(z_var), y_rep, use_margin=use_margin
+            )
             cost = (z_var - x_anchor).reshape(z_var.size(0), -1).pow(2).sum(dim=1)
             return (ce - lam * cost).mean()
 
@@ -91,9 +94,13 @@ class WFRTrainer(BaseAdvTrainer):
                 else:
                     z = clamped_normalized_copy(z)
 
-                cur_loss = criterion(self._classifier_module(z), y_rep).view(bs, m)
+                cur_loss = adversary_loss_per_sample(
+                    self._classifier_module(z), y_rep, use_margin=use_margin
+                ).view(bs, m)
                 dist_sq = (z - x_anchor).reshape(bs * m, -1).pow(2).sum(dim=1).view(bs, m)
-                energy = cur_loss - 2.0 * lam * dist_sq
+                # Same objective as the deterministic drift:
+                # primary(classifier(z), y) - lambda * ||z - x||^2.
+                energy = cur_loss - lam * dist_sq
 
                 weights.pow_(weight_exponent)
                 weights.mul_(torch.exp(energy * wt_lr))
@@ -124,18 +131,16 @@ class WFRTrainer(BaseAdvTrainer):
         return z.detach(), weights.detach(), y_rep
 
     def step(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        self._classifier_module.eval()
-        set_requires_grad(self._classifier_module, False)
-        z, weights, y_rep = self._sampler(x, y)
-        # Stash for the WFR-specific outer update below.
-        self._wfr_z = z
-        self._wfr_w = weights
-        self._wfr_y_rep = y_rep
-        with torch.no_grad():
-            ce = F.cross_entropy(self._classifier_module(z), y_rep, reduction="none")
-            obj = (ce.view(weights.size(0), self.num_samples) * weights).sum(dim=1).mean()
-            self._last_inner_loss = float(obj.item())
-        set_requires_grad(self._classifier_module, True)
+        with frozen_module(self._classifier_module):
+            z, weights, y_rep = self._sampler(x, y)
+            # Stash for the WFR-specific outer update below.
+            self._wfr_z = z
+            self._wfr_w = weights
+            self._wfr_y_rep = y_rep
+            with torch.no_grad():
+                ce = F.cross_entropy(self._classifier_module(z), y_rep, reduction="none")
+                obj = (ce.view(weights.size(0), self.num_samples) * weights).sum(dim=1).mean()
+                self._last_inner_loss = float(obj.item())
         # Return the highest-weight particle per sample so the base trainer
         # can compute MSE / clean-vs-adv accuracy. The actual classifier
         # update overrides that path via ``classifier_update`` below.

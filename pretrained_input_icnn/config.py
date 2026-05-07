@@ -61,9 +61,9 @@ class TrainConfig:
     # When True, replace the per-sample CE in the adversary's primary loss
     # with the log-sum-exp margin: logsumexp_{j≠y}(logit_j - logit_y).
     # Mirrors the legacy ``--use-margin-loss`` flag in
-    # ``pretrained_INPUT_icnn.py``. Applied to NPF, NN-DRO, WRM, Madry,
-    # and New_PPA (CE is structural to WFR / Sinkhorn-Dual, so they
-    # ignore this knob).
+    # ``pretrained_INPUT_icnn.py``. Applied to the adversarial primary
+    # loss in every method; the outer classifier update remains CE for
+    # primal adversarial-training methods.
     use_margin_loss: bool = False
 
     # --- Inner-loop budget shared by NPF / NN-DRO ---
@@ -74,12 +74,14 @@ class TrainConfig:
     #   * NPF      — BB+Armijo on ω parameters (parametric variant)
     #   * NN-DRO   — BB+Armijo on MLP adversary parameters (replaces Adam)
     #   * WRM      — BB+Armijo on z (input-space variant)
-    #   * Madry    — BB+Armijo on z + post-step l2-ball projection
+    #   * Madry / RO is exempt: it uses fixed-step pixel-space l2-PGD
+    #     with epsilon and no lambda penalty.
     #   * WFR      — BB+Armijo on the deterministic gradient step;
     #                Langevin noise injected after
     #   * New_PPA  — BB+Armijo replaces the legacy WRM ascent inside each
     #                round; projection rounds unchanged
-    # Dual is exempt — its loss is closed-form (no per-batch inner ascent).
+    # Dual is exempt — its inner work is Langevin/MALA sampling of the
+    # entropic Gibbs target rather than BB ascent.
     # Defaults mirror NPF's settings from the LR-CIFAR10 reference so a
     # cross-method runtime comparison reflects only the per-method
     # objective cost, not the step rule.
@@ -130,15 +132,15 @@ class TrainConfig:
     wfr_inner_lr: float = 1e-2
 
     # --- Sinkhorn dual hyperparameters ---
-    # The legacy implementation draws m=2^sample_level Gaussian particles
-    # around x and computes the closed-form entropic dual on those.
+    # The one-shot implementation draws m=2^sample_level Gaussian particles
+    # around x and computes the same-lambda closed-form entropic dual on those.
     # Option D replaces the Gaussian-prior particles with honest samples
     # from the Gibbs target via a Langevin chain — set
     # ``dual_langevin_steps > 0`` to enable.
     dual_epsilon: float = 1e-3
     dual_sample_level: int = 5
     # Number of Langevin iterations per particle per batch. 0 keeps the
-    # legacy one-shot Gaussian behaviour.
+    # one-shot Gaussian behaviour.
     dual_langevin_steps: int = 0
     # Langevin step size η. Conservative default — start small; with
     # MALA enabled the accept rate is the right tuning signal (target
@@ -151,7 +153,7 @@ class TrainConfig:
     # Option D; pass --no-dual-mala for plain ULA (cheaper, biased).
     dual_mala: bool = True
     # Std of the initial Gaussian draw. None → sqrt(epsilon) (matches
-    # the legacy one-shot init exactly, so K=0 reproduces old behaviour).
+    # the one-shot Gaussian init exactly, so K=0 keeps that behaviour).
     dual_init_noise_scale: Optional[float] = None
     # Number of leading Langevin iterations to discard as burn-in
     # before the dual loss is computed. The discarded steps are still
@@ -262,7 +264,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Inner-loop budget
     parser.add_argument("--omega-steps-per-batch", type=int, default=10)
-    # Shared BB+Armijo step rule (applies to every algorithm with an inner ascent).
+    # Shared BB+Armijo step rule (DRO inner ascent only; Madry/RO uses PGD).
     bb = parser.add_argument_group("bb_armijo (shared step rule)")
     bb.add_argument("--bb-alpha0", type=float, default=2e-4)
     bb.add_argument("--bb-alpha-min", type=float, default=1e-7)
@@ -277,7 +279,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Use log-sum-exp margin objective for the adversary "
             "(logsumexp_{j!=y}(logit_j - logit_y)) instead of cross-entropy. "
-            "Applied to NPF, NN-DRO, WRM, Madry, New_PPA."
+            "Applied to every method's adversarial primary loss."
         ),
     )
     parser.add_argument(
@@ -342,7 +344,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dual-langevin-steps", type=int, default=0,
         help=(
             "Number of Langevin (or MALA) iterations per particle per batch "
-            "for Option-D rigorous inner sampling. 0 = legacy one-shot Gaussian."
+            "for Option-D rigorous inner sampling. 0 = one-shot Gaussian."
         ),
     )
     dual.add_argument("--dual-langevin-step-size", type=float, default=1e-3)

@@ -25,7 +25,7 @@ from ..utils import (
     bb_armijo_step_tensor,
     clamped_normalized_copy,
     free_weight_projection_images,
-    set_requires_grad,
+    frozen_module,
 )
 from .base import BaseAdvTrainer
 
@@ -84,8 +84,6 @@ class NewPPATrainer(BaseAdvTrainer):
         lam = float(cfg.lambda_param)
         use_margin = bool(cfg.use_margin_loss)
         clf = self._classifier_module
-        clf.eval()
-        set_requires_grad(clf, False)
 
         bb_kwargs = dict(
             bb_alpha0=cfg.bb_alpha0,
@@ -96,41 +94,41 @@ class NewPPATrainer(BaseAdvTrainer):
             bb_ls_max_steps=cfg.bb_ls_max_steps,
         )
 
-        # Round 0: BB+Armijo ascent (replaces diminishing-LR WRM).
-        z = _bb_armijo_ascent(
-            x, x, clf, y, lam,
-            num_steps=int(cfg.ppa_round0_steps),
-            use_margin=use_margin,
-            **bb_kwargs,
-        )
-
-        # Refinement rounds: alternate free-weight projection + BB+Armijo
-        # ascent, with adaptive early stopping on the projection gain.
-        for round_idx in range(1, max(1, int(cfg.ppa_num_rounds))):
-            z, _y_proj, gain, obj_scale, _ = free_weight_projection_images(
-                z, x, y, clf, lam, use_margin=use_margin
-            )
-            if (
-                round_idx >= int(cfg.ppa_min_rounds)
-                and gain <= float(cfg.ppa_gain_rtol) * max(obj_scale, 1e-12)
-            ):
-                break
+        with frozen_module(clf):
+            # Round 0: BB+Armijo ascent (replaces diminishing-LR WRM).
             z = _bb_armijo_ascent(
-                z, x, clf, y, lam,
-                num_steps=int(cfg.ppa_refine_steps),
+                x, x, clf, y, lam,
+                num_steps=int(cfg.ppa_round0_steps),
                 use_margin=use_margin,
                 **bb_kwargs,
             )
 
-        # Final projection so the outer step sees within-class best
-        # responses (matches MNIST_Cuturi's contract).
-        z, _y_proj, _, _, _ = free_weight_projection_images(
-            z, x, y, clf, lam, use_margin=use_margin
-        )
+            # Refinement rounds: alternate free-weight projection + BB+Armijo
+            # ascent, with adaptive early stopping on the projection gain.
+            for round_idx in range(1, max(1, int(cfg.ppa_num_rounds))):
+                z, _y_proj, gain, obj_scale, _ = free_weight_projection_images(
+                    z, x, y, clf, lam, use_margin=use_margin
+                )
+                if (
+                    round_idx >= int(cfg.ppa_min_rounds)
+                    and gain <= float(cfg.ppa_gain_rtol) * max(obj_scale, 1e-12)
+                ):
+                    break
+                z = _bb_armijo_ascent(
+                    z, x, clf, y, lam,
+                    num_steps=int(cfg.ppa_refine_steps),
+                    use_margin=use_margin,
+                    **bb_kwargs,
+                )
 
-        with torch.no_grad():
-            self._last_inner_loss = float(F.cross_entropy(clf(z), y).item())
-        set_requires_grad(clf, True)
+            # Final projection so the outer step sees within-class best
+            # responses (matches MNIST_Cuturi's contract).
+            z, _y_proj, _, _, _ = free_weight_projection_images(
+                z, x, y, clf, lam, use_margin=use_margin
+            )
+
+            with torch.no_grad():
+                self._last_inner_loss = float(F.cross_entropy(clf(z), y).item())
         return z.detach()
 
     def transport_for_eval(self, x: torch.Tensor) -> torch.Tensor:

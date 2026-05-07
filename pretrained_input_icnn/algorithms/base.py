@@ -303,10 +303,15 @@ class BaseAdvTrainer:
                 # Adversary's inner loop already ran inside step(); skip
                 # the classifier update so θ stays frozen this epoch.
                 loss = float(getattr(self, "_last_inner_loss", 0.0))
-                with torch.no_grad():
-                    acc = (
-                        self.classifier(x_adv).argmax(dim=1) == y
-                    ).float().mean().item()
+                was_training = self.classifier.training
+                self.classifier.eval()
+                try:
+                    with torch.no_grad():
+                        acc = (
+                            self.classifier(x_adv).argmax(dim=1) == y
+                        ).float().mean().item()
+                finally:
+                    self.classifier.train(was_training)
             else:
                 loss, acc = self.classifier_update(x_adv, y)
             with torch.no_grad():

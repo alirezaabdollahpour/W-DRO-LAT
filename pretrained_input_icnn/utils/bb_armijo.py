@@ -201,7 +201,7 @@ def bb_armijo_step_tensor(
     """Single BB+Armijo ASCENT step on an input-space variable z.
 
     The variable counterpart of :func:`bb_armijo_step_params` for the
-    methods (WRM / Madry / WFR / New_PPA) whose adversary updates the
+    methods (WRM / WFR / New_PPA) whose adversary updates the
     input z directly rather than a parametric module. ``f_obj(z_var,
     create_graph: bool) -> scalar tensor`` is the per-method DRO inner
     objective on the LOCAL batch (e.g.

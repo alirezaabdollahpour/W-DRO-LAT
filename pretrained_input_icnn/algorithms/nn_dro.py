@@ -24,6 +24,7 @@ from ..utils import (
     adversary_loss_per_sample,
     bb_armijo_step_params,
     clamped_normalized_copy,
+    frozen_module,
     set_requires_grad,
 )
 from .base import BaseAdvTrainer
@@ -65,37 +66,36 @@ class NNDROTrainer(BaseAdvTrainer):
         use_margin = bool(cfg.use_margin_loss)
 
         # Inner loop: BB+Armijo ascent on ω with the classifier frozen.
-        self._classifier_module.eval()
         self.adversary.train()
-        set_requires_grad(self._classifier_module, False)
         set_requires_grad(self.adversary, True)
 
-        def omega_objective(create_graph: bool) -> torch.Tensor:
-            x_adv = self._transport(x)  # MLP forward; create_graph unused
-            logits = self._classifier_module(x_adv)
-            primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
-            cost = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1)
-            obj = (primary - lam * cost).mean()
-            return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
+        with frozen_module(self._classifier_module):
+            def omega_objective(create_graph: bool) -> torch.Tensor:
+                x_adv = self._transport(x)  # MLP forward; create_graph unused
+                logits = self._classifier_module(x_adv)
+                primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
+                cost = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1)
+                obj = (primary - lam * cost).mean()
+                return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
-        # Same DDP reducers as NPF: ω is shared across ranks, so each
-        # rank's local gradient must be averaged before the step.
-        reduce_grad_fn = (
-            dist_helpers.all_reduce_grad_list if self.dist.is_distributed else None
-        )
-        reduce_scalar_fn = (
-            dist_helpers.all_reduce_scalar if self.dist.is_distributed else None
-        )
-
-        last_f_val = 0.0
-        for _ in range(int(cfg.omega_steps_per_batch)):
-            _, self.bb_state, last_f_val, _ = bb_armijo_step_params(
-                self.adversary.parameters(),
-                omega_objective,
-                self.bb_state,
-                reduce_grad_fn=reduce_grad_fn,
-                reduce_scalar_fn=reduce_scalar_fn,
+            # Same DDP reducers as NPF: ω is shared across ranks, so each
+            # rank's local gradient must be averaged before the step.
+            reduce_grad_fn = (
+                dist_helpers.all_reduce_grad_list if self.dist.is_distributed else None
             )
+            reduce_scalar_fn = (
+                dist_helpers.all_reduce_scalar if self.dist.is_distributed else None
+            )
+
+            last_f_val = 0.0
+            for _ in range(int(cfg.omega_steps_per_batch)):
+                _, self.bb_state, last_f_val, _ = bb_armijo_step_params(
+                    self.adversary.parameters(),
+                    omega_objective,
+                    self.bb_state,
+                    reduce_grad_fn=reduce_grad_fn,
+                    reduce_scalar_fn=reduce_scalar_fn,
+                )
         self._last_inner_loss = last_f_val
 
         self.adversary.eval()

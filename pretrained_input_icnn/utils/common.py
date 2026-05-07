@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import random
+from contextlib import contextmanager
+from typing import Iterator
 
 import numpy as np
 import torch
@@ -69,3 +71,21 @@ def cuda_sync() -> None:
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
     for p in module.parameters():
         p.requires_grad_(flag)
+
+
+@contextmanager
+def frozen_module(module: nn.Module, *, eval_mode: bool = True) -> Iterator[nn.Module]:
+    """Temporarily freeze a module's parameters and restore its prior state."""
+    was_training = module.training
+    params = list(module.parameters())
+    requires_grad = [p.requires_grad for p in params]
+    if eval_mode:
+        module.eval()
+    for p in params:
+        p.requires_grad_(False)
+    try:
+        yield module
+    finally:
+        for p, req in zip(params, requires_grad):
+            p.requires_grad_(req)
+        module.train(was_training)

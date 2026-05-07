@@ -2,6 +2,7 @@
 
 from .common import (
     cuda_sync,
+    frozen_module,
     get_device,
     set_deterministic,
     set_requires_grad,
@@ -27,6 +28,7 @@ from .adversary_loss import adversary_loss_per_sample
 
 __all__ = [
     "cuda_sync",
+    "frozen_module",
     "get_device",
     "set_deterministic",
     "set_seed_benchmark_mode",
