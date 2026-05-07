@@ -51,3 +51,14 @@ LLM/
 LLM/*
 FlowDRO/
 FlowDRO/*
+Moon
+Moon/*
+.xlxs
+*.xlxs
+*.xlx
+worst-case-generation-MLP/
+worst-case-generation-MLP/*
+worst-case-generation-MLP
+Drifting-ICNN/
+Drifting-ICNN/*
+Drifting-ICNN
