@@ -100,6 +100,25 @@ class TrainConfig:
     npf_bb_ls_shrink: float = 0.5
     npf_bb_ls_max_steps: int = 15
 
+    # NPF variant: no hidden-layer quadratic injections and one trainable
+    # rank-0 diagonal quadratic form at the output layer only.
+    npf_lastquad_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
+    npf_lastquad_activation: str = "softplus"
+    npf_lastquad_elu_alpha: float = 1.0
+    npf_lastquad_softplus_beta: float = 10.0
+    npf_lastquad_init_eps: float = 1e-4
+    inner_steps_npf_lastquad: int = 20
+    # Deprecated Adam lr, kept for CLI back-compat.
+    inner_lr_npf_lastquad: float = 1e-2
+    npf_lastquad_lr_B: float = 1e-3
+    npf_lastquad_weight_decay_B: float = 1e-4
+    npf_lastquad_bb_alpha0: float = 2e-4
+    npf_lastquad_bb_alpha_min: float = 1e-7
+    npf_lastquad_bb_alpha_max: float = 0.25
+    npf_lastquad_bb_ls_c: float = 1e-4
+    npf_lastquad_bb_ls_shrink: float = 0.5
+    npf_lastquad_bb_ls_max_steps: int = 15
+
     # NN-DRO knobs (vanilla-MLP adversary, no gradient-of-potential)
     nn_dro_hidden: Tuple[int, ...] = (512, 512, 256, 256, 128)
     nn_dro_activation: str = "relu"
@@ -124,7 +143,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "Figure 6 adversarial multiclass logistic regression on CIFAR-10 "
             "(ResNet-50 features). Competitors: SAA, Dual, WRM, RO, WGF, WFR, "
-            "SVG, RGO, ICNN, NPF, NN-DRO, PPA."
+            "SVG, RGO, ICNN, NPF, NPF-LastQuad, NN-DRO, PPA."
         )
     )
 
@@ -263,6 +282,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     npf.add_argument("--npf_bb_ls_shrink", type=float, default=0.5)
     npf.add_argument("--npf_bb_ls_max_steps", type=int, default=15)
 
+    # NPF last-layer diagonal quadratic variant knobs
+    npf_lq = parser.add_argument_group("npf_lastquad")
+    npf_lq.add_argument("--npf_lastquad_hidden", type=int, nargs="+",
+                        default=[512, 512, 256, 128, 64])
+    npf_lq.add_argument("--npf_lastquad_activation", type=str, default="softplus",
+                        choices=["elu", "softplus", "relu"])
+    npf_lq.add_argument("--npf_lastquad_elu_alpha", type=float, default=1.0)
+    npf_lq.add_argument("--npf_lastquad_softplus_beta", type=float, default=10.0)
+    npf_lq.add_argument("--npf_lastquad_init_eps", type=float, default=1e-4)
+    npf_lq.add_argument("--inner_steps_npf_lastquad", type=int, default=20)
+    npf_lq.add_argument("--inner_lr_npf_lastquad", type=float, default=1e-2,
+                        help="Deprecated: Adam lr is no longer used (now BB+Armijo).")
+    npf_lq.add_argument("--npf_lastquad_lr_B", type=float, default=1e-3)
+    npf_lq.add_argument("--npf_lastquad_weight_decay_B", type=float, default=1e-4)
+    npf_lq.add_argument("--npf_lastquad_bb_alpha0", type=float, default=2e-4,
+                        help="NPF-LastQuad BB+Armijo initial step size.")
+    npf_lq.add_argument("--npf_lastquad_bb_alpha_min", type=float, default=1e-7)
+    npf_lq.add_argument("--npf_lastquad_bb_alpha_max", type=float, default=0.25)
+    npf_lq.add_argument("--npf_lastquad_bb_ls_c", type=float, default=1e-4)
+    npf_lq.add_argument("--npf_lastquad_bb_ls_shrink", type=float, default=0.5)
+    npf_lq.add_argument("--npf_lastquad_bb_ls_max_steps", type=int, default=15)
+
     # NN-DRO knobs
     nn_dro = parser.add_argument_group("nn_dro")
     nn_dro.add_argument("--nn_dro_hidden", type=int, nargs="+",
@@ -308,6 +349,9 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
             continue
         if name == "npf_hidden":
             kwargs[name] = tuple(args.npf_hidden)
+            continue
+        if name == "npf_lastquad_hidden":
+            kwargs[name] = tuple(args.npf_lastquad_hidden)
             continue
         if name == "nn_dro_hidden":
             kwargs[name] = tuple(args.nn_dro_hidden)

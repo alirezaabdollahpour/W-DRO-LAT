@@ -3,6 +3,8 @@
 Architecture: per-layer diagonal + low-rank convex quadratic injections on
 top of a fixed strong-convexity base plus a learnable PSD residual, with
 non-negative hidden-to-hidden weights and a convex non-decreasing activation.
+The optional ``last_layer_diagonal`` mode keeps only one trainable rank-0
+diagonal quadratic form at the output layer.
 """
 from __future__ import annotations
 
@@ -123,6 +125,8 @@ class NPFInputConvexPotential(nn.Module):
         hidden_sizes: Sequence[int],
         outer_rank: int = 4,
         inner_rank: int = 1,
+        quadratic_mode: str = "all_layers",
+        trainable_outer_quadratic: bool = True,
         activation: str = "elu",
         elu_alpha: float = 1.0,
         softplus_beta: float = 20.0,
@@ -136,17 +140,37 @@ class NPFInputConvexPotential(nn.Module):
         self.hidden_sizes = [int(h) for h in hidden_sizes]
         self.outer_rank = int(outer_rank)
         self.inner_rank = int(inner_rank)
+        self.quadratic_mode = quadratic_mode.lower()
+        valid_modes = {"all_layers", "last_layer_diagonal"}
+        if self.quadratic_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported NPF quadratic_mode '{quadratic_mode}'. "
+                f"Use one of {sorted(valid_modes)}."
+            )
+        self.use_hidden_quadratics = self.quadratic_mode == "all_layers"
+        self.output_rank = (
+            0 if self.quadratic_mode == "last_layer_diagonal" else self.inner_rank
+        )
+        self.trainable_outer_quadratic = bool(trainable_outer_quadratic)
         self.activation = activation.lower()
         self.elu_alpha = float(elu_alpha)
         self.softplus_beta = float(softplus_beta)
         self.init_eps = float(init_eps)
         self.strong_convexity = float(strong_convexity)
 
-        outer_delta_init = self.init_eps if self.strong_convexity > 0.0 else 1.0
-        self.outer_delta_raw = nn.Parameter(
-            torch.full((self.input_dim,), _npf_softplus_inverse(outer_delta_init))
+        if self.trainable_outer_quadratic:
+            outer_delta_init = self.init_eps if self.strong_convexity > 0.0 else 1.0
+        else:
+            outer_delta_init = 0.0
+        outer_delta_raw = torch.full(
+            (self.input_dim,), _npf_softplus_inverse(outer_delta_init)
         )
-        if self.outer_rank > 0:
+        if self.trainable_outer_quadratic:
+            self.outer_delta_raw = nn.Parameter(outer_delta_raw)
+        else:
+            self.register_buffer("outer_delta_raw", outer_delta_raw)
+
+        if self.trainable_outer_quadratic and self.outer_rank > 0:
             if self.init_eps > 0.0:
                 std = self.init_eps / math.sqrt(
                     max(self.outer_rank * self.input_dim, 1)
@@ -168,15 +192,16 @@ class NPFInputConvexPotential(nn.Module):
         self.w_linears: nn.ModuleList = nn.ModuleList()
 
         for l, width in enumerate(self.hidden_sizes):
-            self.q_blocks.append(
-                NPFQuadraticForm(
-                    input_dim=self.input_dim,
-                    num_forms=width,
-                    rank=self.inner_rank,
-                    delta_init=0.0,
-                    init_eps=self.init_eps,
+            if self.use_hidden_quadratics:
+                self.q_blocks.append(
+                    NPFQuadraticForm(
+                        input_dim=self.input_dim,
+                        num_forms=width,
+                        rank=self.inner_rank,
+                        delta_init=0.0,
+                        init_eps=self.init_eps,
+                    )
                 )
-            )
             self.b_linears.append(nn.Linear(self.input_dim, width, bias=True))
             if l == 0:
                 self.w_linears.append(None)  # type: ignore[arg-type]
@@ -195,7 +220,7 @@ class NPFInputConvexPotential(nn.Module):
         self.q_out = NPFQuadraticForm(
             input_dim=self.input_dim,
             num_forms=1,
-            rank=self.inner_rank,
+            rank=self.output_rank,
             delta_init=0.0,
             init_eps=self.init_eps,
         )
@@ -206,7 +231,10 @@ class NPFInputConvexPotential(nn.Module):
         eps = self.init_eps
         delta_raw_init = _npf_softplus_inverse(eps) if eps > 0.0 else -1e3
         with torch.no_grad():
-            outer_delta_init = eps if self.strong_convexity > 0.0 else 1.0
+            if self.trainable_outer_quadratic:
+                outer_delta_init = eps if self.strong_convexity > 0.0 else 1.0
+            else:
+                outer_delta_init = 0.0
             self.outer_delta_raw.fill_(_npf_softplus_inverse(outer_delta_init))
             if self.outer_A is not None:
                 if eps > 0.0:
@@ -280,14 +308,15 @@ class NPFInputConvexPotential(nn.Module):
             )
         linear = z_flat @ self.outer_a
 
-        q0 = self.q_blocks[0](z_flat)
-        b0 = self.b_linears[0](z_flat)
-        h = self._act(q0 + b0)
+        hidden_input = self.b_linears[0](z_flat)
+        if self.use_hidden_quadratics:
+            hidden_input = hidden_input + self.q_blocks[0](z_flat)
+        h = self._act(hidden_input)
         for l in range(1, len(self.hidden_sizes)):
-            ql = self.q_blocks[l](z_flat)
-            bl = self.b_linears[l](z_flat)
-            wl = self.w_linears[l](h)
-            h = self._act(wl + ql + bl)
+            hidden_input = self.w_linears[l](h) + self.b_linears[l](z_flat)
+            if self.use_hidden_quadratics:
+                hidden_input = hidden_input + self.q_blocks[l](z_flat)
+            h = self._act(hidden_input)
 
         phi = (
             self.w_out(h).squeeze(-1)

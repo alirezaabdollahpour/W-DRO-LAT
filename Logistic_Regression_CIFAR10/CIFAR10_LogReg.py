@@ -16,6 +16,7 @@ Competitors
   * RGO (rejection sampling)
   * ICNN-DRO (Brenier transport-map adversary, our method)
   * NPF (Vesseron & Cuturi, 2024 — ICNN with per-layer quadratic injections)
+  * NPF-LastQuad (NPF variant with only a final rank-0 diagonal quadratic)
   * NN-DRO (vanilla-MLP adversary, no gradient-of-potential)
   * PPA (Projected Particle Ascent)
 
@@ -23,7 +24,7 @@ Usage
 -----
     python CIFAR10_LogReg.py --help
     python CIFAR10_LogReg.py
-    python CIFAR10_LogReg.py --methods SAA WRM RO ICNN NPF NN-DRO PPA
+    python CIFAR10_LogReg.py --methods SAA WRM RO ICNN NPF NPF-LastQuad NN-DRO PPA
 """
 from __future__ import annotations
 
@@ -143,6 +144,14 @@ def main() -> None:
             f"inner_rank={cfg.npf_inner_rank}, "
             f"activation={cfg.npf_activation}"
         )
+    if "NPF-LastQuad" in requested_methods:
+        print(
+            "NPF-LastQuad architecture: "
+            f"hidden={list(cfg.npf_lastquad_hidden)}, "
+            "quadratic_mode=last_layer_diagonal, "
+            "outer_rank=0, inner_rank=0, "
+            f"activation={cfg.npf_lastquad_activation}"
+        )
 
     # Train shared (ε_ent-independent) algorithms once.
     shared_models: Dict[str, Any] = {}
@@ -255,6 +264,16 @@ def main() -> None:
                     "elu_alpha": cfg.npf_elu_alpha,
                     "softplus_beta": cfg.npf_softplus_beta,
                     "init_eps": cfg.npf_init_eps,
+                },
+                "NPF-LastQuad": {
+                    "hidden": list(cfg.npf_lastquad_hidden),
+                    "quadratic_mode": "last_layer_diagonal",
+                    "outer_rank": 0,
+                    "inner_rank": 0,
+                    "activation": cfg.npf_lastquad_activation,
+                    "elu_alpha": cfg.npf_lastquad_elu_alpha,
+                    "softplus_beta": cfg.npf_lastquad_softplus_beta,
+                    "init_eps": cfg.npf_lastquad_init_eps,
                 }
             },
             "method_timings": {

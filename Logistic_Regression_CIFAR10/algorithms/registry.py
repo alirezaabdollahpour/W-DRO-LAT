@@ -3,7 +3,8 @@
 Separates:
 
 * ``SHARED_ALGORITHMS`` — algorithms independent of ε_ent (SAA, WRM, RO, ICNN,
-  NPF, NN-DRO, PPA). These are trained once and evaluated for every ε_ent value.
+  NPF, NPF-LastQuad, NN-DRO, PPA). These are trained once and evaluated for
+  every ε_ent value.
 * ``EPS_ENT_ALGORITHMS`` — algorithms whose hyperparameters depend on ε_ent
   (Dual, WGF, WFR, SVG, RGO). Re-trained for each ε_ent value.
 """
@@ -29,7 +30,16 @@ from algorithms.wrm import WRM
 
 
 # Algorithms whose training is independent of ε_ent.
-SHARED_ALGORITHMS = ("SAA", "WRM", "RO", "ICNN", "NPF", "NN-DRO", "PPA")
+SHARED_ALGORITHMS = (
+    "SAA",
+    "WRM",
+    "RO",
+    "ICNN",
+    "NPF",
+    "NPF-LastQuad",
+    "NN-DRO",
+    "PPA",
+)
 
 # Algorithms whose ε_ent is a training-time hyperparameter.
 EPS_ENT_ALGORITHMS = ("Dual", "WGF", "WFR", "SVG", "RGO")
@@ -46,6 +56,7 @@ ALL_ALGORITHMS = (
     "RGO",
     "ICNN",
     "NPF",
+    "NPF-LastQuad",
     "NN-DRO",
     "PPA",
 )
@@ -151,6 +162,38 @@ def _build_npf(cfg, input_dim: int, num_classes: int, device: torch.device, eps_
         weight_decay_B=cfg.npf_weight_decay_B,
         max_itr=cfg.epochs,
         batch_size=cfg.batch_size,
+    )
+
+
+def _build_npf_lastquad(
+    cfg, input_dim: int, num_classes: int, device: torch.device, eps_ent: float
+) -> BaseLinearDRO:
+    return NPF(
+        input_dim,
+        num_classes,
+        device=device.type,
+        lambda_param=cfg.lambda_param,
+        npf_hidden=tuple(cfg.npf_lastquad_hidden),
+        npf_outer_rank=0,
+        npf_inner_rank=0,
+        npf_quadratic_mode="last_layer_diagonal",
+        npf_trainable_outer_quadratic=False,
+        npf_activation=cfg.npf_lastquad_activation,
+        npf_elu_alpha=cfg.npf_lastquad_elu_alpha,
+        npf_softplus_beta=cfg.npf_lastquad_softplus_beta,
+        npf_init_eps=cfg.npf_lastquad_init_eps,
+        omega_steps_per_batch=cfg.inner_steps_npf_lastquad,
+        bb_alpha0=cfg.npf_lastquad_bb_alpha0,
+        bb_alpha_min=cfg.npf_lastquad_bb_alpha_min,
+        bb_alpha_max=cfg.npf_lastquad_bb_alpha_max,
+        bb_ls_c=cfg.npf_lastquad_bb_ls_c,
+        bb_ls_shrink=cfg.npf_lastquad_bb_ls_shrink,
+        bb_ls_max_steps=cfg.npf_lastquad_bb_ls_max_steps,
+        lr_B=cfg.npf_lastquad_lr_B,
+        weight_decay_B=cfg.npf_lastquad_weight_decay_B,
+        max_itr=cfg.epochs,
+        batch_size=cfg.batch_size,
+        method_name="NPF-LastQuad",
     )
 
 
@@ -277,6 +320,7 @@ BUILDERS: Dict[str, Builder] = {
     "RO": _build_ro,
     "ICNN": _build_icnn,
     "NPF": _build_npf,
+    "NPF-LastQuad": _build_npf_lastquad,
     "NN-DRO": _build_nn_dro,
     "PPA": _build_ppa,
     "Dual": _build_dual,

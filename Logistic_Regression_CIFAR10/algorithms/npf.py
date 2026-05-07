@@ -50,6 +50,8 @@ class NPF(BaseLinearDRO):
         npf_hidden: Sequence[int] = (512, 512, 256, 128, 64),
         npf_outer_rank: int = 8,
         npf_inner_rank: int = 2,
+        npf_quadratic_mode: str = "all_layers",
+        npf_trainable_outer_quadratic: bool = True,
         npf_activation: str = "softplus",
         npf_elu_alpha: float = 1.0,
         npf_softplus_beta: float = 10.0,
@@ -67,6 +69,7 @@ class NPF(BaseLinearDRO):
         max_itr: int = 10,
         batch_size: int = 128,
         device: str = "cpu",
+        method_name: str = "NPF",
     ):
         self.device = torch.device(
             device if device == "cuda" and torch.cuda.is_available() else "cpu"
@@ -79,6 +82,7 @@ class NPF(BaseLinearDRO):
         self.weight_decay_B = float(weight_decay_B)
         self.max_itr = int(max_itr)
         self.batch_size = int(batch_size)
+        self.method_name = str(method_name)
 
         self.model = make_linear_model(
             self.input_dim, self.num_classes, self.fit_intercept, self.device
@@ -89,6 +93,8 @@ class NPF(BaseLinearDRO):
             hidden_sizes=npf_hidden,
             outer_rank=npf_outer_rank,
             inner_rank=npf_inner_rank,
+            quadratic_mode=npf_quadratic_mode,
+            trainable_outer_quadratic=npf_trainable_outer_quadratic,
             activation=npf_activation,
             elu_alpha=npf_elu_alpha,
             softplus_beta=npf_softplus_beta,
@@ -133,7 +139,10 @@ class NPF(BaseLinearDRO):
             epoch_loss_record = 0.0
             pbar = tqdm(
                 dataloader,
-                desc=f"Run {run_id+1} Training NPF Epoch {epoch+1}/{self.max_itr}",
+                desc=(
+                    f"Run {run_id+1} Training {self.method_name} "
+                    f"Epoch {epoch+1}/{self.max_itr}"
+                ),
                 leave=False,
             )
             for x_original_batch, y_original_batch in pbar:
@@ -201,7 +210,7 @@ class NPF(BaseLinearDRO):
                     "B_state_dict": self.model.state_dict(),
                     "psi_omega_state_dict": self.psi_omega.state_dict(),
                 },
-                f"{checkpoint_dir}/NPF_run{run_id}_epoch_{epoch+1}.pth",
+                f"{checkpoint_dir}/{self.method_name}_run{run_id}_epoch_{epoch+1}.pth",
             )
 
         # Diagnostic: ``outer_a`` is the linear term of the convex potential
@@ -211,7 +220,7 @@ class NPF(BaseLinearDRO):
         # reviewer can spot this without re-loading the checkpoint.
         try:
             outer_a_norm = float(self.psi_omega.outer_a.detach().norm().item())
-            print(f"[NPF] final ||outer_a||_2 = {outer_a_norm:.4e}")
+            print(f"[{self.method_name}] final ||outer_a||_2 = {outer_a_norm:.4e}")
         except AttributeError:
             pass
 

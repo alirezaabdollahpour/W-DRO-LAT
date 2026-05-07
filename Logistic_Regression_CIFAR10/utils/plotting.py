@@ -70,7 +70,21 @@ def plot_figure6_panels(
     if len(eps_ent_list) == 1:
         axes = [axes]
 
-    methods_order = ["RGO", "WGF", "SAA", "Dual", "WRM", "RO", "WFR", "SVG", "ICNN", "NPF", "NN-DRO", "PPA"]
+    methods_order = [
+        "RGO",
+        "WGF",
+        "SAA",
+        "Dual",
+        "WRM",
+        "RO",
+        "WFR",
+        "SVG",
+        "ICNN",
+        "NPF",
+        "NPF-LastQuad",
+        "NN-DRO",
+        "PPA",
+    ]
 
     for ax, eps_ent in zip(axes, eps_ent_list):
         results_for_eps = all_results_by_eps_ent[eps_ent]
