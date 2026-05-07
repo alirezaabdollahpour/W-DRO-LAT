@@ -4,6 +4,14 @@ Mirrors ``Logistic_Regression_CIFAR10/algorithms/wfr.py``. Maintains
 ``num_samples`` particles per data point and reweights them by the inner
 energy each step. The base trainer's outer loss uses the importance-
 weighted CE on the final particle ensemble (computed inside ``step``).
+
+For uniform comparison with the other adversaries, the deterministic
+gradient component of the Langevin step is taken via the SAME
+BB+Armijo step rule as NPF. The Gaussian noise (the Fisher-Rao part)
+is then added on top, and the importance-reweighting / particle
+revival logic is unchanged. With ``cfg.bb_alpha_max`` matching the
+classical WFR step size, the deterministic component recovers the
+original behaviour up to BB's adaptive scaling.
 """
 from __future__ import annotations
 
@@ -13,7 +21,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..utils import clamped_normalized_copy, set_requires_grad
+from ..utils import (
+    BBArmijoState,
+    bb_armijo_step_tensor,
+    clamped_normalized_copy,
+    set_requires_grad,
+)
 from .base import BaseAdvTrainer
 
 
@@ -50,14 +63,33 @@ class WFRTrainer(BaseAdvTrainer):
         criterion = nn.CrossEntropyLoss(reduction="none")
         low_weight_threshold = 1e-4
 
+        # WFR's deterministic step is gradient ascent on
+        # ``CE(classifier(z), y_rep) - λ ||z - x_anchor||^2`` (this is
+        # the WRM-style Langevin drift; see Sinha et al. and the WFR
+        # paper). We take that step via BB+Armijo, then add Langevin
+        # noise. BB state is fresh per batch.
+        bb_state = BBArmijoState.create(
+            alpha0=cfg.bb_alpha0,
+            alpha_min=cfg.bb_alpha_min,
+            alpha_max=cfg.bb_alpha_max,
+            ls_c=cfg.bb_ls_c,
+            ls_shrink=cfg.bb_ls_shrink,
+            ls_max_steps=cfg.bb_ls_max_steps,
+            reject_on_armijo_failure=True,
+        )
+
+        def f_obj(z_var: torch.Tensor, create_graph: bool) -> torch.Tensor:
+            ce = criterion(self._classifier_module(z_var), y_rep)
+            cost = (z_var - x_anchor).reshape(z_var.size(0), -1).pow(2).sum(dim=1)
+            return (ce - lam * cost).mean()
+
         for _ in range(self.inner_steps):
-            z.requires_grad_(True)
-            losses = criterion(self._classifier_module(z), y_rep)
-            grads = torch.autograd.grad(losses.sum(), z, create_graph=False)[0]
+            z, bb_state, _, _ = bb_armijo_step_tensor(z, f_obj, bb_state)
             with torch.no_grad():
-                mean = z.detach() + self.inner_lr * (grads - 2.0 * lam * (z.detach() - x_anchor))
-                noise = torch.randn_like(mean) * std_dev if std_dev > 0 else 0.0
-                z = clamped_normalized_copy(mean + noise) if std_dev > 0 else clamped_normalized_copy(mean)
+                if std_dev > 0:
+                    z = clamped_normalized_copy(z + torch.randn_like(z) * std_dev)
+                else:
+                    z = clamped_normalized_copy(z)
 
                 cur_loss = criterion(self._classifier_module(z), y_rep).view(bs, m)
                 dist_sq = (z - x_anchor).reshape(bs * m, -1).pow(2).sum(dim=1).view(bs, m)

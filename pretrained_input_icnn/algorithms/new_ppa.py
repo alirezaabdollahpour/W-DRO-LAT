@@ -1,22 +1,28 @@
-"""New_PPA: free-weight projected particle ascent.
+"""New_PPA: free-weight projected particle ascent — BB+Armijo on z.
 
-Adapted from ``MNIST_Cuturi/algorithms/new_ppa.py``: round 0 is a WRM
+Adapted from ``MNIST_Cuturi/algorithms/new_ppa.py``: round 0 is an inner
 ascent on the inputs; refinement rounds alternate within-class best-
-response projection with a constant-LR WRM ascent anchored at the original
+response projection with another inner ascent anchored at the original
 inputs. Ranges are clamped to the valid normalized CIFAR-10 pixel bounds
 each step. Early-stop the refinement when the marginal gain falls below
 ``ppa_gain_rtol`` * (running objective scale).
+
+The original LR-CIFAR10 reference uses constant-LR WRM ascent inside
+each round. Here we replace that with the SAME BB+Armijo step rule
+used by NPF, applied to z directly. The projection rounds are
+unchanged; BB state is fresh at the start of each ascent burst because
+z is anchored / re-projected between bursts.
 """
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils import (
+    BBArmijoState,
     adversary_loss_per_sample,
+    bb_armijo_step_tensor,
     clamped_normalized_copy,
     free_weight_projection_images,
     set_requires_grad,
@@ -24,29 +30,49 @@ from ..utils import (
 from .base import BaseAdvTrainer
 
 
-def _wrm_ascent(
+def _bb_armijo_ascent(
     z0: torch.Tensor,
     x_anchor: torch.Tensor,
     classifier: nn.Module,
     y: torch.Tensor,
     lam: float,
     num_steps: int,
-    lr: float,
-    diminishing: bool,
     use_margin: bool,
-    step_offset: int = 0,
+    bb_alpha0: float,
+    bb_alpha_min: float,
+    bb_alpha_max: float,
+    bb_ls_c: float,
+    bb_ls_shrink: float,
+    bb_ls_max_steps: int,
 ) -> torch.Tensor:
+    """BB+Armijo ascent on ``primary(classifier(z), y) - λ ||z - x_anchor||^2``.
+
+    The penalty is anchored to the ORIGINAL inputs (matches the legacy
+    ``wrm_ascent_x_anchored`` semantics from MNIST_Cuturi). BB state is
+    fresh — between PPA rounds the projection moves z to a different
+    sample within its class, breaking any history we'd hope to reuse.
+    """
     if num_steps <= 0:
         return z0.detach()
+    bb_state = BBArmijoState.create(
+        alpha0=bb_alpha0,
+        alpha_min=bb_alpha_min,
+        alpha_max=bb_alpha_max,
+        ls_c=bb_ls_c,
+        ls_shrink=bb_ls_shrink,
+        ls_max_steps=bb_ls_max_steps,
+        reject_on_armijo_failure=True,
+    )
+
+    def f_obj(z_var: torch.Tensor, create_graph: bool) -> torch.Tensor:
+        primary = adversary_loss_per_sample(classifier(z_var), y, use_margin=use_margin)
+        cost = (z_var - x_anchor).reshape(z_var.size(0), -1).pow(2).sum(dim=1)
+        return (primary - lam * cost).mean()
+
     z = z0.detach().clone()
-    for s in range(1 + step_offset, num_steps + 1 + step_offset):
-        z.requires_grad_(True)
-        primary = adversary_loss_per_sample(classifier(z), y, use_margin=use_margin)
-        grads = torch.autograd.grad(primary.sum(), z, create_graph=False)[0]
-        eta = lr / math.sqrt(s) if diminishing else lr
-        with torch.no_grad():
-            z = z.detach() + eta * (grads - 2.0 * lam * (z.detach() - x_anchor))
-            z = clamped_normalized_copy(z)
+    for _ in range(int(num_steps)):
+        z, bb_state, _, _ = bb_armijo_step_tensor(z, f_obj, bb_state)
+        z = clamped_normalized_copy(z)
     return z.detach()
 
 
@@ -61,17 +87,25 @@ class NewPPATrainer(BaseAdvTrainer):
         clf.eval()
         set_requires_grad(clf, False)
 
-        # Round 0: diminishing-LR WRM ascent.
-        z = _wrm_ascent(
-            x, x, clf, y, lam,
-            num_steps=int(cfg.ppa_round0_steps),
-            lr=float(cfg.ppa_round0_lr),
-            diminishing=True,
-            use_margin=use_margin,
+        bb_kwargs = dict(
+            bb_alpha0=cfg.bb_alpha0,
+            bb_alpha_min=cfg.bb_alpha_min,
+            bb_alpha_max=cfg.bb_alpha_max,
+            bb_ls_c=cfg.bb_ls_c,
+            bb_ls_shrink=cfg.bb_ls_shrink,
+            bb_ls_max_steps=cfg.bb_ls_max_steps,
         )
 
-        # Refinement rounds: alternate free-weight projection + constant-LR
-        # WRM ascent, with adaptive early stopping on the projection gain.
+        # Round 0: BB+Armijo ascent (replaces diminishing-LR WRM).
+        z = _bb_armijo_ascent(
+            x, x, clf, y, lam,
+            num_steps=int(cfg.ppa_round0_steps),
+            use_margin=use_margin,
+            **bb_kwargs,
+        )
+
+        # Refinement rounds: alternate free-weight projection + BB+Armijo
+        # ascent, with adaptive early stopping on the projection gain.
         for round_idx in range(1, max(1, int(cfg.ppa_num_rounds))):
             z, _y_proj, gain, obj_scale, _ = free_weight_projection_images(
                 z, x, y, clf, lam, use_margin=use_margin
@@ -81,12 +115,11 @@ class NewPPATrainer(BaseAdvTrainer):
                 and gain <= float(cfg.ppa_gain_rtol) * max(obj_scale, 1e-12)
             ):
                 break
-            z = _wrm_ascent(
+            z = _bb_armijo_ascent(
                 z, x, clf, y, lam,
                 num_steps=int(cfg.ppa_refine_steps),
-                lr=float(cfg.ppa_refine_lr),
-                diminishing=False,
                 use_margin=use_margin,
+                **bb_kwargs,
             )
 
         # Final projection so the outer step sees within-class best

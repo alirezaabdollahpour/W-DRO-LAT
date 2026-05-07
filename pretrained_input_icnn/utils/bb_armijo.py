@@ -189,3 +189,84 @@ def bb_armijo_step_params(
             nn_utils.vector_to_parameters(params_vec, params)
         new_state = bb_state
     return params, new_state, f_val_float, grad_norm
+
+
+def bb_armijo_step_tensor(
+    z: torch.Tensor,
+    f_obj,
+    bb_state: BBArmijoState,
+    reduce_grad_fn=None,
+    reduce_scalar_fn=None,
+) -> Tuple[torch.Tensor, BBArmijoState, float, float]:
+    """Single BB+Armijo ASCENT step on an input-space variable z.
+
+    The variable counterpart of :func:`bb_armijo_step_params` for the
+    methods (WRM / Madry / WFR / New_PPA) whose adversary updates the
+    input z directly rather than a parametric module. ``f_obj(z_var,
+    create_graph: bool) -> scalar tensor`` is the per-method DRO inner
+    objective on the LOCAL batch (e.g.
+    ``primary_loss(classifier(z), y) - lambda * ||z - x||^2``).
+
+    DDP semantics: in input-space methods each rank's z lives on its
+    OWN batch shard, so unlike :func:`bb_armijo_step_params` we never
+    all-reduce gradients. The reducers default to ``None``; the
+    function is single-rank by construction. Pass them only when you
+    explicitly want a globally-synced step (rare for input-space).
+
+    Returns ``(new_z, new_state, f_val, grad_norm)`` — ``f_val`` is the
+    objective at the START of the step (matches the parametric variant
+    so logging stays consistent).
+    """
+    z_orig = z.detach()
+    z_var = z_orig.clone().requires_grad_(True)
+    f_val = f_obj(z_var, True)
+    grad = torch.autograd.grad(f_val, z_var, create_graph=False, retain_graph=False)[0].detach()
+    if reduce_grad_fn is not None:
+        grad = reduce_grad_fn([grad])[0]
+    if reduce_scalar_fn is not None:
+        f_val_float = float(reduce_scalar_fn(f_val.detach()))
+    else:
+        f_val_float = float(f_val.detach())
+
+    grad_vec = grad.reshape(-1)
+    z_vec = z_orig.reshape(-1)
+    grad_norm = float(grad_vec.norm().item())
+
+    if (
+        not math.isfinite(f_val_float)
+        or not torch.isfinite(grad_vec).all()
+        or not math.isfinite(grad_norm)
+    ):
+        return z_orig, bb_state, f_val_float, grad_norm
+
+    alpha = bb_state.propose(z_vec, grad_vec)
+    g_dot_g = float(torch.dot(grad_vec, grad_vec).item())
+    if g_dot_g <= 0.0 or not math.isfinite(g_dot_g):
+        return z_orig, bb_state, f_val_float, grad_norm
+
+    alpha_k = alpha
+    armijo_succeeded = False
+    for i in range(bb_state.ls_max_steps):
+        trial = z_orig + alpha_k * grad
+        with torch.no_grad():
+            f_trial_t = f_obj(trial, False).detach()
+            if reduce_scalar_fn is not None:
+                f_trial = float(reduce_scalar_fn(f_trial_t))
+            else:
+                f_trial = float(f_trial_t)
+        if (
+            math.isfinite(f_trial)
+            and f_trial >= f_val_float + bb_state.ls_c * alpha_k * g_dot_g
+        ):
+            armijo_succeeded = True
+            break
+        if i < bb_state.ls_max_steps - 1:
+            alpha_k *= bb_state.ls_shrink
+
+    if armijo_succeeded or not bb_state.reject_on_armijo_failure:
+        new_z = z_orig + alpha_k * grad
+        new_state = bb_state.update_history(z_vec, grad_vec, alpha_k)
+    else:
+        new_z = z_orig
+        new_state = bb_state
+    return new_z.detach(), new_state, f_val_float, grad_norm

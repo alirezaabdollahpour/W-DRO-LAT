@@ -60,13 +60,16 @@ class NPFTrainer(BaseAdvTrainer):
         # the non-negative layers' constructor.
         self.psi_omega.init_as_identity()
 
+        # Shared BB+Armijo config — same hyperparameters as every other
+        # adversary in the comparison. NPF was the source of the defaults
+        # so behaviour is unchanged.
         self.bb_state = BBArmijoState.create(
-            alpha0=cfg.npf_bb_alpha0,
-            alpha_min=cfg.npf_bb_alpha_min,
-            alpha_max=cfg.npf_bb_alpha_max,
-            ls_c=cfg.npf_bb_ls_c,
-            ls_shrink=cfg.npf_bb_ls_shrink,
-            ls_max_steps=cfg.npf_bb_ls_max_steps,
+            alpha0=cfg.bb_alpha0,
+            alpha_min=cfg.bb_alpha_min,
+            alpha_max=cfg.bb_alpha_max,
+            ls_c=cfg.bb_ls_c,
+            ls_shrink=cfg.bb_ls_shrink,
+            ls_max_steps=cfg.bb_ls_max_steps,
             reject_on_armijo_failure=True,
         )
 

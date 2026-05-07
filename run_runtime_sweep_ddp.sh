@@ -1,23 +1,41 @@
 #!/bin/bash
 # =============================================================================
-# Input-ICNN Runtime Sweep — DDP edition (publication ready)
+# Input-ICNN Runtime Sweep — DDP edition (BB+Armijo across-the-board)
 # =============================================================================
 #
 # Fair runtime comparison across 7 input-space adversarial training
 # algorithms on CIFAR-10, with each run distributed across NPROC GPUs
 # via torchrun + DistributedDataParallel.
 #
-# Algorithms (all evaluated at the SAME inner-iteration budget K):
-#   * NPF       — Vesseron–Cuturi NPF ICNN with BB+Armijo ω-ascent
-#                 (cross-rank gradient + scalar reductions wired into
-#                  bb_armijo_step_params; ω stays in lockstep)
-#   * NN-DRO    — vanilla MLP adversary, Adam ascent, ω-grads all-reduced
-#                 before each Adam.step()
-#   * Madry     — l2-PGD, attacks each rank's local batch shard
-#   * WRM       — Sinha-style ascent, local batch, no ω state to sync
-#   * WFR       — Wasserstein-Fisher-Rao sampler, local particles
-#   * Dual      — Sinkhorn entropic dual, local noise samples
-#   * New_PPA   — WRM + free-weight projection, local batch
+# Adversaries (all using the SAME BB+Armijo step rule for fair comparison):
+#   * NPF      — NPF ICNN potential, BB+Armijo on ω parameters
+#   * NN-DRO   — vanilla MLP adversary, BB+Armijo on ω parameters
+#                (replaces the legacy Adam ascent)
+#   * Madry    — l2-PGD threat model, BB+Armijo on z + post-step
+#                projection back to the eps-ball + clamp
+#   * WRM      — WRM inner objective on z, BB+Armijo step rule
+#                (replaces constant-LR ascent)
+#   * WFR      — particle ensemble + reweighting, BB+Armijo on the
+#                deterministic gradient component, Langevin noise added
+#                after (replaces constant-LR Langevin)
+#   * New_PPA  — BB+Armijo ascent inside each round (replaces WRM ascent),
+#                free-weight projection rounds unchanged
+#   * Dual     — Sinkhorn entropic dual. Two operating modes:
+#                  – DUAL_LANGEVIN_STEPS=0: legacy closed-form estimator
+#                    (one-shot Gaussian particles around x). Fast but the
+#                    samples come from the prior, not the Gibbs target,
+#                    so the inner integral isn't actually solved.
+#                  – DUAL_LANGEVIN_STEPS>0: Option-D rigorous inner
+#                    sampling. Each particle is refined via a Langevin
+#                    chain on the Gibbs target π(z|x) ∝ exp(U(z)),
+#                    optionally MH-corrected (DUAL_MALA=1, default) for
+#                    unbiased samples. The Sinkhorn dual loss is then
+#                    computed on the refined particles. The legacy
+#                    closed-form is recovered exactly at K=0.
+#
+# All BB+Armijo hyperparameters (alpha0, alpha_min, alpha_max, ls_c,
+# ls_shrink, ls_max_steps) are SHARED across the 6 inner-ascent
+# methods, defaulting to NPF's settings from the LR-CIFAR10 reference.
 #
 # ---- Parallelism strategy ----
 #
@@ -25,6 +43,12 @@
 # is wrapped in DDP; on classifier_update the gradient all-reduce fires
 # automatically. Inner adversary loops use the unwrapped module so DDP's
 # reducer state isn't corrupted by forward-without-backward.
+#
+# For the parametric adversaries (NPF, NN-DRO) the BB+Armijo step
+# all-reduces ω-gradients across ranks so every rank picks the same
+# Armijo trial step. For the input-space adversaries (WRM/Madry/WFR/PPA)
+# each rank runs an independent BB+Armijo ascent on its local batch
+# shard — no cross-rank sync is meaningful since z lives on the shard.
 #
 # Per-rank batch_size = BATCH_SIZE / NPROC, so the GLOBAL effective batch
 # matches the single-GPU configuration for fair throughput comparison.
@@ -34,10 +58,15 @@
 #
 # ---- Fairness rules baked in ----
 #
-#   * Same hyperparameters across algorithms (epochs, lr, λ, batch).
+#   * Same outer hyperparameters (epochs, lr_theta, λ, global batch).
 #   * Same K=20 inner-iteration budget (per-algorithm interpretation
-#     applied: NPF ω-steps=K, WRM/WFR inner_steps=K, Madry pgd_steps=K,
-#     New_PPA round0_steps=refine_steps=K, Dual sample_level=min(K,5)).
+#     applied: NPF/NN-DRO omega_steps=K, WRM/WFR inner_steps=K, Madry
+#     pgd_steps=K, New_PPA round0_steps=refine_steps=K, Dual
+#     langevin_steps=K via the Option-D MALA sampler).
+#   * Same BB+Armijo step rule and hyperparameters across all six
+#     inner-ascent methods (Dual uses the Langevin/MALA sampler, not
+#     BB+Armijo, since its inner objective is a Gibbs density to sample
+#     from rather than an adversarial loss to maximise per-sample).
 #   * --skip-pgd-during-train: PGD eval would otherwise dominate.
 #   * --benchmark-mode: cuDNN autotune + TF32, identical for all algos.
 #   * Sequential (no in-script concurrency on the same GPUs).
@@ -104,16 +133,60 @@ LR_THETA=${LR_THETA:-0.1}
 INP_P=${INP_P:-2}
 INP_EPS=${INP_EPS:-0.5}
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
-NUM_WORKERS=${NUM_WORKERS:-4}
+# Conservative default — cluster containers typically ship with a tiny
+# /dev/shm (Docker's 64 MB default) and 4 workers/rank × 4 ranks = 16
+# worker processes is enough to exhaust it. CIFAR-10 fits in RAM and the
+# GPU adversary work dominates wallclock, so 2 workers/rank is plenty.
+# Set NUM_WORKERS=0 if you still hit "No space left on device".
+NUM_WORKERS=${NUM_WORKERS:-2}
 EPOCHS_ICNN_PRETRAIN=${EPOCHS_ICNN_PRETRAIN:-0}
+
+# ---- Shared BB+Armijo step rule (overridable; defaults match NPF's) ----
+BB_ALPHA0=${BB_ALPHA0:-2e-4}
+BB_ALPHA_MIN=${BB_ALPHA_MIN:-1e-7}
+BB_ALPHA_MAX=${BB_ALPHA_MAX:-0.25}
+BB_LS_C=${BB_LS_C:-1e-4}
+BB_LS_SHRINK=${BB_LS_SHRINK:-0.5}
+BB_LS_MAX_STEPS=${BB_LS_MAX_STEPS:-15}
+BB_ARGS=(
+  --bb-alpha0 "${BB_ALPHA0}"
+  --bb-alpha-min "${BB_ALPHA_MIN}"
+  --bb-alpha-max "${BB_ALPHA_MAX}"
+  --bb-ls-c "${BB_LS_C}"
+  --bb-ls-shrink "${BB_LS_SHRINK}"
+  --bb-ls-max-steps "${BB_LS_MAX_STEPS}"
+)
+
+# ---- Dual Option-D Langevin / MALA inner sampler ----
+# DUAL_LANGEVIN_STEPS=0 keeps the legacy one-shot Gaussian estimator
+# (closed-form Sinkhorn dual). >0 enables iterative MCMC refinement of
+# each particle on the Gibbs target. Defaults below assume DUAL_EPSILON=0.05;
+# η ≈ ε is a good starting point — MALA's accept rate is the right
+# tuning signal (target ~0.5–0.8). Set DUAL_MALA=0 for plain ULA
+# (cheaper, biased).
+DUAL_EPSILON=${DUAL_EPSILON:-0.05}
+DUAL_LANGEVIN_STEPS=${DUAL_LANGEVIN_STEPS:-${K}}
+DUAL_LANGEVIN_STEP_SIZE=${DUAL_LANGEVIN_STEP_SIZE:-5e-3}
+DUAL_MALA=${DUAL_MALA:-1}
+DUAL_BURN_IN=${DUAL_BURN_IN:-0}
+DUAL_SAMPLE_LEVEL=${DUAL_SAMPLE_LEVEL:-3}  # m=8 — keeps wallclock comparable
 
 # ---- Pre-flight ----
 echo ""
 echo "================================================================"
-echo "  Input-ICNN Runtime Sweep — DDP"
+echo "  Input-ICNN Runtime Sweep — DDP (BB+Armijo across all methods)"
 echo "  SPLIT=${SPLIT}  SEED=${SEED}  NPROC=${NPROC}  K=${K}"
 echo "  Epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
 echo "  Margin loss: ${USE_MARGIN_LOSS}"
+echo "  BB+Armijo:   alpha0=${BB_ALPHA0}  alpha=[${BB_ALPHA_MIN}, ${BB_ALPHA_MAX}]"
+echo "                ls_c=${BB_LS_C}  shrink=${BB_LS_SHRINK}  ls_max=${BB_LS_MAX_STEPS}"
+if [ "${DUAL_LANGEVIN_STEPS}" -gt 0 ]; then
+    echo "  Dual mode:   Option-D Langevin/MALA sampler"
+    echo "                eps=${DUAL_EPSILON}  m=2^${DUAL_SAMPLE_LEVEL}  K_langevin=${DUAL_LANGEVIN_STEPS}"
+    echo "                eta=${DUAL_LANGEVIN_STEP_SIZE}  MALA=${DUAL_MALA}  burn_in=${DUAL_BURN_IN}"
+else
+    echo "  Dual mode:   legacy one-shot Gaussian (closed-form Sinkhorn)"
+fi
 echo "  Results: ${RESULTS_DIR}"
 echo "  Started: $(date)"
 echo "================================================================"
@@ -134,6 +207,12 @@ fi
 # Per-algorithm config keyed off K (the shared inner-iteration budget).
 # ======================================================================
 algo_args() {
+    # Per-algorithm flags. The shared --bb-* hyperparameters are added
+    # by the runner outside of this function so every adversary uses
+    # the SAME BB+Armijo step rule. Note that legacy step-size flags
+    # like --wrm-inner-lr / --madry-pgd-step-size / --nn-dro-inner-lr
+    # are passed but IGNORED in BB+Armijo mode — the inner step size is
+    # picked adaptively by the line search.
     local algo="$1" k="$2"
     case "$algo" in
         npf)
@@ -141,34 +220,44 @@ algo_args() {
                 --npf-hidden 1024 512 512 256 128 64 \
                 --npf-outer-rank 8 --npf-inner-rank 2 \
                 --npf-activation softplus --npf-softplus-beta 10.0 \
-                --npf-init-eps 1e-4 --npf-strong-convexity 1.0 \
-                --npf-bb-alpha0 2e-4 --npf-bb-alpha-min 1e-7 --npf-bb-alpha-max 0.25 \
-                --npf-bb-ls-c 1e-4 --npf-bb-ls-shrink 0.5 --npf-bb-ls-max-steps 15"
+                --npf-init-eps 1e-4 --npf-strong-convexity 1.0"
             ;;
         nn_dro)
             echo "--omega-steps-per-batch ${k} \
                 --nn-dro-hidden 512 512 256 256 128 \
                 --nn-dro-activation relu --nn-dro-softplus-beta 20.0 \
-                --nn-dro-init-scale 1e-3 --nn-dro-inner-lr 1e-2"
+                --nn-dro-init-scale 1e-3"
             ;;
         madry)
             echo "--madry-epsilon ${INP_EPS} --madry-pgd-steps ${k} --madry-pgd-restarts 1"
             ;;
         wrm)
-            echo "--wrm-inner-steps ${k} --wrm-inner-lr 1e-2"
+            echo "--wrm-inner-steps ${k}"
             ;;
         wfr)
-            echo "--wfr-inner-steps ${k} --wfr-num-samples 8 --wfr-epsilon 0.1 --wfr-inner-lr 1e-2"
+            echo "--wfr-inner-steps ${k} --wfr-num-samples 8 --wfr-epsilon 0.1"
             ;;
         dual)
-            local lvl=$k
-            if [ "$lvl" -gt 5 ]; then lvl=5; fi
-            echo "--dual-epsilon 1e-3 --dual-sample-level ${lvl}"
+            # Option-D rigorous inner sampling: each particle is refined
+            # via a Langevin chain on the Gibbs target before the
+            # Sinkhorn dual loss. With DUAL_LANGEVIN_STEPS=0 the run
+            # falls back to the legacy one-shot closed-form estimator
+            # (no inner ascent — Dual is then the only method without
+            # iterative inner work, kept for back-compat and as a
+            # fast-but-biased reference).
+            local mala_flag="--no-dual-mala"
+            if [ "$DUAL_MALA" = "1" ]; then mala_flag="--dual-mala"; fi
+            echo "--dual-epsilon ${DUAL_EPSILON} \
+                --dual-sample-level ${DUAL_SAMPLE_LEVEL} \
+                --dual-langevin-steps ${DUAL_LANGEVIN_STEPS} \
+                --dual-langevin-step-size ${DUAL_LANGEVIN_STEP_SIZE} \
+                --dual-burn-in ${DUAL_BURN_IN} \
+                ${mala_flag}"
             ;;
         new_ppa)
             echo "--ppa-num-rounds 5 --ppa-min-rounds 2 \
-                --ppa-round0-steps ${k} --ppa-round0-lr 1e-2 \
-                --ppa-refine-steps ${k} --ppa-refine-lr 5e-3 \
+                --ppa-round0-steps ${k} \
+                --ppa-refine-steps ${k} \
                 --ppa-gain-rtol 1e-4"
             ;;
     esac
@@ -222,6 +311,10 @@ run_algo() {
             TIME_CMD="/usr/bin/time -v -o ${TIME_FILE}"
         fi
 
+        # The shared --bb-* knobs are passed to every algorithm. They
+        # are consumed only by methods using BB+Armijo (NPF, NN-DRO,
+        # WRM, Madry, WFR, New_PPA); Dual parses them and ignores them
+        # since it uses the Langevin/MALA sampler instead.
         $TIME_CMD torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC} \
             -m pretrained_input_icnn.main \
             --algorithm "$ALGO" \
@@ -238,6 +331,7 @@ run_algo() {
             --skip-pgd-during-train \
             --benchmark-mode \
             $([ "$USE_MARGIN_LOSS" = "1" ] && echo "--use-margin-loss") \
+            "${BB_ARGS[@]}" \
             --seed "$SEED" \
             --save "${OUT_DIR}/final.pth" \
             --log-csv "$CSV" \

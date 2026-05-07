@@ -1,22 +1,28 @@
-"""NN-DRO competitor: vanilla MLP adversary trained with Adam ascent.
+"""NN-DRO competitor: vanilla MLP adversary, BB+Armijo ascent on ω.
 
 Mirrors ``Logistic_Regression_CIFAR10/algorithms/nn_dro.py``: the adversary
 is parametrised directly as ``T_ω(x) = x + h_ω(x)`` with ``h_ω`` a plain
 MLP. We clamp the resulting adversarial inputs to the valid normalized
 pixel range so the classifier is never fed values outside its training
 support.
+
+The original LR-CIFAR10 reference used Adam on ω. Here we replace that
+with the SAME BB+Armijo step rule used by NPF, so every parametric
+adversary in the runtime sweep is optimised by an identical step rule
+and only the adversary architecture differs.
 """
 from __future__ import annotations
 
 from typing import Any, Dict
 
 import torch
-import torch.optim as optim
 
 from .. import distributed as dist_helpers
 from ..models.nn_dro import MLPAdversary
 from ..utils import (
+    BBArmijoState,
     adversary_loss_per_sample,
+    bb_armijo_step_params,
     clamped_normalized_copy,
     set_requires_grad,
 )
@@ -38,7 +44,17 @@ class NNDROTrainer(BaseAdvTrainer):
             softplus_beta=cfg.nn_dro_softplus_beta,
             init_scale=cfg.nn_dro_init_scale,
         ).to(self.device)
-        self.inner_opt = optim.Adam(self.adversary.parameters(), lr=cfg.nn_dro_inner_lr)
+        # Persistent BB+Armijo state on the MLP adversary parameters —
+        # ω lives across batches so the (s, y) history carries over.
+        self.bb_state = BBArmijoState.create(
+            alpha0=cfg.bb_alpha0,
+            alpha_min=cfg.bb_alpha_min,
+            alpha_max=cfg.bb_alpha_max,
+            ls_c=cfg.bb_ls_c,
+            ls_shrink=cfg.bb_ls_shrink,
+            ls_max_steps=cfg.bb_ls_max_steps,
+            reject_on_armijo_failure=True,
+        )
 
     def _transport(self, x: torch.Tensor) -> torch.Tensor:
         return clamped_normalized_copy(self.adversary(x))
@@ -48,27 +64,39 @@ class NNDROTrainer(BaseAdvTrainer):
         lam = float(cfg.lambda_param)
         use_margin = bool(cfg.use_margin_loss)
 
-        # Inner loop: Adam ascent on ω with the classifier frozen.
+        # Inner loop: BB+Armijo ascent on ω with the classifier frozen.
         self._classifier_module.eval()
         self.adversary.train()
         set_requires_grad(self._classifier_module, False)
         set_requires_grad(self.adversary, True)
 
-        last_obj = 0.0
-        for _ in range(int(cfg.omega_steps_per_batch)):
-            self.inner_opt.zero_grad(set_to_none=True)
-            x_adv = self._transport(x)
+        def omega_objective(create_graph: bool) -> torch.Tensor:
+            x_adv = self._transport(x)  # MLP forward; create_graph unused
             logits = self._classifier_module(x_adv)
             primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
             cost = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1)
             obj = (primary - lam * cost).mean()
-            (-obj).backward()
-            # All-reduce ω gradients before Adam.step() — Adam's update
-            # is local, so without this each rank would diverge in ω.
-            dist_helpers.all_reduce_grads_(self.adversary.parameters())
-            self.inner_opt.step()
-            last_obj = float(obj.detach().item())
-        self._last_inner_loss = last_obj
+            return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
+
+        # Same DDP reducers as NPF: ω is shared across ranks, so each
+        # rank's local gradient must be averaged before the step.
+        reduce_grad_fn = (
+            dist_helpers.all_reduce_grad_list if self.dist.is_distributed else None
+        )
+        reduce_scalar_fn = (
+            dist_helpers.all_reduce_scalar if self.dist.is_distributed else None
+        )
+
+        last_f_val = 0.0
+        for _ in range(int(cfg.omega_steps_per_batch)):
+            _, self.bb_state, last_f_val, _ = bb_armijo_step_params(
+                self.adversary.parameters(),
+                omega_objective,
+                self.bb_state,
+                reduce_grad_fn=reduce_grad_fn,
+                reduce_scalar_fn=reduce_scalar_fn,
+            )
+        self._last_inner_loss = last_f_val
 
         self.adversary.eval()
         set_requires_grad(self.adversary, False)

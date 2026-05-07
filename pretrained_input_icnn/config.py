@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 ALL_ALGORITHMS: Tuple[str, ...] = (
     "npf",
@@ -69,6 +69,27 @@ class TrainConfig:
     # --- Inner-loop budget shared by NPF / NN-DRO ---
     omega_steps_per_batch: int = 10
 
+    # --- Shared BB+Armijo step rule ---
+    # Applied UNIFORMLY across all adversaries that have an inner ascent:
+    #   * NPF      — BB+Armijo on ω parameters (parametric variant)
+    #   * NN-DRO   — BB+Armijo on MLP adversary parameters (replaces Adam)
+    #   * WRM      — BB+Armijo on z (input-space variant)
+    #   * Madry    — BB+Armijo on z + post-step l2-ball projection
+    #   * WFR      — BB+Armijo on the deterministic gradient step;
+    #                Langevin noise injected after
+    #   * New_PPA  — BB+Armijo replaces the legacy WRM ascent inside each
+    #                round; projection rounds unchanged
+    # Dual is exempt — its loss is closed-form (no per-batch inner ascent).
+    # Defaults mirror NPF's settings from the LR-CIFAR10 reference so a
+    # cross-method runtime comparison reflects only the per-method
+    # objective cost, not the step rule.
+    bb_alpha0: float = 2e-4
+    bb_alpha_min: float = 1e-7
+    bb_alpha_max: float = 0.25
+    bb_ls_c: float = 1e-4
+    bb_ls_shrink: float = 0.5
+    bb_ls_max_steps: int = 15
+
     # --- NPF hyperparameters (LR-CIFAR10 defaults) ---
     npf_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
     npf_outer_rank: int = 8
@@ -109,8 +130,34 @@ class TrainConfig:
     wfr_inner_lr: float = 1e-2
 
     # --- Sinkhorn dual hyperparameters ---
+    # The legacy implementation draws m=2^sample_level Gaussian particles
+    # around x and computes the closed-form entropic dual on those.
+    # Option D replaces the Gaussian-prior particles with honest samples
+    # from the Gibbs target via a Langevin chain — set
+    # ``dual_langevin_steps > 0`` to enable.
     dual_epsilon: float = 1e-3
     dual_sample_level: int = 5
+    # Number of Langevin iterations per particle per batch. 0 keeps the
+    # legacy one-shot Gaussian behaviour.
+    dual_langevin_steps: int = 0
+    # Langevin step size η. Conservative default — start small; with
+    # MALA enabled the accept rate is the right tuning signal (target
+    # 0.5–0.8). Without MALA, η must be tiny to keep ULA's bias bounded.
+    dual_langevin_step_size: float = 1e-3
+    # When True, accept/reject each Langevin proposal via the
+    # Metropolis-Hastings ratio — gives unbiased samples from the Gibbs
+    # target at the cost of one extra fwd+bwd per Langevin step (to
+    # evaluate the drift at the proposal). Default True for "rigorous"
+    # Option D; pass --no-dual-mala for plain ULA (cheaper, biased).
+    dual_mala: bool = True
+    # Std of the initial Gaussian draw. None → sqrt(epsilon) (matches
+    # the legacy one-shot init exactly, so K=0 reproduces old behaviour).
+    dual_init_noise_scale: Optional[float] = None
+    # Number of leading Langevin iterations to discard as burn-in
+    # before the dual loss is computed. The discarded steps are still
+    # taken (they advance the chain), but the final loss is computed
+    # on the post-burn-in state. 0 = no burn-in.
+    dual_burn_in: int = 0
 
     # --- New_PPA hyperparameters ---
     ppa_num_rounds: int = 5
@@ -215,6 +262,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Inner-loop budget
     parser.add_argument("--omega-steps-per-batch", type=int, default=10)
+    # Shared BB+Armijo step rule (applies to every algorithm with an inner ascent).
+    bb = parser.add_argument_group("bb_armijo (shared step rule)")
+    bb.add_argument("--bb-alpha0", type=float, default=2e-4)
+    bb.add_argument("--bb-alpha-min", type=float, default=1e-7)
+    bb.add_argument("--bb-alpha-max", type=float, default=0.25)
+    bb.add_argument("--bb-ls-c", type=float, default=1e-4)
+    bb.add_argument("--bb-ls-shrink", type=float, default=0.5)
+    bb.add_argument("--bb-ls-max-steps", type=int, default=15)
     parser.add_argument(
         "--use-margin-loss",
         dest="use_margin_loss",
@@ -283,6 +338,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dual = parser.add_argument_group("dual")
     dual.add_argument("--dual-epsilon", type=float, default=1e-3)
     dual.add_argument("--dual-sample-level", type=int, default=5)
+    dual.add_argument(
+        "--dual-langevin-steps", type=int, default=0,
+        help=(
+            "Number of Langevin (or MALA) iterations per particle per batch "
+            "for Option-D rigorous inner sampling. 0 = legacy one-shot Gaussian."
+        ),
+    )
+    dual.add_argument("--dual-langevin-step-size", type=float, default=1e-3)
+    dual.add_argument(
+        "--dual-mala", dest="dual_mala", action="store_true",
+        help="MH-correct the Langevin proposals (unbiased; one extra fwd+bwd per step).",
+    )
+    dual.add_argument(
+        "--no-dual-mala", dest="dual_mala", action="store_false",
+        help="Use plain ULA (biased but cheaper).",
+    )
+    parser.set_defaults(dual_mala=True)
+    dual.add_argument(
+        "--dual-init-noise-scale", type=float, default=None,
+        help="Std of the initial Gaussian particle draw. Default sqrt(epsilon).",
+    )
+    dual.add_argument("--dual-burn-in", type=int, default=0)
 
     # New_PPA
     ppa = parser.add_argument_group("new_ppa")
@@ -358,6 +435,12 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "weight_decay": "weight_decay",
         "seed": "seed",
         "omega_steps_per_batch": "omega_steps_per_batch",
+        "bb_alpha0": "bb_alpha0",
+        "bb_alpha_min": "bb_alpha_min",
+        "bb_alpha_max": "bb_alpha_max",
+        "bb_ls_c": "bb_ls_c",
+        "bb_ls_shrink": "bb_ls_shrink",
+        "bb_ls_max_steps": "bb_ls_max_steps",
         "use_margin_loss": "use_margin_loss",
         "npf_hidden": "npf_hidden",
         "npf_outer_rank": "npf_outer_rank",
@@ -390,6 +473,11 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "wfr_inner_lr": "wfr_inner_lr",
         "dual_epsilon": "dual_epsilon",
         "dual_sample_level": "dual_sample_level",
+        "dual_langevin_steps": "dual_langevin_steps",
+        "dual_langevin_step_size": "dual_langevin_step_size",
+        "dual_mala": "dual_mala",
+        "dual_init_noise_scale": "dual_init_noise_scale",
+        "dual_burn_in": "dual_burn_in",
         "ppa_num_rounds": "ppa_num_rounds",
         "ppa_min_rounds": "ppa_min_rounds",
         "ppa_round0_steps": "ppa_round0_steps",
