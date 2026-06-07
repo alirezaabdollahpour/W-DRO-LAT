@@ -14,6 +14,7 @@ from .transforms import (
     clamp_normalized_inputs_,
     clamped_normalized_copy,
     normalized_pixel_bounds,
+    pixel_l2_squared,
     to_normalized,
     to_pixel,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "clamp_normalized_inputs_",
     "clamped_normalized_copy",
     "normalized_pixel_bounds",
+    "pixel_l2_squared",
     "BBArmijoState",
     "bb_armijo_step_params",
     "bb_armijo_step_tensor",

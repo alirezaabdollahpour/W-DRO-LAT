@@ -19,6 +19,9 @@ Two operating modes:
 
       U(z) = ℓ(f_θ(z), y) / (2λε)  −  ‖z − x‖² / (2ε).
 
+  The classifier sees normalized CIFAR tensors, but the Gaussian prior
+  and squared distance above are interpreted in pixel coordinates [0, 1].
+
   The shared factor 2 makes the zero-temperature limit
   ``max_z ℓ(f_θ(z), y) - λ‖z - x‖²``, matching NPF / NN-DRO / WRM /
   WFR / New_PPA. The ½ factor in the quadratic term comes from the
@@ -59,7 +62,10 @@ from ..utils import (
     clamped_normalized_copy,
     frozen_module,
     normalized_pixel_bounds,
+    pixel_l2_squared,
     set_requires_grad,
+    to_normalized,
+    to_pixel,
 )
 from .base import BaseAdvTrainer
 
@@ -96,9 +102,10 @@ class SDRODualTrainer(BaseAdvTrainer):
         """Tile x and y to m copies per sample. Returns (x_rep, y_rep, z_init)."""
         x_rep = x.repeat_interleave(m, dim=0)
         y_rep = y.repeat_interleave(m, dim=0)
-        z_init = clamped_normalized_copy(
-            x_rep + self.init_noise_scale * torch.randn_like(x_rep)
+        z_init_pix = (to_pixel(x_rep) + self.init_noise_scale * torch.randn_like(x_rep)).clamp(
+            0.0, 1.0
         )
+        z_init = to_normalized(z_init_pix)
         return x_rep, y_rep, z_init
 
     def _U_and_grad(
@@ -117,7 +124,7 @@ class SDRODualTrainer(BaseAdvTrainer):
         ce = adversary_loss_per_sample(
             logits, y_rep, use_margin=bool(self.config.use_margin_loss)
         )
-        sq = (z_in - x_rep).reshape(z_in.size(0), -1).pow(2).sum(dim=1)
+        sq = pixel_l2_squared(z_in, x_rep)
         U_per_particle = ce / lam_eps - 0.5 * sq / self.epsilon
         # autograd.grad wrt z_in returns dU_total/dz_in. We want
         # dU_per_particle / dz_in (per-particle drift). Since U_per_particle

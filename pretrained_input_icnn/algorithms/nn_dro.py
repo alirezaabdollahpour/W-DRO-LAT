@@ -6,6 +6,9 @@ MLP. We clamp the resulting adversarial inputs to the valid normalized
 pixel range so the classifier is never fed values outside its training
 support.
 
+The Wasserstein penalty is measured in pixel coordinates [0, 1] even
+though the adversary and classifier exchange normalized CIFAR tensors.
+
 The original LR-CIFAR10 reference used Adam on ω. Here we replace that
 with the SAME BB+Armijo step rule used by NPF, so every parametric
 adversary in the runtime sweep is optimised by an identical step rule
@@ -25,6 +28,7 @@ from ..utils import (
     bb_armijo_step_params,
     clamped_normalized_copy,
     frozen_module,
+    pixel_l2_squared,
     set_requires_grad,
 )
 from .base import BaseAdvTrainer
@@ -74,7 +78,7 @@ class NNDROTrainer(BaseAdvTrainer):
                 x_adv = self._transport(x)  # MLP forward; create_graph unused
                 logits = self._classifier_module(x_adv)
                 primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
-                cost = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1)
+                cost = pixel_l2_squared(x_adv, x)
                 obj = (primary - lam * cost).mean()
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 

@@ -10,7 +10,8 @@ gradient component of the Langevin step is taken via the SAME
 BB+Armijo step rule as NPF. The Gaussian noise (the Fisher-Rao part)
 is then added on top. The deterministic drift and the particle
 reweighting use the same primary - lambda * ||z - x||^2 energy so the
-lambda convention matches the other DRO trainers.
+lambda convention matches the other DRO trainers. The squared transport
+cost and Langevin noise scale are interpreted in pixel coordinates [0, 1].
 """
 from __future__ import annotations
 
@@ -26,7 +27,10 @@ from ..utils import (
     bb_armijo_step_tensor,
     clamped_normalized_copy,
     frozen_module,
+    pixel_l2_squared,
     set_requires_grad,
+    to_normalized,
+    to_pixel,
 )
 from .base import BaseAdvTrainer
 
@@ -83,21 +87,22 @@ class WFRTrainer(BaseAdvTrainer):
             ce = adversary_loss_per_sample(
                 self._classifier_module(z_var), y_rep, use_margin=use_margin
             )
-            cost = (z_var - x_anchor).reshape(z_var.size(0), -1).pow(2).sum(dim=1)
+            cost = pixel_l2_squared(z_var, x_anchor)
             return (ce - lam * cost).mean()
 
         for _ in range(self.inner_steps):
             z, bb_state, _, _ = bb_armijo_step_tensor(z, f_obj, bb_state)
             with torch.no_grad():
                 if std_dev > 0:
-                    z = clamped_normalized_copy(z + torch.randn_like(z) * std_dev)
+                    z_pix = (to_pixel(z) + torch.randn_like(z) * std_dev).clamp(0.0, 1.0)
+                    z = to_normalized(z_pix)
                 else:
                     z = clamped_normalized_copy(z)
 
                 cur_loss = adversary_loss_per_sample(
                     self._classifier_module(z), y_rep, use_margin=use_margin
                 ).view(bs, m)
-                dist_sq = (z - x_anchor).reshape(bs * m, -1).pow(2).sum(dim=1).view(bs, m)
+                dist_sq = pixel_l2_squared(z, x_anchor).view(bs, m)
                 # Same objective as the deterministic drift:
                 # primary(classifier(z), y) - lambda * ||z - x||^2.
                 energy = cur_loss - lam * dist_sq

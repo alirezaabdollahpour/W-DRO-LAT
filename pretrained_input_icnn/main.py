@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -43,15 +44,31 @@ _LOG_FIELDS = (
     "train_acc",
     "train_mse",
     "inner_loss",
+    "adversary_loss_type",
+    "train_adv_loss",
+    "train_transport_cost",
+    "train_weighted_penalty",
+    "train_inner_objective",
     "epoch_seconds",
     "test_loss",
     "test_acc",
+    "clean_loss",
+    "clean_acc",
     "adv_loss",
     "adv_acc",
     "adv_penalty",
+    "eval_transport_cost",
+    "eval_transport_weighted_penalty",
+    "transport_adv_loss",
+    "transport_adv_acc",
     "input_pgd_acc",
+    "input_pgd_clean_acc",
+    "input_pgd_clean_correct",
+    "input_pgd_robust_correct",
     "input_pgd_avg_l2",
     "input_pgd_avg_linf",
+    "input_pgd_max_l2",
+    "input_pgd_max_linf",
     "input_pgd_samples",
     "lambda_param",
     "lr_theta",
@@ -62,14 +79,86 @@ _LOG_FIELDS = (
 
 
 def _append_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    rows = list(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = path.exists()
+    if file_exists:
+        with path.open(newline="") as f:
+            reader = csv.reader(f)
+            try:
+                fieldnames = next(reader)
+            except StopIteration:
+                fieldnames = list(_LOG_FIELDS)
+    else:
+        extra_fields = sorted(
+            {
+                key
+                for row in rows
+                for key in row.keys()
+                if key not in _LOG_FIELDS
+            }
+        )
+        fieldnames = list(_LOG_FIELDS) + extra_fields
     with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(_LOG_FIELDS))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
         for row in rows:
-            writer.writerow({k: row.get(k) for k in _LOG_FIELDS})
+            writer.writerow({k: row.get(k) for k in fieldnames})
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    return value
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_json_ready(payload), indent=2, allow_nan=False))
+
+
+def _metric_definitions(use_margin_loss: bool) -> Dict[str, str]:
+    adv_loss = (
+        "Mean logsumexp margin on T_omega(x): logsumexp_{j != y}(logit_j - logit_y)."
+        if use_margin_loss
+        else "Mean cross-entropy on T_omega(x)."
+    )
+    return {
+        "train_loss": "Outer classifier update loss: cross-entropy on adversarial training inputs.",
+        "train_acc": "Outer classifier accuracy on adversarial training inputs.",
+        "inner_loss": "Last optimizer-reported inner objective value for the batch, averaged over the epoch.",
+        "train_adv_loss": adv_loss,
+        "train_transport_cost": "Mean raw transport cost ||T_omega(x) - x||_2^2 in pixel coordinates on training batches.",
+        "train_mse": "Backward-compatible alias for train_transport_cost; despite the old name, this is now pixel-space squared L2.",
+        "train_weighted_penalty": "lambda_param * train_transport_cost.",
+        "train_inner_objective": "train_adv_loss - train_weighted_penalty.",
+        "clean_loss": "Clean test cross-entropy after the epoch.",
+        "clean_acc": "Clean test accuracy after the epoch.",
+        "transport_adv_loss": "Test cross-entropy under the learned transport adversary.",
+        "transport_adv_acc": "Test accuracy under the learned transport adversary after the epoch.",
+        "input_pgd_acc": "Robust test accuracy under the input-space PGD attack after the epoch.",
+        "input_pgd_clean_acc": "Clean accuracy on exactly the examples evaluated by input-space PGD.",
+        "input_pgd_clean_correct": "Number of PGD-evaluated examples classified correctly before attack.",
+        "input_pgd_robust_correct": "Number of PGD-evaluated examples still correct after attack.",
+        "input_pgd_avg_l2": "Average pixel-space L2 perturbation norm selected by PGD.",
+        "input_pgd_avg_linf": "Average pixel-space Linf perturbation norm selected by PGD.",
+        "input_pgd_max_l2": "Maximum pixel-space L2 perturbation norm selected by PGD.",
+        "input_pgd_max_linf": "Maximum pixel-space Linf perturbation norm selected by PGD.",
+        "eval_transport_cost": "Mean raw pixel-space squared L2 test-set transport cost under transport_for_eval.",
+        "eval_transport_weighted_penalty": "lambda_param * eval_transport_cost.",
+        "profile_*": (
+            "Inner-maximization profiler fields. Timings are CUDA-synchronized "
+            "seconds, off by default, and intended for ablation rather than "
+            "throughput training. *_per_batch averages over profiled train "
+            "batches; *_per_step averages over BB+Armijo inner steps; "
+            "*_per_trial averages over Armijo trial objectives."
+        ),
+    }
 
 
 def main() -> None:
@@ -153,10 +242,19 @@ def main() -> None:
         return
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    adversary_loss_type = "logsumexp_margin" if cfg.use_margin_loss else "cross_entropy"
+    history_epochs = [
+        {
+            **entry,
+            "run_id": run_id,
+            "adversary_loss_type": adversary_loss_type,
+            "lambda_param": cfg.lambda_param,
+        }
+        for entry in history
+    ]
     rows = []
-    for entry in history:
-        rows.append(
-            {
+    for entry in history_epochs:
+        row = {
                 "run_id": run_id,
                 "algorithm": entry.get("algorithm", cfg.algorithm),
                 "epoch": entry.get("epoch"),
@@ -166,15 +264,31 @@ def main() -> None:
                 "train_acc": entry.get("train_acc"),
                 "train_mse": entry.get("train_mse"),
                 "inner_loss": entry.get("inner_loss"),
+                "adversary_loss_type": adversary_loss_type,
+                "train_adv_loss": entry.get("train_adv_loss"),
+                "train_transport_cost": entry.get("train_transport_cost"),
+                "train_weighted_penalty": entry.get("train_weighted_penalty"),
+                "train_inner_objective": entry.get("train_inner_objective"),
                 "epoch_seconds": entry.get("epoch_seconds"),
                 "test_loss": entry.get("test_loss"),
                 "test_acc": entry.get("test_acc"),
+                "clean_loss": entry.get("clean_loss", entry.get("test_loss")),
+                "clean_acc": entry.get("clean_acc", entry.get("test_acc")),
                 "adv_loss": entry.get("adv_loss"),
                 "adv_acc": entry.get("adv_acc"),
                 "adv_penalty": entry.get("adv_penalty"),
+                "eval_transport_cost": entry.get("eval_transport_cost"),
+                "eval_transport_weighted_penalty": entry.get("eval_transport_weighted_penalty"),
+                "transport_adv_loss": entry.get("transport_adv_loss", entry.get("adv_loss")),
+                "transport_adv_acc": entry.get("transport_adv_acc", entry.get("adv_acc")),
                 "input_pgd_acc": entry.get("input_pgd_acc"),
+                "input_pgd_clean_acc": entry.get("input_pgd_clean_acc"),
+                "input_pgd_clean_correct": entry.get("input_pgd_clean_correct"),
+                "input_pgd_robust_correct": entry.get("input_pgd_robust_correct"),
                 "input_pgd_avg_l2": entry.get("input_pgd_avg_l2"),
                 "input_pgd_avg_linf": entry.get("input_pgd_avg_linf"),
+                "input_pgd_max_l2": entry.get("input_pgd_max_l2"),
+                "input_pgd_max_linf": entry.get("input_pgd_max_linf"),
                 "input_pgd_samples": entry.get("input_pgd_samples"),
                 "lambda_param": cfg.lambda_param,
                 "lr_theta": cfg.lr_theta,
@@ -182,45 +296,49 @@ def main() -> None:
                 "seed": cfg.seed,
                 "pretrained_path": cfg.pretrained_path,
             }
-        )
-        total_epochs = cfg.epochs_icnn_pretrain + cfg.epochs_adv
-        epoch_seconds = entry.get("epoch_seconds")
-        msg_parts = [
-            f"[{cfg.algorithm}|{entry.get('phase', 'adv')}]",
-            f"epoch {entry['epoch']:02d}/{total_epochs}",
-            f"train {entry['train_loss']:.4f}/{entry['train_acc']*100:.2f}%",
-            f"mse {entry['train_mse']:.4f}",
-            f"clean {entry['test_loss']:.4f}/{entry['test_acc']*100:.2f}%",
-            f"adv {entry['adv_loss']:.4f}/{entry['adv_acc']*100:.2f}%",
-        ]
-        if epoch_seconds is not None:
-            msg_parts.append(f"t={epoch_seconds:.2f}s")
-        if entry.get("input_pgd_acc") is not None:
-            msg_parts.append(
-                f"pgd {entry['input_pgd_acc']*100:.2f}% (l2 {entry['input_pgd_avg_l2']:.3f})"
-            )
-        print(" | ".join(msg_parts))
+        row.update({k: v for k, v in entry.items() if k.startswith("profile_")})
+        rows.append(row)
 
     _append_csv(Path(cfg.log_csv), rows)
+    metric_definitions = _metric_definitions(cfg.use_margin_loss)
+    history_payload = {
+        "run_id": run_id,
+        "algorithm": cfg.algorithm,
+        "adversary_loss_type": adversary_loss_type,
+        "lambda_param": cfg.lambda_param,
+        "metric_definitions": metric_definitions,
+        "epochs": history_epochs,
+        "config": cfg.to_dict(),
+    }
+    history_path = Path(cfg.log_csv).with_name("history.json")
+    _write_json(history_path, history_payload)
     summary = {
         "run_id": run_id,
         "algorithm": cfg.algorithm,
+        "adversary_loss_type": adversary_loss_type,
         "best_robust_acc": trainer.best_robust_acc,
         "best_robust_epoch": trainer.best_robust_epoch,
         "epochs_completed": trainer.last_completed_epoch,
         "peak_gpu_alloc_mb": peak_gpu_alloc_mb,
         "peak_gpu_reserved_mb": peak_gpu_reserved_mb,
+        "csv": cfg.log_csv,
+        "history_json": str(history_path),
+        "metric_definitions": metric_definitions,
+        "final_epoch": history_epochs[-1] if history_epochs else None,
         "config": cfg.to_dict(),
     }
     # Always write a summary next to the CSV so the analyzer can find it
     # even when --save was empty (GPU memory is the new RSS replacement).
     summary_path = Path(cfg.log_csv).with_name("summary.json")
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summary, indent=2))
+    _write_json(summary_path, summary)
     if cfg.save:
-        Path(cfg.save).with_suffix(".summary.json").write_text(json.dumps(summary, indent=2))
+        save_summary_path = Path(cfg.save).with_suffix(".summary.json")
+        save_history_path = Path(cfg.save).with_suffix(".history.json")
+        _write_json(save_summary_path, summary)
+        _write_json(save_history_path, history_payload)
     print(
-        f"[input-icnn] done. log={cfg.log_csv}  best_robust={trainer.best_robust_acc}  "
+        f"[input-icnn] done. log={cfg.log_csv}  history={history_path}  "
+        f"best_robust={trainer.best_robust_acc}  "
         f"gpu_peak={peak_gpu_alloc_mb:.1f} MB"
     )
     dist_helpers.cleanup_distributed()

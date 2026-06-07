@@ -13,6 +13,10 @@ Inner loop: BB+Armijo on ω optimising
 
     max_ω  E[ CE(f(T_ω(x)), y) - λ ||T_ω(x) - x||_2^2 ]
 
+where classifier inputs are normalized CIFAR tensors, but the squared
+transport cost is measured after converting both arguments back to
+pixel coordinates in [0, 1], matching CIFAR L2 benchmark convention.
+
 Hyperparameters mirror ``config.py`` from the LR-CIFAR10 reference: the
 ``cfg.npf_bb_*`` defaults and the principled LogNormal + identity init are
 used so the only modeling difference between this and the LR setting is
@@ -32,6 +36,7 @@ from ..utils import (
     bb_armijo_step_params,
     clamped_normalized_copy,
     frozen_module,
+    pixel_l2_squared,
     set_requires_grad,
 )
 from .base import BaseAdvTrainer
@@ -93,6 +98,18 @@ class NPFTrainer(BaseAdvTrainer):
         lambda_param = float(cfg.lambda_param)
         use_margin = bool(cfg.use_margin_loss)
 
+        with self.profile_time("step_wall_s"):
+            return self._profiled_step_impl(x, y, lambda_param, use_margin)
+
+    def _profiled_step_impl(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        lambda_param: float,
+        use_margin: bool,
+    ) -> torch.Tensor:
+        cfg = self.config
+
         # Inner loop: ω-ascent via BB+Armijo. Freeze the classifier so its
         # gradients are not accumulated; bb_armijo_step_params already
         # routes gradients only to ψ_ω parameters, but the explicit
@@ -102,13 +119,21 @@ class NPFTrainer(BaseAdvTrainer):
 
         with frozen_module(self._classifier_module):
             def omega_objective(create_graph: bool) -> torch.Tensor:
-                x_adv = self._transport(x, create_graph=create_graph)
+                self.profile_add("objective_calls", 1.0)
+                self.profile_add(
+                    "objective_create_graph_calls" if create_graph else "objective_no_graph_calls",
+                    1.0,
+                )
+                with self.profile_time("objective_transport_s"):
+                    x_adv = self._transport(x, create_graph=create_graph)
                 # Use the unwrapped classifier — DDP's reducer must not be
                 # disturbed by the many forwards in the inner ascent.
-                logits = self._classifier_module(x_adv)
-                primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
-                transport_cost = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1)
-                obj = (primary - lambda_param * transport_cost).mean()
+                with self.profile_time("objective_classifier_s"):
+                    logits = self._classifier_module(x_adv)
+                with self.profile_time("objective_loss_cost_s"):
+                    primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
+                    transport_cost = pixel_l2_squared(x_adv, x)
+                    obj = (primary - lambda_param * transport_cost).mean()
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
             # Plumb the cross-rank reducers when DDP is active so every rank
@@ -121,14 +146,16 @@ class NPFTrainer(BaseAdvTrainer):
             )
 
             last_f_val = 0.0
-            for _ in range(int(cfg.omega_steps_per_batch)):
-                _, self.bb_state, last_f_val, _ = bb_armijo_step_params(
-                    self.psi_omega.parameters(),
-                    omega_objective,
-                    self.bb_state,
-                    reduce_grad_fn=reduce_grad_fn,
-                    reduce_scalar_fn=reduce_scalar_fn,
-                )
+            with self.profile_time("inner_loop_wall_s"):
+                for _ in range(int(cfg.omega_steps_per_batch)):
+                    _, self.bb_state, last_f_val, _ = bb_armijo_step_params(
+                        self.psi_omega.parameters(),
+                        omega_objective,
+                        self.bb_state,
+                        reduce_grad_fn=reduce_grad_fn,
+                        reduce_scalar_fn=reduce_scalar_fn,
+                        profile=self if self.is_inner_profile_active else None,
+                    )
         self._last_inner_loss = last_f_val
 
         # Switch contract for the outer step. The base trainer will set
@@ -137,7 +164,8 @@ class NPFTrainer(BaseAdvTrainer):
         self.psi_omega.eval()
         set_requires_grad(self.psi_omega, False)
         with torch.no_grad():
-            x_adv = self._transport(x, create_graph=False)
+            with self.profile_time("final_transport_s"):
+                x_adv = self._transport(x, create_graph=False)
         return x_adv.detach()
 
     def transport_for_eval(self, x: torch.Tensor) -> torch.Tensor:

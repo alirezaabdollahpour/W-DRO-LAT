@@ -11,7 +11,8 @@ The original LR-CIFAR10 reference uses constant-LR WRM ascent inside
 each round. Here we replace that with the SAME BB+Armijo step rule
 used by NPF, applied to z directly. The projection rounds are
 unchanged; BB state is fresh at the start of each ascent burst because
-z is anchored / re-projected between bursts.
+z is anchored / re-projected between bursts. All transport costs are
+measured in pixel coordinates [0, 1].
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from ..utils import (
     clamped_normalized_copy,
     free_weight_projection_images,
     frozen_module,
+    pixel_l2_squared,
 )
 from .base import BaseAdvTrainer
 
@@ -66,7 +68,7 @@ def _bb_armijo_ascent(
 
     def f_obj(z_var: torch.Tensor, create_graph: bool) -> torch.Tensor:
         primary = adversary_loss_per_sample(classifier(z_var), y, use_margin=use_margin)
-        cost = (z_var - x_anchor).reshape(z_var.size(0), -1).pow(2).sum(dim=1)
+        cost = pixel_l2_squared(z_var, x_anchor)
         return (primary - lam * cost).mean()
 
     z = z0.detach().clone()

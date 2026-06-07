@@ -39,3 +39,18 @@ def clamp_normalized_inputs_(x: torch.Tensor) -> None:
 def clamped_normalized_copy(x: torch.Tensor) -> torch.Tensor:
     lower, upper = normalized_pixel_bounds(x)
     return torch.clamp(x, min=lower, max=upper)
+
+
+def pixel_l2_squared(
+    x_adv_norm: torch.Tensor,
+    x_clean_norm: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample squared L2 distance in CIFAR pixel coordinates.
+
+    Inputs are normalized tensors because that is the package-wide
+    classifier convention. The returned cost is measured after undoing
+    CIFAR normalization, matching the standard CIFAR L2 robustness
+    benchmark convention where eps is defined on pixels in [0, 1].
+    """
+    diff_pix = to_pixel(x_adv_norm) - to_pixel(x_clean_norm)
+    return diff_pix.reshape(diff_pix.size(0), -1).pow(2).sum(dim=1)

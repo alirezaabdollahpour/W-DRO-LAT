@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from .adversary_loss import adversary_loss_per_sample
+from .transforms import to_pixel
 
 
 def free_weight_projection_images(
@@ -38,8 +39,8 @@ def free_weight_projection_images(
         logits = classifier(z)
         candidate_loss = adversary_loss_per_sample(logits, y, use_margin=use_margin)
 
-    z_flat = z.detach().view(N, -1)
-    x_flat = x.detach().view(N, -1)
+    z_flat = to_pixel(z.detach()).view(N, -1)
+    x_flat = to_pixel(x.detach()).view(N, -1)
     z_proj = torch.empty_like(z)
     y_proj = y.clone()
 

@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,10 +33,12 @@ from tqdm.auto import tqdm
 
 from .. import distributed as dist_helpers
 from ..utils import (
+    adversary_loss_per_sample,
     cuda_sync,
     evaluate_clean,
     evaluate_under_input_pgd,
     evaluate_under_transport,
+    pixel_l2_squared,
     set_requires_grad,
 )
 
@@ -111,6 +114,9 @@ class BaseAdvTrainer:
         self.best_robust_acc: Optional[float] = None
         self.best_robust_epoch: Optional[int] = None
         self.last_completed_epoch: int = 0
+        self._profile_epoch_accum: Dict[str, float] = {}
+        self._profile_epoch_batches: int = 0
+        self._profile_current: Optional[Dict[str, float]] = None
 
     # ------------------------------------------------------------------
     # Distributed helpers (no-op in single-GPU mode)
@@ -155,6 +161,99 @@ class BaseAdvTrainer:
     def adversary_state_dicts(self) -> Dict[str, Any]:
         """Optional extra checkpoint payload (adversary parameters)."""
         return {}
+
+    # ------------------------------------------------------------------
+    # Inner-loop profiler helpers
+    # ------------------------------------------------------------------
+    @property
+    def is_inner_profile_active(self) -> bool:
+        return self._profile_current is not None
+
+    def _reset_inner_profile_epoch(self) -> None:
+        self._profile_epoch_accum = {}
+        self._profile_epoch_batches = 0
+        self._profile_current = None
+
+    def _begin_inner_profile_batch(self) -> None:
+        cfg = self.config
+        if not bool(getattr(cfg, "profile_inner", False)):
+            self._profile_current = None
+            return
+        max_batches = int(getattr(cfg, "profile_inner_batches", 0) or 0)
+        if max_batches > 0 and self._profile_epoch_batches >= max_batches:
+            self._profile_current = None
+            return
+        self._profile_current = {}
+
+    def _finish_inner_profile_batch(self) -> None:
+        if self._profile_current is None:
+            return
+        self.profile_add("batches", 1.0)
+        for key, value in self._profile_current.items():
+            self._profile_epoch_accum[key] = (
+                self._profile_epoch_accum.get(key, 0.0) + float(value)
+            )
+        self._profile_epoch_batches += 1
+        self._profile_current = None
+
+    def profile_add(self, key: str, value: float = 1.0) -> None:
+        if self._profile_current is None:
+            return
+        self._profile_current[key] = self._profile_current.get(key, 0.0) + float(value)
+
+    @contextmanager
+    def profile_time(self, key: str) -> Iterator[None]:
+        if self._profile_current is None:
+            with nullcontext():
+                yield
+            return
+        cuda_sync()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            cuda_sync()
+            self.profile_add(key, time.perf_counter() - start)
+
+    def _inner_profile_epoch_extras(
+        self,
+        *,
+        train_batches_total: int,
+        train_samples_total: int,
+    ) -> Dict[str, float]:
+        accum = self._profile_epoch_accum
+        batches = int(accum.get("batches", 0.0))
+        if batches <= 0:
+            return {}
+
+        extras: Dict[str, float] = {
+            "profile_batches": float(batches),
+            "profile_train_batches_total": float(train_batches_total),
+            "profile_train_samples_total": float(train_samples_total),
+            "profile_batch_coverage": float(batches) / float(max(1, train_batches_total)),
+            "profile_bb_steps": float(accum.get("bb_steps", 0.0)),
+            "profile_bb_trials": float(accum.get("bb_trials", 0.0)),
+            "profile_bb_rejections": float(accum.get("bb_rejections", 0.0)),
+        }
+        bb_steps = max(1.0, float(accum.get("bb_steps", 0.0)))
+        bb_trials = max(1.0, float(accum.get("bb_trials", 0.0)))
+
+        for key, value in sorted(accum.items()):
+            profile_key = f"profile_{key}"
+            extras[profile_key] = float(value)
+            if key.endswith("_s"):
+                extras[f"{profile_key}_per_batch"] = float(value) / float(batches)
+                extras[f"{profile_key}_per_step"] = float(value) / bb_steps
+                if key in {
+                    "bb_trial_objective_s",
+                    "bb_trial_write_s",
+                    "bb_trial_make_s",
+                }:
+                    extras[f"{profile_key}_per_trial"] = float(value) / bb_trials
+
+        extras["profile_bb_steps_per_batch"] = float(accum.get("bb_steps", 0.0)) / float(batches)
+        extras["profile_bb_trials_per_step"] = float(accum.get("bb_trials", 0.0)) / bb_steps
+        return extras
 
     # ------------------------------------------------------------------
     # Optimizer / classifier helpers
@@ -217,20 +316,20 @@ class BaseAdvTrainer:
                 phase="warmup",
             )
             evaluations = self._evaluate(warmup_idx)
-            history.append(
-                {
-                    "algorithm": self.name,
-                    "epoch": warmup_idx,
-                    "phase": "warmup",
-                    "train_loss": metrics.train_loss,
-                    "train_acc": metrics.train_acc,
-                    "train_mse": metrics.train_mse,
-                    "inner_loss": metrics.inner_loss,
-                    "epoch_seconds": metrics.epoch_seconds,
-                    **metrics.extras,
-                    **evaluations,
-                }
-            )
+            entry = {
+                "algorithm": self.name,
+                "epoch": warmup_idx,
+                "phase": "warmup",
+                "train_loss": metrics.train_loss,
+                "train_acc": metrics.train_acc,
+                "train_mse": metrics.train_mse,
+                "inner_loss": metrics.inner_loss,
+                "epoch_seconds": metrics.epoch_seconds,
+                **metrics.extras,
+                **evaluations,
+            }
+            history.append(entry)
+            self._print_epoch_summary(entry, total_epochs)
             # No checkpoint / scheduler step during warmup — the classifier
             # is frozen, so robust accuracy reflects θ_init only.
             self.last_completed_epoch = warmup_idx
@@ -246,20 +345,20 @@ class BaseAdvTrainer:
                 phase="adv",
             )
             evaluations = self._evaluate(epoch)
-            history.append(
-                {
-                    "algorithm": self.name,
-                    "epoch": epoch,
-                    "phase": "adv",
-                    "train_loss": metrics.train_loss,
-                    "train_acc": metrics.train_acc,
-                    "train_mse": metrics.train_mse,
-                    "inner_loss": metrics.inner_loss,
-                    "epoch_seconds": metrics.epoch_seconds,
-                    **metrics.extras,
-                    **evaluations,
-                }
-            )
+            entry = {
+                "algorithm": self.name,
+                "epoch": epoch,
+                "phase": "adv",
+                "train_loss": metrics.train_loss,
+                "train_acc": metrics.train_acc,
+                "train_mse": metrics.train_mse,
+                "inner_loss": metrics.inner_loss,
+                "epoch_seconds": metrics.epoch_seconds,
+                **metrics.extras,
+                **evaluations,
+            }
+            history.append(entry)
+            self._print_epoch_summary(entry, total_epochs)
             self._maybe_checkpoint_best(epoch, evaluations.get("input_pgd_acc"))
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -274,12 +373,19 @@ class BaseAdvTrainer:
     ) -> EpochMetrics:
         cfg = self.config
         is_warmup = phase == "warmup"
+        self._reset_inner_profile_epoch()
         total_loss = 0.0
         total_acc = 0.0
         total_mse = 0.0
         total_inner = 0.0
+        total_train_adv_loss = 0.0
+        total_transport_cost = 0.0
+        total_weighted_penalty = 0.0
+        total_inner_objective = 0.0
         total_samples = 0
+        total_batches = 0
         desc_phase = "Warmup" if is_warmup else "Adv"
+        primary_name = "margin" if bool(getattr(cfg, "use_margin_loss", False)) else "adv_ce"
         # CUDA-synced wallclock around the training loop. Async kernel
         # launches mean reading the clock without sync only counts
         # dispatch time, not actual GPU work.
@@ -291,14 +397,20 @@ class BaseAdvTrainer:
             leave=False,
         )
         for x, y in progress:
+            total_batches += 1
             x = x.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
-            x_adv = self.step(x, y)
+            self._begin_inner_profile_batch()
+            try:
+                x_adv = self.step(x, y)
+            finally:
+                self._finish_inner_profile_batch()
             if not torch.is_tensor(x_adv):
                 raise TypeError("step() must return a tensor")
             x_adv = x_adv.detach()
             if not torch.isfinite(x_adv).all():
                 continue
+            diagnostics = self._batch_adversary_diagnostics(x, x_adv, y)
             if is_warmup:
                 # Adversary's inner loop already ran inside step(); skip
                 # the classifier update so θ stays frozen this epoch.
@@ -308,38 +420,89 @@ class BaseAdvTrainer:
                 try:
                     with torch.no_grad():
                         acc = (
-                            self.classifier(x_adv).argmax(dim=1) == y
+                            self.classifier_module(x_adv).argmax(dim=1) == y
                         ).float().mean().item()
                 finally:
                     self.classifier.train(was_training)
             else:
                 loss, acc = self.classifier_update(x_adv, y)
             with torch.no_grad():
-                mse = (x_adv - x).reshape(x.size(0), -1).pow(2).sum(dim=1).mean().item()
+                mse = pixel_l2_squared(x_adv, x).mean().item()
             bs = x.size(0)
             total_loss += loss * bs
             total_acc += acc * bs
             total_mse += float(mse) * bs
+            total_train_adv_loss += diagnostics["train_adv_loss"] * bs
+            total_transport_cost += diagnostics["train_transport_cost"] * bs
+            total_weighted_penalty += diagnostics["train_weighted_penalty"] * bs
+            total_inner_objective += diagnostics["train_inner_objective"] * bs
             total_samples += bs
             inner = float(getattr(self, "_last_inner_loss", 0.0))
             total_inner += inner * bs
             if total_samples > 0:
                 progress.set_postfix(
-                    loss=f"{total_loss/total_samples:.4f}",
-                    acc=f"{total_acc/total_samples*100:.2f}%",
-                    mse=f"{total_mse/total_samples:.4f}",
+                    {
+                        "outer_ce": f"{total_loss/total_samples:.4f}",
+                        "acc": f"{total_acc/total_samples*100:.2f}%",
+                        primary_name: f"{total_train_adv_loss/total_samples:.4f}",
+                        "cost": f"{total_transport_cost/total_samples:.4f}",
+                        "pen": f"{total_weighted_penalty/total_samples:.4f}",
+                        "obj": f"{total_inner_objective/total_samples:.4f}",
+                    }
                 )
         progress.close()
         cuda_sync()
         epoch_seconds = time.perf_counter() - epoch_start
         n = max(1, total_samples)
+        extras = {
+            "train_adv_loss": total_train_adv_loss / n,
+            "train_transport_cost": total_transport_cost / n,
+            "train_weighted_penalty": total_weighted_penalty / n,
+            "train_inner_objective": total_inner_objective / n,
+        }
+        extras.update(
+            self._inner_profile_epoch_extras(
+                train_batches_total=total_batches,
+                train_samples_total=total_samples,
+            )
+        )
         return EpochMetrics(
             train_loss=total_loss / n,
             train_acc=total_acc / n,
             train_mse=total_mse / n,
             inner_loss=total_inner / n,
             epoch_seconds=epoch_seconds,
+            extras=extras,
         )
+
+    def _batch_adversary_diagnostics(
+        self,
+        x: torch.Tensor,
+        x_adv: torch.Tensor,
+        y: torch.Tensor,
+    ) -> Dict[str, float]:
+        cfg = self.config
+        lam = float(getattr(cfg, "lambda_param", 0.0))
+        was_training = self.classifier_module.training
+        self.classifier_module.eval()
+        try:
+            with torch.no_grad():
+                logits = self.classifier_module(x_adv)
+                primary = adversary_loss_per_sample(
+                    logits, y, use_margin=bool(getattr(cfg, "use_margin_loss", False))
+                )
+                cost = pixel_l2_squared(x_adv, x)
+                adv_loss = float(primary.mean().item())
+                transport_cost = float(cost.mean().item())
+        finally:
+            self.classifier_module.train(was_training)
+        weighted_penalty = lam * transport_cost
+        return {
+            "train_adv_loss": adv_loss,
+            "train_transport_cost": transport_cost,
+            "train_weighted_penalty": weighted_penalty,
+            "train_inner_objective": adv_loss - weighted_penalty,
+        }
 
     # ------------------------------------------------------------------
     # Evaluation + checkpointing
@@ -357,7 +520,7 @@ class BaseAdvTrainer:
             self.classifier_module, self.test_loader, self.device
         )
 
-        adv_loss, adv_acc, adv_pen = evaluate_under_transport(
+        adv_loss, adv_acc, adv_cost, adv_pen = evaluate_under_transport(
             self.classifier_module,
             lambda x: self.transport_for_eval(x),
             self.test_loader,
@@ -368,9 +531,15 @@ class BaseAdvTrainer:
         result: Dict[str, Any] = {
             "test_loss": clean_loss,
             "test_acc": clean_acc,
+            "clean_loss": clean_loss,
+            "clean_acc": clean_acc,
             "adv_loss": adv_loss,
             "adv_acc": adv_acc,
             "adv_penalty": adv_pen,
+            "eval_transport_cost": adv_cost,
+            "eval_transport_weighted_penalty": adv_pen,
+            "transport_adv_loss": adv_loss,
+            "transport_adv_acc": adv_acc,
         }
 
         if (
@@ -390,6 +559,8 @@ class BaseAdvTrainer:
                 sample_limit = min(sample_limit, samples_available)
                 batch_size = getattr(self.test_loader, "batch_size", sample_limit) or sample_limit
                 max_batches = max(1, math.ceil(sample_limit / batch_size))
+            else:
+                sample_limit = None
             p_input = 2 if cfg.inp_p == "2" else float("inf")
             pgd_acc, pgd_info = evaluate_under_input_pgd(
                 self.classifier_module,
@@ -401,34 +572,95 @@ class BaseAdvTrainer:
                 step_size=cfg.inp_step_size,
                 restarts=cfg.inp_restarts,
                 max_batches=max_batches,
+                max_samples=sample_limit,
             )
             result["input_pgd_acc"] = pgd_acc
+            result["input_pgd_clean_acc"] = pgd_info["clean_acc"]
+            result["input_pgd_clean_correct"] = pgd_info["clean_correct"]
+            result["input_pgd_robust_correct"] = pgd_info["robust_correct"]
             result["input_pgd_avg_l2"] = pgd_info["avg_l2"]
             result["input_pgd_avg_linf"] = pgd_info["avg_linf"]
+            result["input_pgd_max_l2"] = pgd_info["max_l2"]
+            result["input_pgd_max_linf"] = pgd_info["max_linf"]
             result["input_pgd_samples"] = pgd_info["samples"]
         dist_helpers.barrier()
         return result
+
+    def _print_epoch_summary(self, entry: Dict[str, Any], total_epochs: int) -> None:
+        if not self.is_main_rank:
+            return
+        epoch_seconds = entry.get("epoch_seconds")
+        primary_label = (
+            "inner_margin"
+            if bool(getattr(self.config, "use_margin_loss", False))
+            else "inner_adv_ce"
+        )
+        parts = [
+            f"[{self.name}|{entry.get('phase', 'adv')}]",
+            f"epoch {entry['epoch']:02d}/{total_epochs}",
+            f"outer_ce {entry.get('train_loss', 0.0):.4f}/{entry.get('train_acc', 0.0)*100:.2f}%",
+            f"{primary_label} {entry.get('train_adv_loss', 0.0):.4f}",
+            f"cost {entry.get('train_transport_cost', entry.get('train_mse', 0.0)):.4f}",
+            f"pen {entry.get('train_weighted_penalty', 0.0):.4f}",
+            f"obj {entry.get('train_inner_objective', entry.get('inner_loss', 0.0)):.4f}",
+        ]
+        if "test_acc" in entry:
+            parts.append(
+                f"clean {entry.get('test_loss', 0.0):.4f}/{entry['test_acc']*100:.2f}%"
+            )
+        if "adv_acc" in entry:
+            parts.append(
+                f"transport {entry.get('adv_loss', 0.0):.4f}/{entry['adv_acc']*100:.2f}%"
+            )
+            parts.append(f"eval_pen {entry.get('adv_penalty', 0.0):.4f}")
+        if entry.get("input_pgd_acc") is not None:
+            parts.append(
+                f"pgd_robust {entry['input_pgd_acc']*100:.2f}% "
+                f"(avg_l2 {entry.get('input_pgd_avg_l2', 0.0):.3f}, "
+                f"max_l2 {entry.get('input_pgd_max_l2', 0.0):.3f}, "
+                f"n {entry.get('input_pgd_samples', 0)})"
+            )
+        else:
+            parts.append("pgd_robust n/a")
+        if epoch_seconds is not None:
+            parts.append(f"t={epoch_seconds:.2f}s")
+        if entry.get("profile_batches"):
+            parts.append(
+                "profile "
+                f"step={entry.get('profile_step_wall_s_per_batch', 0.0):.3f}s/b "
+                f"inner={entry.get('profile_inner_loop_wall_s_per_batch', 0.0):.3f}s/b "
+                f"T={entry.get('profile_objective_transport_s_per_step', 0.0):.3f}s/step "
+                f"clf={entry.get('profile_objective_classifier_s_per_step', 0.0):.3f}s/step "
+                f"ls={entry.get('profile_bb_linesearch_s_per_step', 0.0):.3f}s/step "
+                f"trials={entry.get('profile_bb_trials_per_step', 0.0):.2f}/step"
+            )
+        print(" | ".join(parts), flush=True)
 
     def _maybe_checkpoint_best(self, epoch: int, robust_acc: Optional[float]) -> None:
         cfg = self.config
         if not self.is_main_rank:
             return
-        if robust_acc is None or not cfg.save_best_robust:
+        if robust_acc is None:
             return
-        if self.best_robust_acc is None or robust_acc > self.best_robust_acc:
-            self.best_robust_acc = float(robust_acc)
-            self.best_robust_epoch = epoch
-            path = Path(cfg.save_best_robust)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "algorithm": self.name,
-                "classifier": self._classifier_module.state_dict(),
-                "epoch": epoch,
-                "robust_input_pgd_acc": robust_acc,
-                "config": cfg.to_dict() if hasattr(cfg, "to_dict") else None,
-                **self.adversary_state_dicts(),
-            }
-            torch.save(payload, path)
+        if self.best_robust_acc is not None and robust_acc <= self.best_robust_acc:
+            return
+
+        self.best_robust_acc = float(robust_acc)
+        self.best_robust_epoch = epoch
+        if not cfg.save_best_robust:
+            return
+
+        path = Path(cfg.save_best_robust)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "algorithm": self.name,
+            "classifier": self._classifier_module.state_dict(),
+            "epoch": epoch,
+            "robust_input_pgd_acc": robust_acc,
+            "config": cfg.to_dict() if hasattr(cfg, "to_dict") else None,
+            **self.adversary_state_dicts(),
+        }
+        torch.save(payload, path)
 
     def save_final(self) -> None:
         cfg = self.config

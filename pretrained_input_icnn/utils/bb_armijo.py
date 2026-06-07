@@ -9,8 +9,10 @@ only the parameter-list variant since the NPF algorithm here uses live
 from __future__ import annotations
 
 import math
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.utils as nn_utils
@@ -98,12 +100,38 @@ class BBArmijoState:
         )
 
 
+def _profile_add(profile: Any, key: str, value: float = 1.0) -> None:
+    if profile is None:
+        return
+    add = getattr(profile, "profile_add", None)
+    if add is not None:
+        add(key, value)
+
+
+@contextmanager
+def _profile_time(profile: Any, key: str) -> Iterator[None]:
+    if profile is None:
+        with nullcontext():
+            yield
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _profile_add(profile, key, time.perf_counter() - start)
+
+
 def bb_armijo_step_params(
     params,
     f_params,
     bb_state: BBArmijoState,
     reduce_grad_fn=None,
     reduce_scalar_fn=None,
+    profile=None,
 ) -> Tuple[List[torch.nn.Parameter], BBArmijoState, float, float]:
     """Single BB+Armijo gradient-ascent step on a parameter collection.
 
@@ -118,34 +146,39 @@ def bb_armijo_step_params(
     call. The next call recomputes the gradient at the new iterate, so an
     extra fwd+bwd just for logging would double the inner-loop wallclock.
     """
-    params = list(params)
-    if len(params) == 0:
-        raise ValueError("bb_armijo_step_params received an empty parameter list.")
-    params_vec = nn_utils.parameters_to_vector(params).detach()
+    _profile_add(profile, "bb_steps", 1.0)
+    with _profile_time(profile, "bb_params_prepare_s"):
+        params = list(params)
+        if len(params) == 0:
+            raise ValueError("bb_armijo_step_params received an empty parameter list.")
+        params_vec = nn_utils.parameters_to_vector(params).detach()
 
-    f_val = f_params(True)
-    grads = torch.autograd.grad(
-        f_val,
-        params,
-        create_graph=False,
-        retain_graph=False,
-        allow_unused=True,
-    )
+    with _profile_time(profile, "bb_f_grad_objective_s"):
+        f_val = f_params(True)
+    with _profile_time(profile, "bb_grad_autograd_s"):
+        grads = torch.autograd.grad(
+            f_val,
+            params,
+            create_graph=False,
+            retain_graph=False,
+            allow_unused=True,
+        )
     # autograd.grad can return non-contiguous tensors (e.g. through .t() or
     # einsum in NPF); parameters_to_vector internally calls view(-1) which
     # fails on non-contiguous storage, so we reshape and concat instead.
-    grad_tensors = [
-        g.detach() if g is not None else torch.zeros_like(p)
-        for p, g in zip(params, grads)
-    ]
-    if reduce_grad_fn is not None:
-        grad_tensors = reduce_grad_fn(grad_tensors)
-    grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
-    grad_norm = grad_vec.norm().item()
-    if reduce_scalar_fn is not None:
-        f_val_float = float(reduce_scalar_fn(f_val.detach()))
-    else:
-        f_val_float = float(f_val.detach())
+    with _profile_time(profile, "bb_grad_pack_reduce_s"):
+        grad_tensors = [
+            g.detach() if g is not None else torch.zeros_like(p)
+            for p, g in zip(params, grads)
+        ]
+        if reduce_grad_fn is not None:
+            grad_tensors = reduce_grad_fn(grad_tensors)
+        grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
+        grad_norm = grad_vec.norm().item()
+        if reduce_scalar_fn is not None:
+            f_val_float = float(reduce_scalar_fn(f_val.detach()))
+        else:
+            f_val_float = float(f_val.detach())
 
     if (
         not math.isfinite(f_val_float)
@@ -154,40 +187,49 @@ def bb_armijo_step_params(
     ):
         return params, bb_state, f_val_float, grad_norm
 
-    alpha = bb_state.propose(params_vec, grad_vec)
-    directional_derivative = float(torch.dot(grad_vec, grad_vec).item())
+    with _profile_time(profile, "bb_propose_s"):
+        alpha = bb_state.propose(params_vec, grad_vec)
+        directional_derivative = float(torch.dot(grad_vec, grad_vec).item())
     if directional_derivative <= 0.0 or not math.isfinite(directional_derivative):
         return params, bb_state, f_val_float, grad_norm
 
     alpha_k = alpha
     armijo_succeeded = False
-    for i in range(bb_state.ls_max_steps):
-        trial_vec = params_vec + alpha_k * grad_vec
-        with torch.no_grad():
-            nn_utils.vector_to_parameters(trial_vec, params)
-            f_trial_t = f_params(False).detach()
-            if reduce_scalar_fn is not None:
-                f_trial = float(reduce_scalar_fn(f_trial_t))
-            else:
-                f_trial = float(f_trial_t)
-        if (
-            math.isfinite(f_trial)
-            and f_trial >= f_val_float + bb_state.ls_c * alpha_k * directional_derivative
-        ):
-            armijo_succeeded = True
-            break
-        if i < bb_state.ls_max_steps - 1:
-            alpha_k *= bb_state.ls_shrink
+    with _profile_time(profile, "bb_linesearch_s"):
+        for i in range(bb_state.ls_max_steps):
+            _profile_add(profile, "bb_trials", 1.0)
+            trial_vec = params_vec + alpha_k * grad_vec
+            with torch.no_grad():
+                with _profile_time(profile, "bb_trial_write_s"):
+                    nn_utils.vector_to_parameters(trial_vec, params)
+                with _profile_time(profile, "bb_trial_objective_s"):
+                    f_trial_t = f_params(False).detach()
+                    if reduce_scalar_fn is not None:
+                        f_trial = float(reduce_scalar_fn(f_trial_t))
+                    else:
+                        f_trial = float(f_trial_t)
+            if (
+                math.isfinite(f_trial)
+                and f_trial >= f_val_float + bb_state.ls_c * alpha_k * directional_derivative
+            ):
+                armijo_succeeded = True
+                break
+            if i < bb_state.ls_max_steps - 1:
+                alpha_k *= bb_state.ls_shrink
 
     if armijo_succeeded or not bb_state.reject_on_armijo_failure:
-        final_vec = params_vec + alpha_k * grad_vec
-        with torch.no_grad():
-            nn_utils.vector_to_parameters(final_vec, params)
-        new_state = bb_state.update_history(params_vec, grad_vec, alpha_k)
+        _profile_add(profile, "bb_armijo_successes" if armijo_succeeded else "bb_forced_accepts", 1.0)
+        with _profile_time(profile, "bb_apply_s"):
+            final_vec = params_vec + alpha_k * grad_vec
+            with torch.no_grad():
+                nn_utils.vector_to_parameters(final_vec, params)
+            new_state = bb_state.update_history(params_vec, grad_vec, alpha_k)
     else:
-        with torch.no_grad():
-            nn_utils.vector_to_parameters(params_vec, params)
-        new_state = bb_state
+        _profile_add(profile, "bb_rejections", 1.0)
+        with _profile_time(profile, "bb_apply_s"):
+            with torch.no_grad():
+                nn_utils.vector_to_parameters(params_vec, params)
+            new_state = bb_state
     return params, new_state, f_val_float, grad_norm
 
 
@@ -197,6 +239,7 @@ def bb_armijo_step_tensor(
     bb_state: BBArmijoState,
     reduce_grad_fn=None,
     reduce_scalar_fn=None,
+    profile=None,
 ) -> Tuple[torch.Tensor, BBArmijoState, float, float]:
     """Single BB+Armijo ASCENT step on an input-space variable z.
 
@@ -217,20 +260,25 @@ def bb_armijo_step_tensor(
     objective at the START of the step (matches the parametric variant
     so logging stays consistent).
     """
-    z_orig = z.detach()
-    z_var = z_orig.clone().requires_grad_(True)
-    f_val = f_obj(z_var, True)
-    grad = torch.autograd.grad(f_val, z_var, create_graph=False, retain_graph=False)[0].detach()
-    if reduce_grad_fn is not None:
-        grad = reduce_grad_fn([grad])[0]
-    if reduce_scalar_fn is not None:
-        f_val_float = float(reduce_scalar_fn(f_val.detach()))
-    else:
-        f_val_float = float(f_val.detach())
+    _profile_add(profile, "bb_steps", 1.0)
+    with _profile_time(profile, "bb_tensor_prepare_s"):
+        z_orig = z.detach()
+        z_var = z_orig.clone().requires_grad_(True)
+    with _profile_time(profile, "bb_f_grad_objective_s"):
+        f_val = f_obj(z_var, True)
+    with _profile_time(profile, "bb_grad_autograd_s"):
+        grad = torch.autograd.grad(f_val, z_var, create_graph=False, retain_graph=False)[0].detach()
+    with _profile_time(profile, "bb_grad_pack_reduce_s"):
+        if reduce_grad_fn is not None:
+            grad = reduce_grad_fn([grad])[0]
+        if reduce_scalar_fn is not None:
+            f_val_float = float(reduce_scalar_fn(f_val.detach()))
+        else:
+            f_val_float = float(f_val.detach())
 
-    grad_vec = grad.reshape(-1)
-    z_vec = z_orig.reshape(-1)
-    grad_norm = float(grad_vec.norm().item())
+        grad_vec = grad.reshape(-1)
+        z_vec = z_orig.reshape(-1)
+        grad_norm = float(grad_vec.norm().item())
 
     if (
         not math.isfinite(f_val_float)
@@ -239,34 +287,43 @@ def bb_armijo_step_tensor(
     ):
         return z_orig, bb_state, f_val_float, grad_norm
 
-    alpha = bb_state.propose(z_vec, grad_vec)
-    g_dot_g = float(torch.dot(grad_vec, grad_vec).item())
+    with _profile_time(profile, "bb_propose_s"):
+        alpha = bb_state.propose(z_vec, grad_vec)
+        g_dot_g = float(torch.dot(grad_vec, grad_vec).item())
     if g_dot_g <= 0.0 or not math.isfinite(g_dot_g):
         return z_orig, bb_state, f_val_float, grad_norm
 
     alpha_k = alpha
     armijo_succeeded = False
-    for i in range(bb_state.ls_max_steps):
-        trial = z_orig + alpha_k * grad
-        with torch.no_grad():
-            f_trial_t = f_obj(trial, False).detach()
-            if reduce_scalar_fn is not None:
-                f_trial = float(reduce_scalar_fn(f_trial_t))
-            else:
-                f_trial = float(f_trial_t)
-        if (
-            math.isfinite(f_trial)
-            and f_trial >= f_val_float + bb_state.ls_c * alpha_k * g_dot_g
-        ):
-            armijo_succeeded = True
-            break
-        if i < bb_state.ls_max_steps - 1:
-            alpha_k *= bb_state.ls_shrink
+    with _profile_time(profile, "bb_linesearch_s"):
+        for i in range(bb_state.ls_max_steps):
+            _profile_add(profile, "bb_trials", 1.0)
+            with _profile_time(profile, "bb_trial_make_s"):
+                trial = z_orig + alpha_k * grad
+            with torch.no_grad():
+                with _profile_time(profile, "bb_trial_objective_s"):
+                    f_trial_t = f_obj(trial, False).detach()
+                    if reduce_scalar_fn is not None:
+                        f_trial = float(reduce_scalar_fn(f_trial_t))
+                    else:
+                        f_trial = float(f_trial_t)
+            if (
+                math.isfinite(f_trial)
+                and f_trial >= f_val_float + bb_state.ls_c * alpha_k * g_dot_g
+            ):
+                armijo_succeeded = True
+                break
+            if i < bb_state.ls_max_steps - 1:
+                alpha_k *= bb_state.ls_shrink
 
     if armijo_succeeded or not bb_state.reject_on_armijo_failure:
-        new_z = z_orig + alpha_k * grad
-        new_state = bb_state.update_history(z_vec, grad_vec, alpha_k)
+        _profile_add(profile, "bb_armijo_successes" if armijo_succeeded else "bb_forced_accepts", 1.0)
+        with _profile_time(profile, "bb_apply_s"):
+            new_z = z_orig + alpha_k * grad
+            new_state = bb_state.update_history(z_vec, grad_vec, alpha_k)
     else:
-        new_z = z_orig
-        new_state = bb_state
+        _profile_add(profile, "bb_rejections", 1.0)
+        with _profile_time(profile, "bb_apply_s"):
+            new_z = z_orig
+            new_state = bb_state
     return new_z.detach(), new_state, f_val_float, grad_norm

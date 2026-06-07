@@ -13,13 +13,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ALL_ALGORITHMS: Tuple[str, ...] = (
     "npf",
-    "npf_lastquad",
+    "npf_lastquad", # this is going to be our main algorithm, because it just injects quadratic terms at the last layer---reduces computional cost of npf(injecting quadratics at every layer)---we stick to this algorithm.
     "nn_dro",
-    "madry",
+    "madry", # famous PGD-based adversarial training method from Madry et al. (2018); it's a primal method that optimizes the inner maximization by running projected gradient ascent in the input space with a fixed step size and projection radius (epsilon) for a fixed number of steps and restarts.
     "wrm",
     "wfr",
     "dual",
-    "new_ppa",
+    "new_ppa", # is our MPA version: MPA approximates the regularized Wasserstein DRO inner maximization, i.e. role of the adversary, by alternating between parallel local optimization of $B$ adversarial samples~$\mathcal Z=\{z_i\}_{i=1}^B$ ($B$ is a batch size) and batch-wide reassignment of each empirical sample~$\hat z_i$~(i.e., nominal sample) to the best adversarial sample in~$\mathcal Z$, thereby restoring assignment stationarity of the implicit map; see the inner loop in Algorithm~\ref{alg:implicit_mpa}, which runs over~$R$ rounds. Note that MPA collapses to PA if~$R=1$, while $R>1$ activates the reassignment steps.
 )
 
 
@@ -34,10 +34,10 @@ class TrainConfig:
     log_csv: str = "./runs_log_input_icnn.csv"
 
     # --- Algorithm selection ---
-    algorithm: str = "npf"
+    algorithm: str = "npf_lastquad"
 
     # --- Outer optimisation (classifier) ---
-    epochs_adv: int = 30
+    epochs_adv: int = 50
     # Warmup: train *only* the adversary (e.g. NPF ω) for this many epochs
     # before the regular minimax loop. The classifier stays frozen during
     # warmup. Mirrors ``--epochs-icnn-pretrain`` from the legacy
@@ -55,9 +55,12 @@ class TrainConfig:
 
     # --- DRO core hyperparameters ---
     # The penalty weight λ scales ||T(x) - x||^2 in every adversary's
-    # objective. The CLI exposes both --penalty-lambda (the ICNN/NPF
-    # convention from the original script) and --tau (the Figure-6
-    # convention, λ = 1 / (2τ)). Whichever is passed wins.
+    # objective. For CIFAR input-space runs this cost is measured in
+    # pixel coordinates [0, 1], matching standard L2 robustness benchmark
+    # conventions, while classifier inputs remain normalized tensors.
+    # The CLI exposes both --penalty-lambda (the ICNN/NPF convention from
+    # the original script) and --tau (the Figure-6 convention,
+    # λ = 1 / (2τ)). Whichever is passed wins.
     lambda_param: float = 30.0
     # When True, replace the per-sample CE in the adversary's primary loss
     # with the log-sum-exp margin: logsumexp_{j≠y}(logit_j - logit_y).
@@ -65,10 +68,10 @@ class TrainConfig:
     # ``pretrained_INPUT_icnn.py``. Applied to the adversarial primary
     # loss in every method; the outer classifier update remains CE for
     # primal adversarial-training methods.
-    use_margin_loss: bool = False
+    use_margin_loss: bool = True
 
     # --- Inner-loop budget shared by NPF / NN-DRO ---
-    omega_steps_per_batch: int = 10
+    omega_steps_per_batch: int = 20
 
     # --- Shared BB+Armijo step rule ---
     # Applied UNIFORMLY across all adversaries that have an inner ascent:
@@ -194,6 +197,13 @@ class TrainConfig:
     # leaving it on biases comparisons toward eval throughput rather than
     # training throughput). Final eval still runs after fit().
     skip_pgd_during_train: bool = False
+    # When True, record synchronized, part-by-part timings for the inner
+    # maximization. This intentionally inserts CUDA synchronizations around
+    # small regions, so use it for ablations/profiling rather than production
+    # training throughput.
+    profile_inner: bool = False
+    # Number of train batches per epoch to profile. 0 means every batch.
+    profile_inner_batches: int = 0
 
     # --- Evaluation (input-space PGD) ---
     eval_input_pgd: bool = True
@@ -332,12 +342,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     npf_lq.add_argument(
         "--npf-lastquad-activation",
         type=str,
-        default="softplus",
+        default="elu",
         choices=["elu", "softplus", "relu"],
     )
     npf_lq.add_argument("--npf-lastquad-elu-alpha", type=float, default=1.0)
     npf_lq.add_argument("--npf-lastquad-softplus-beta", type=float, default=10.0)
-    npf_lq.add_argument("--npf-lastquad-init-eps", type=float, default=1e-4)
+    npf_lq.add_argument("--npf-lastquad-init-eps", type=float, default=1e-2)
     npf_lq.add_argument("--npf-lastquad-strong-convexity", type=float, default=1.0)
 
     # NN-DRO
@@ -423,6 +433,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "transport-adversary evals still run (they are O(test-set))."
         ),
     )
+    parser.add_argument(
+        "--profile-inner",
+        action="store_true",
+        help=(
+            "Record synchronized part-by-part timings for inner maximization. "
+            "Adds overhead; intended for NPF/WRM ablations."
+        ),
+    )
+    parser.add_argument(
+        "--profile-inner-batches",
+        type=int,
+        default=0,
+        help="Number of train batches per epoch to profile. 0 profiles every batch.",
+    )
 
     # Evaluation
     parser.add_argument("--eval-input-pgd", dest="eval_input_pgd", action="store_true")
@@ -460,6 +484,8 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "epochs_icnn_pretrain": "epochs_icnn_pretrain",
         "benchmark_mode": "benchmark_mode",
         "skip_pgd_during_train": "skip_pgd_during_train",
+        "profile_inner": "profile_inner",
+        "profile_inner_batches": "profile_inner_batches",
         "batch_size": "batch_size",
         "num_workers": "num_workers",
         "augment_train": "augment_train",
