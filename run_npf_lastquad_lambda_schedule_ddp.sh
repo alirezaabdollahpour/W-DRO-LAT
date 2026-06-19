@@ -32,6 +32,11 @@ SKIP_PGD_DURING_TRAIN=${SKIP_PGD_DURING_TRAIN:-0}
 EVAL_PGD_SAMPLES=${EVAL_PGD_SAMPLES:-1000}
 EPOCHS_ICNN_PRETRAIN=${EPOCHS_ICNN_PRETRAIN:-0}
 FORCE_SCHEDULE=${FORCE_SCHEDULE:-0}
+FREEZE_BATCHNORM=${FREEZE_BATCHNORM:-1}
+RECALIBRATE_BATCHNORM=${RECALIBRATE_BATCHNORM:-0}
+BATCHNORM_RECALIBRATION_BATCHES=${BATCHNORM_RECALIBRATION_BATCHES:-0}
+BATCHNORM_RECALIBRATION_RESET=${BATCHNORM_RECALIBRATION_RESET:-1}
+BATCHNORM_RECALIBRATION_MOMENTUM=${BATCHNORM_RECALIBRATION_MOMENTUM:-}
 
 is_positive_int() {
     case "$1" in
@@ -48,6 +53,26 @@ for name in SEED NPROC K EPOCHS_PER_LAMBDA; do
         exit 1
     fi
 done
+if ! [[ "$BATCHNORM_RECALIBRATION_BATCHES" =~ ^[0-9]+$ ]]; then
+    echo "[FATAL] BATCHNORM_RECALIBRATION_BATCHES must be a non-negative integer, got '${BATCHNORM_RECALIBRATION_BATCHES}'."
+    exit 1
+fi
+if [ -n "$BATCHNORM_RECALIBRATION_MOMENTUM" ]; then
+    python - "$BATCHNORM_RECALIBRATION_MOMENTUM" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and 0.0 <= value <= 1.0 else 1)
+PY
+    if [ "$?" != "0" ]; then
+        echo "[FATAL] BATCHNORM_RECALIBRATION_MOMENTUM must be finite and in [0, 1], got '${BATCHNORM_RECALIBRATION_MOMENTUM}'."
+        exit 1
+    fi
+fi
 
 LAMBDA_SCHEDULE_RAW="${LAMBDA_SCHEDULE//,/ }"
 read -r -a LAMBDAS <<< "$LAMBDA_SCHEDULE_RAW"
@@ -108,8 +133,8 @@ if [ "$FORCE_SCHEDULE" != "1" ] && [ -f "$DONE_FILE" ] && [ -f "$FINAL_CKPT" ]; 
 fi
 
 cat > "$SCHEDULE_MANIFEST" <<EOF
-mode	lambda_schedule	epochs_per_lambda	total_epochs	seed	world_size	k	results_dir	epoch_checkpoint_dir	final_checkpoint
-native	${LAMBDA_SCHEDULE_RAW}	${EPOCHS_PER_LAMBDA}	${TOTAL_EPOCHS}	${SEED}	${NPROC}	${K}	${SCHEDULE_DIR}	${EPOCH_CKPT_DIR}	${FINAL_CKPT}
+mode	lambda_schedule	epochs_per_lambda	total_epochs	seed	world_size	k	freeze_batchnorm	recalibrate_batchnorm	bn_recalibration_batches	bn_recalibration_reset	bn_recalibration_momentum	results_dir	epoch_checkpoint_dir	final_checkpoint
+native	${LAMBDA_SCHEDULE_RAW}	${EPOCHS_PER_LAMBDA}	${TOTAL_EPOCHS}	${SEED}	${NPROC}	${K}	${FREEZE_BATCHNORM}	${RECALIBRATE_BATCHNORM}	${BATCHNORM_RECALIBRATION_BATCHES}	${BATCHNORM_RECALIBRATION_RESET}	${BATCHNORM_RECALIBRATION_MOMENTUM:-cumulative}	${SCHEDULE_DIR}	${EPOCH_CKPT_DIR}	${FINAL_CKPT}
 EOF
 
 echo ""
@@ -118,6 +143,7 @@ echo "  NPF-LastQuad native lambda scheduling — DDP"
 echo "  seed=${SEED}  GPUs=${NPROC}  K=${K}"
 echo "  lambdas=${LAMBDA_SCHEDULE_RAW}"
 echo "  epochs_per_lambda=${EPOCHS_PER_LAMBDA}  total_adv_epochs=${TOTAL_EPOCHS}"
+echo "  BatchNorm: freeze=${FREEZE_BATCHNORM}  recalibrate=${RECALIBRATE_BATCHNORM}  batches=${BATCHNORM_RECALIBRATION_BATCHES}  reset=${BATCHNORM_RECALIBRATION_RESET}  momentum=${BATCHNORM_RECALIBRATION_MOMENTUM:-cumulative}"
 echo "  PGD during train: skip=${SKIP_PGD_DURING_TRAIN} samples=${EVAL_PGD_SAMPLES}"
 echo "  results_dir=${SCHEDULE_DIR}"
 echo "  per_epoch_checkpoints=${EPOCH_CKPT_DIR}"
@@ -133,6 +159,11 @@ CHECKPOINT_EPOCH_OFFSET=0 \
 SKIP_PGD_DURING_TRAIN="$SKIP_PGD_DURING_TRAIN" \
 EVAL_PGD_SAMPLES="$EVAL_PGD_SAMPLES" \
 EPOCHS_ICNN_PRETRAIN="$EPOCHS_ICNN_PRETRAIN" \
+FREEZE_BATCHNORM="$FREEZE_BATCHNORM" \
+RECALIBRATE_BATCHNORM="$RECALIBRATE_BATCHNORM" \
+BATCHNORM_RECALIBRATION_BATCHES="$BATCHNORM_RECALIBRATION_BATCHES" \
+BATCHNORM_RECALIBRATION_RESET="$BATCHNORM_RECALIBRATION_RESET" \
+BATCHNORM_RECALIBRATION_MOMENTUM="$BATCHNORM_RECALIBRATION_MOMENTUM" \
 bash "${SRC_DIR}/run_runtime_sweep_ddp.sh" 0 "$SEED" "$NPROC" "$K" "$TOTAL_EPOCHS"
 
 if [ ! -f "$FINAL_CKPT" ]; then
