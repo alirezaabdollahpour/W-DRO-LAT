@@ -19,6 +19,7 @@ from .transforms import (
     to_pixel,
 )
 from .bb_armijo import BBArmijoState, bb_armijo_step_params, bb_armijo_step_tensor
+from .muon import MuonState, muon_step_params
 from .eval import (
     evaluate_clean,
     evaluate_under_input_pgd,
@@ -45,6 +46,8 @@ __all__ = [
     "BBArmijoState",
     "bb_armijo_step_params",
     "bb_armijo_step_tensor",
+    "MuonState",
+    "muon_step_params",
     "evaluate_clean",
     "evaluate_under_input_pgd",
     "evaluate_under_transport",

@@ -196,15 +196,26 @@ def evaluate_under_input_pgd(
     step_size: Optional[float],
     restarts: int = 1,
     max_batches: Optional[int] = None,
+    max_samples: Optional[int] = None,
 ):
-    """Run input-space PGD in pixel units and report accuracy and perturbation stats."""
+    """Run input-space PGD in pixel units and report robust accuracy.
+
+    Robust accuracy follows the standard benchmark convention: examples that
+    are clean-misclassified are already non-robust, so the final count is
+    ``clean_correct & adversarial_correct``. The attack itself is untargeted
+    PGD on cross-entropy in pixel space, with per-restart random starts,
+    per-sample L2 gradient normalization for L2 attacks, projection back to
+    the requested Lp ball, and clipping to the valid [0, 1] pixel box.
+    """
     phi.eval()
     head.eval()
-    total_correct = 0
+    total_robust_correct = 0
+    total_clean_correct = 0
     total = 0
-    avg_l2 = 0.0
-    avg_linf = 0.0
-    n_batches = 0
+    sum_l2 = 0.0
+    sum_linf = 0.0
+    max_l2 = 0.0
+    max_linf = 0.0
 
     step_size = auto_pgd_step_size(p, eps, steps, step_size)
     restarts = max(1, int(restarts))
@@ -212,13 +223,31 @@ def evaluate_under_input_pgd(
     total_batches = len(loader) if hasattr(loader, "__len__") else None
     if max_batches is not None and total_batches is not None:
         total_batches = min(total_batches, max_batches)
+    if max_samples is not None and total_batches is not None:
+        batch_size = getattr(loader, "batch_size", None) or int(max_samples)
+        total_batches = min(
+            total_batches,
+            max(1, (int(max_samples) + int(batch_size) - 1) // int(batch_size)),
+        )
     progress = tqdm(loader, desc="Input-PGD", leave=False, total=total_batches)
     for batch_idx, (x_norm, y) in enumerate(progress):
         if max_batches is not None and batch_idx >= max_batches:
             break
+        if max_samples is not None and total >= int(max_samples):
+            break
+        if max_samples is not None:
+            remaining = int(max_samples) - total
+            if remaining <= 0:
+                break
+            x_norm = x_norm[:remaining]
+            y = y[:remaining]
         x_norm = x_norm.to(device)
         y = y.to(device)
         x0_pix = to_pixel(x_norm).detach()
+
+        with torch.no_grad():
+            clean_pred = head(phi(x_norm)).argmax(dim=1)
+            clean_correct = clean_pred == y
 
         best_delta = torch.zeros_like(x0_pix)
         best_loss = torch.full((x0_pix.size(0),), -1e9, device=device)
@@ -248,19 +277,34 @@ def evaluate_under_input_pgd(
 
         with torch.no_grad():
             x_adv_best_pix = (x0_pix + best_delta).clamp(0.0, 1.0)
+            final_delta = x_adv_best_pix - x0_pix
             logits = head(phi(to_normalized(x_adv_best_pix)))
-            total_correct += (logits.argmax(dim=1) == y).sum().item()
+            adv_correct = logits.argmax(dim=1) == y
+            robust_correct = clean_correct & adv_correct
+            total_robust_correct += int(robust_correct.sum().item())
+            total_clean_correct += int(clean_correct.sum().item())
             total += x_norm.size(0)
-            delta = best_delta
-            avg_l2 += delta.view(delta.size(0), -1).norm(p=2, dim=1).mean().item()
-            avg_linf += delta.abs().view(delta.size(0), -1).max(dim=1)[0].mean().item()
-            n_batches += 1
+            l2 = final_delta.view(final_delta.size(0), -1).norm(p=2, dim=1)
+            linf = final_delta.abs().view(final_delta.size(0), -1).max(dim=1)[0]
+            sum_l2 += float(l2.sum().item())
+            sum_linf += float(linf.sum().item())
+            max_l2 = max(max_l2, float(l2.max().item()))
+            max_linf = max(max_linf, float(linf.max().item()))
 
-    accuracy = total_correct / max(1, total)
-    avg_l2 /= max(1, n_batches)
-    avg_linf /= max(1, n_batches)
+    accuracy = total_robust_correct / max(1, total)
+    avg_l2 = sum_l2 / max(1, total)
+    avg_linf = sum_linf / max(1, total)
     progress.close()
-    return accuracy, {"avg_l2": avg_l2, "avg_linf": avg_linf, "samples": total}
+    return accuracy, {
+        "clean_acc": total_clean_correct / max(1, total),
+        "clean_correct": total_clean_correct,
+        "robust_correct": total_robust_correct,
+        "avg_l2": avg_l2,
+        "avg_linf": avg_linf,
+        "max_l2": max_l2,
+        "max_linf": max_linf,
+        "samples": total,
+    }
 
 
 def dataloader_seed(base_seed: int, offset: int = 0) -> Tuple[torch.Generator, Callable[[int], None]]:

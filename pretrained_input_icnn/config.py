@@ -8,6 +8,7 @@ classifier-side defaults specific to the CIFAR-10 ResNet setting.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +32,9 @@ class TrainConfig:
     pretrained_strict: bool = False
     save: str = ""
     save_best_robust: str = ""
+    resume_checkpoint: str = ""
+    save_every_epoch_dir: str = ""
+    checkpoint_epoch_offset: int = 0
     log_csv: str = "./runs_log_input_icnn.csv"
 
     # --- Algorithm selection ---
@@ -51,6 +55,7 @@ class TrainConfig:
     lr_theta: float = 0.1
     momentum: float = 0.9
     weight_decay: float = 5e-4
+    freeze_batchnorm: bool = True
     seed: int = 1
 
     # --- DRO core hyperparameters ---
@@ -62,6 +67,13 @@ class TrainConfig:
     # the original script) and --tau (the Figure-6 convention,
     # λ = 1 / (2τ)). Whichever is passed wins.
     lambda_param: float = 30.0
+    # Optional piecewise-constant lambda schedule for adversarial epochs.
+    # When non-empty, lambda_schedule[0] is used for adversarial epochs
+    # 1..lambda_stage_epochs, lambda_schedule[1] for the next block, etc.
+    # This is intentionally handled in-process so optimizer state, Muon state,
+    # LR scheduler state, and DDP sampler epoch progression remain continuous.
+    lambda_schedule: Tuple[float, ...] = ()
+    lambda_stage_epochs: int = 0
     # When True, replace the per-sample CE in the adversary's primary loss
     # with the log-sum-exp margin: logsumexp_{j≠y}(logit_j - logit_y).
     # Mirrors the legacy ``--use-margin-loss`` flag in
@@ -73,9 +85,16 @@ class TrainConfig:
     # --- Inner-loop budget shared by NPF / NN-DRO ---
     omega_steps_per_batch: int = 20
 
+    # --- NPF inner optimizer selection ---
+    # ``bb_armijo`` preserves the existing line-searched ascent. ``muon`` uses
+    # momentum plus Newton-Schulz orthogonalized matrix updates for the NPF ICNN
+    # parameters, with an AdamW/SGD fallback for vector parameters.
+    npf_inner_optimizer: str = "bb_armijo"
+
     # --- Shared BB+Armijo step rule ---
     # Applied UNIFORMLY across all adversaries that have an inner ascent:
-    #   * NPF      — BB+Armijo on ω parameters (parametric variant)
+    #   * NPF      — BB+Armijo on ω parameters when
+    #                npf_inner_optimizer="bb_armijo" (default)
     #   * NN-DRO   — BB+Armijo on MLP adversary parameters (replaces Adam)
     #   * WRM      — BB+Armijo on z (input-space variant)
     #   * Madry / RO is exempt: it uses fixed-step pixel-space l2-PGD
@@ -111,11 +130,25 @@ class TrainConfig:
     npf_bb_ls_c: float = 1e-4
     npf_bb_ls_shrink: float = 0.5
     npf_bb_ls_max_steps: int = 15
+    npf_muon_lr: float = 2e-4
+    npf_muon_momentum: float = 0.95
+    npf_muon_nesterov: bool = True
+    npf_muon_ns_steps: int = 5
+    npf_muon_matrix_lr_scale: str = "auto"
+    npf_muon_weight_decay: float = 0.0
+    npf_muon_fallback: str = "adamw"
+    npf_muon_fallback_lr: float = 0.0
+    npf_muon_fallback_weight_decay: float = 0.0
+    npf_muon_adam_beta1: float = 0.9
+    npf_muon_adam_beta2: float = 0.999
+    npf_muon_adam_eps: float = 1e-8
+    npf_muon_max_grad_norm: float = 0.0
 
     # --- NPF last-quadratic-only variant ---
-    # This shares the NPF trainer, BB+Armijo rule, LogNormal non-negative
-    # layers, and identity initialization. Its potential removes all hidden
-    # quadratic injections and keeps only q_out with rank 0 (diagonal).
+    # This shares the NPF trainer, selectable NPF inner optimizer, LogNormal
+    # non-negative layers, and identity initialization. Its potential removes
+    # all hidden quadratic injections and keeps only q_out with rank 0
+    # (diagonal).
     npf_lastquad_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
     npf_lastquad_activation: str = "softplus"
     npf_lastquad_elu_alpha: float = 1.0
@@ -237,6 +270,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrained-strict", action="store_true")
     parser.add_argument("--save", type=str, default="")
     parser.add_argument("--save-best-robust", type=str, default="")
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default="",
+        help=(
+            "Resume classifier and parametric adversary weights from a previous "
+            "pretrained_input_icnn checkpoint. Optimizer state is intentionally "
+            "not restored; use --lambda-schedule for exact in-process lambda "
+            "scheduling."
+        ),
+    )
+    parser.add_argument(
+        "--save-every-epoch-dir",
+        type=str,
+        default="",
+        help=(
+            "When set, write a classifier + adversary checkpoint at the end of "
+            "every epoch into this directory."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-epoch-offset",
+        type=int,
+        default=0,
+        help=(
+            "Global epoch offset used in per-epoch checkpoint filenames, useful "
+            "for staged schedules."
+        ),
+    )
     parser.add_argument("--log-csv", type=str, default="./runs_log_input_icnn.csv")
 
     # Algorithm
@@ -268,6 +330,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-theta", type=float, default=0.1)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument(
+        "--freeze-batchnorm",
+        dest="freeze_batchnorm",
+        action="store_true",
+        help=(
+            "Keep BatchNorm layers in eval mode during classifier updates, "
+            "preserving pretrained running statistics while still training "
+            "non-BN weights and BN affine parameters."
+        ),
+    )
+    parser.add_argument(
+        "--no-freeze-batchnorm",
+        dest="freeze_batchnorm",
+        action="store_false",
+        help="Allow BatchNorm running statistics to update during classifier training.",
+    )
+    parser.set_defaults(freeze_batchnorm=True)
     parser.add_argument("--seed", type=int, default=1)
 
     # λ
@@ -283,9 +362,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Alternative parameterisation: λ = 1/(2τ). Overrides --penalty-lambda when both are set.",
     )
+    parser.add_argument(
+        "--lambda-schedule",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Piecewise-constant lambda schedule for adversarial epochs, e.g. "
+            "--lambda-schedule 5 10 15 20 30 --lambda-stage-epochs 10. "
+            "Runs in one continuous training process."
+        ),
+    )
+    parser.add_argument(
+        "--lambda-stage-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Number of adversarial epochs per lambda in --lambda-schedule. "
+            "If omitted, epochs_adv must divide evenly by len(lambda_schedule)."
+        ),
+    )
 
     # Inner-loop budget
     parser.add_argument("--omega-steps-per-batch", type=int, default=10)
+    parser.add_argument(
+        "--npf-inner-optimizer",
+        type=str,
+        default="bb_armijo",
+        choices=["bb_armijo", "muon"],
+        help=(
+            "Optimizer for the NPF/NPF-LastQuad adversary inner maximization. "
+            "'bb_armijo' preserves the existing Barzilai-Borwein + Armijo "
+            "line search; 'muon' uses Muon on matrix parameters with the "
+            "configured fallback for vector parameters."
+        ),
+    )
     # Shared BB+Armijo step rule (DRO inner ascent only; Madry/RO uses PGD).
     bb = parser.add_argument_group("bb_armijo (shared step rule)")
     bb.add_argument("--bb-alpha0", type=float, default=2e-4)
@@ -330,6 +441,60 @@ def build_arg_parser() -> argparse.ArgumentParser:
     npf.add_argument("--npf-bb-ls-c", type=float, default=1e-4)
     npf.add_argument("--npf-bb-ls-shrink", type=float, default=0.5)
     npf.add_argument("--npf-bb-ls-max-steps", type=int, default=15)
+    npf.add_argument("--npf-muon-lr", type=float, default=2e-4)
+    npf.add_argument("--npf-muon-momentum", type=float, default=0.95)
+    npf.add_argument(
+        "--npf-muon-nesterov",
+        dest="npf_muon_nesterov",
+        action="store_true",
+        help="Use Nesterov-style momentum in the NPF Muon inner optimizer.",
+    )
+    npf.add_argument(
+        "--no-npf-muon-nesterov",
+        dest="npf_muon_nesterov",
+        action="store_false",
+    )
+    parser.set_defaults(npf_muon_nesterov=True)
+    npf.add_argument("--npf-muon-ns-steps", type=int, default=5)
+    npf.add_argument(
+        "--npf-muon-matrix-lr-scale",
+        type=str,
+        default="auto",
+        choices=["auto", "none"],
+        help=(
+            "Muon matrix learning-rate scaling. 'auto' applies the common "
+            "sqrt(max(1, rows / cols)) factor after flattening tensors to "
+            "(shape[0], -1); 'none' uses exactly --npf-muon-lr."
+        ),
+    )
+    npf.add_argument("--npf-muon-weight-decay", type=float, default=0.0)
+    npf.add_argument(
+        "--npf-muon-fallback",
+        type=str,
+        default="adamw",
+        choices=["adamw", "sgd", "none"],
+        help=(
+            "Update rule for NPF vector/scalar parameters when "
+            "--npf-inner-optimizer=muon. Muon itself is used only for "
+            "matrix-like tensors."
+        ),
+    )
+    npf.add_argument(
+        "--npf-muon-fallback-lr",
+        type=float,
+        default=0.0,
+        help="Fallback lr for vector parameters. 0 reuses --npf-muon-lr.",
+    )
+    npf.add_argument("--npf-muon-fallback-weight-decay", type=float, default=0.0)
+    npf.add_argument("--npf-muon-adam-beta1", type=float, default=0.9)
+    npf.add_argument("--npf-muon-adam-beta2", type=float, default=0.999)
+    npf.add_argument("--npf-muon-adam-eps", type=float, default=1e-8)
+    npf.add_argument(
+        "--npf-muon-max-grad-norm",
+        type=float,
+        default=0.0,
+        help="Global norm clip for NPF Muon gradients. 0 disables clipping.",
+    )
 
     # NPF last-quadratic-only variant
     npf_lq = parser.add_argument_group("npf_lastquad")
@@ -470,6 +635,34 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
     else:
         lambda_param = TrainConfig.lambda_param
 
+    lambda_schedule = tuple(float(x) for x in (args.lambda_schedule or ()))
+    lambda_stage_epochs = int(args.lambda_stage_epochs or 0)
+    if not math.isfinite(lambda_param) or lambda_param <= 0.0:
+        raise ValueError(f"lambda_param must be positive and finite, got {lambda_param}.")
+    if lambda_schedule:
+        bad_lambdas = [x for x in lambda_schedule if not math.isfinite(x) or x <= 0.0]
+        if bad_lambdas:
+            raise ValueError(
+                "All values in --lambda-schedule must be positive and finite; "
+                f"got {bad_lambdas}."
+            )
+        if lambda_stage_epochs <= 0:
+            if int(args.epochs_adv) % len(lambda_schedule) != 0:
+                raise ValueError(
+                    "--lambda-stage-epochs is required when --epochs-adv is not "
+                    "divisible by len(--lambda-schedule)."
+                )
+            lambda_stage_epochs = int(args.epochs_adv) // len(lambda_schedule)
+        expected_epochs = len(lambda_schedule) * lambda_stage_epochs
+        if int(args.epochs_adv) != expected_epochs:
+            raise ValueError(
+                "Lambda schedule length mismatch: expected "
+                f"epochs_adv={expected_epochs} from len(lambda_schedule)="
+                f"{len(lambda_schedule)} and lambda_stage_epochs={lambda_stage_epochs}, "
+                f"but got epochs_adv={args.epochs_adv}."
+            )
+        lambda_param = float(lambda_schedule[0])
+
     field_names = {f.name for f in fields(TrainConfig)}
     kwargs: Dict[str, Any] = {}
     cli_to_field = {
@@ -478,6 +671,9 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "pretrained_strict": "pretrained_strict",
         "save": "save",
         "save_best_robust": "save_best_robust",
+        "resume_checkpoint": "resume_checkpoint",
+        "save_every_epoch_dir": "save_every_epoch_dir",
+        "checkpoint_epoch_offset": "checkpoint_epoch_offset",
         "log_csv": "log_csv",
         "algorithm": "algorithm",
         "epochs_adv": "epochs_adv",
@@ -492,8 +688,10 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "lr_theta": "lr_theta",
         "momentum": "momentum",
         "weight_decay": "weight_decay",
+        "freeze_batchnorm": "freeze_batchnorm",
         "seed": "seed",
         "omega_steps_per_batch": "omega_steps_per_batch",
+        "npf_inner_optimizer": "npf_inner_optimizer",
         "bb_alpha0": "bb_alpha0",
         "bb_alpha_min": "bb_alpha_min",
         "bb_alpha_max": "bb_alpha_max",
@@ -501,6 +699,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "bb_ls_shrink": "bb_ls_shrink",
         "bb_ls_max_steps": "bb_ls_max_steps",
         "use_margin_loss": "use_margin_loss",
+        "lambda_stage_epochs": "lambda_stage_epochs",
         "npf_hidden": "npf_hidden",
         "npf_outer_rank": "npf_outer_rank",
         "npf_inner_rank": "npf_inner_rank",
@@ -515,6 +714,19 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "npf_bb_ls_c": "npf_bb_ls_c",
         "npf_bb_ls_shrink": "npf_bb_ls_shrink",
         "npf_bb_ls_max_steps": "npf_bb_ls_max_steps",
+        "npf_muon_lr": "npf_muon_lr",
+        "npf_muon_momentum": "npf_muon_momentum",
+        "npf_muon_nesterov": "npf_muon_nesterov",
+        "npf_muon_ns_steps": "npf_muon_ns_steps",
+        "npf_muon_matrix_lr_scale": "npf_muon_matrix_lr_scale",
+        "npf_muon_weight_decay": "npf_muon_weight_decay",
+        "npf_muon_fallback": "npf_muon_fallback",
+        "npf_muon_fallback_lr": "npf_muon_fallback_lr",
+        "npf_muon_fallback_weight_decay": "npf_muon_fallback_weight_decay",
+        "npf_muon_adam_beta1": "npf_muon_adam_beta1",
+        "npf_muon_adam_beta2": "npf_muon_adam_beta2",
+        "npf_muon_adam_eps": "npf_muon_adam_eps",
+        "npf_muon_max_grad_norm": "npf_muon_max_grad_norm",
         "npf_lastquad_hidden": "npf_lastquad_hidden",
         "npf_lastquad_activation": "npf_lastquad_activation",
         "npf_lastquad_elu_alpha": "npf_lastquad_elu_alpha",
@@ -567,6 +779,8 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         kwargs[dest] = val
 
     kwargs["lambda_param"] = lambda_param
+    kwargs["lambda_schedule"] = lambda_schedule
+    kwargs["lambda_stage_epochs"] = lambda_stage_epochs
     # Drop any kwargs not known to TrainConfig (defensive against future drift).
     kwargs = {k: v for k, v in kwargs.items() if k in field_names}
     return TrainConfig(**kwargs)

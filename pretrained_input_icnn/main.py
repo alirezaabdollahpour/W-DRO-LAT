@@ -122,6 +122,18 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(_json_ready(payload), indent=2, allow_nan=False))
 
 
+def _load_resume_payload(path: str) -> Dict[str, Any]:
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"--resume-checkpoint not found: {ckpt_path}")
+    payload = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(f"--resume-checkpoint must contain a dict payload: {ckpt_path}")
+    if "classifier" not in payload:
+        raise KeyError(f"--resume-checkpoint is missing required 'classifier': {ckpt_path}")
+    return payload
+
+
 def _metric_definitions(use_margin_loss: bool) -> Dict[str, str]:
     adv_loss = (
         "Mean logsumexp margin on T_omega(x): logsumexp_{j != y}(logit_j - logit_y)."
@@ -155,8 +167,9 @@ def _metric_definitions(use_margin_loss: bool) -> Dict[str, str]:
             "Inner-maximization profiler fields. Timings are CUDA-synchronized "
             "seconds, off by default, and intended for ablation rather than "
             "throughput training. *_per_batch averages over profiled train "
-            "batches; *_per_step averages over BB+Armijo inner steps; "
-            "*_per_trial averages over Armijo trial objectives."
+            "batches; *_per_step averages over inner optimizer steps "
+            "(BB+Armijo or Muon); *_per_trial averages over Armijo trial "
+            "objectives."
         ),
     }
 
@@ -207,6 +220,13 @@ def main() -> None:
         device=device,
     ).to(device)
 
+    resume_payload = None
+    if cfg.resume_checkpoint:
+        resume_payload = _load_resume_payload(cfg.resume_checkpoint)
+        classifier.load_state_dict(resume_payload["classifier"], strict=True)
+        if is_main:
+            print(f"[input-icnn] resumed classifier from {cfg.resume_checkpoint}")
+
     if is_main:
         sanity_loss, sanity_acc = evaluate_clean(classifier, test_loader, device)
         print(f"[sanity] clean test  loss={sanity_loss:.4f}  acc={sanity_acc*100:.2f}%")
@@ -221,6 +241,12 @@ def main() -> None:
         config=cfg,
         train_sampler=train_sampler,
     )
+
+    if resume_payload is not None:
+        trainer.load_adversary_state_dicts(resume_payload, strict=True)
+        if is_main:
+            print(f"[input-icnn] resumed adversary from {cfg.resume_checkpoint}")
+    dist_helpers.barrier()
 
     history = trainer.fit()
     trainer.save_final()
@@ -248,7 +274,7 @@ def main() -> None:
             **entry,
             "run_id": run_id,
             "adversary_loss_type": adversary_loss_type,
-            "lambda_param": cfg.lambda_param,
+            "lambda_param": entry.get("lambda_param", cfg.lambda_param),
         }
         for entry in history
     ]
@@ -290,7 +316,7 @@ def main() -> None:
                 "input_pgd_max_l2": entry.get("input_pgd_max_l2"),
                 "input_pgd_max_linf": entry.get("input_pgd_max_linf"),
                 "input_pgd_samples": entry.get("input_pgd_samples"),
-                "lambda_param": cfg.lambda_param,
+                "lambda_param": entry.get("lambda_param", cfg.lambda_param),
                 "lr_theta": cfg.lr_theta,
                 "batch_size": cfg.batch_size,
                 "seed": cfg.seed,

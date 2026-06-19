@@ -4,22 +4,25 @@ set -euo pipefail
 # Drives the new pretrained_input_icnn package.
 #
 # Usage:
-#   bash run_pretrained_input_icnn.sh                     # NPF (default)
+#   bash run_pretrained_input_icnn.sh                     # npf_lastquad (default)
 #   ALGORITHM=madry bash run_pretrained_input_icnn.sh     # baseline competitor
 #   ALGORITHM=nn_dro EPOCHS_ADV=20 bash run_pretrained_input_icnn.sh
 #
 # Environment overrides (defaults shown):
-#   ALGORITHM             npf
-#   PRETRAINED_PATH       /mnt/lts4/scratch/students/aabdolla/LAT/ResNet_checkpoints/R2.pth
-#   EPOCHS_ADV            30
+#   ALGORITHM             npf_lastquad (default), npf, nn_dro, madry, wrm, wfr, dual, new_ppa
+#   PRETRAINED_PATH       /mloscratch/homes/aabdolla/LAT/ResNet_checkpoints/R2.pth
+#   EPOCHS_ADV            50
 #   BATCH_SIZE            512
-#   PENALTY_LAMBDA        30
-#   LR_THETA              0.1
-#   OMEGA_STEPS           10        (NPF / NN-DRO)
+#   PENALTY_LAMBDA        10
+#   LR_THETA              0.003
+#   OMEGA_STEPS           20        (NPF / NN-DRO)
+#   NPF_LASTQUAD_HIDDEN   "1024 512 512 256 128 64"
 #   INP_P                 2
 #   INP_EPS               0.5
 #   USE_MARGIN_LOSS       0         (set to 1 to use logsumexp margin objective
 #                                    for the adversary on NPF/NN-DRO/WRM/Madry/PPA)
+#   PROFILE_INNER         0         (set to 1 for synchronized inner-loop timing)
+#   PROFILE_INNER_BATCHES 0         (0 = profile every train batch)
 #   EPOCHS_ICNN_PRETRAIN  0         (warmup: train only the adversary (NPF/NN-DRO)
 #                                    for this many epochs before the regular minimax
 #                                    schedule kicks in; classifier stays frozen)
@@ -27,22 +30,29 @@ set -euo pipefail
 # The script forwards algorithm-specific defaults from
 # Logistic_Regression_CIFAR10/config.py and Runtime-LR-CIFAR10/run_runtime_lr_cifar10.sh,
 # so e.g. NPF uses npf_outer_rank=8, npf_inner_rank=2, init_eps=1e-4.
+# The default npf_lastquad run uses only the final diagonal quadratic term.
 
-ALGORITHM="${ALGORITHM:-npf}"
-PRETRAINED_PATH="${PRETRAINED_PATH:-/mnt/lts4/scratch/students/aabdolla/LAT/ResNet_checkpoints/R2.pth}"
-EPOCHS_ADV="${EPOCHS_ADV:-30}"
+ALGORITHM="${ALGORITHM:-npf_lastquad}"
+PRETRAINED_PATH="${PRETRAINED_PATH:-/mloscratch/homes/aabdolla/LAT/ResNet_checkpoints/R2.pth}"
+EPOCHS_ADV="${EPOCHS_ADV:-50}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
-PENALTY_LAMBDA="${PENALTY_LAMBDA:-30}"
-LR_THETA="${LR_THETA:-0.1}"
-OMEGA_STEPS="${OMEGA_STEPS:-10}"
+PENALTY_LAMBDA="${PENALTY_LAMBDA:-10}"
+LR_THETA="${LR_THETA:-0.003}"
+OMEGA_STEPS="${OMEGA_STEPS:-20}"
 INP_P="${INP_P:-2}"
 INP_EPS="${INP_EPS:-0.5}"
 INP_STEPS="${INP_STEPS:-20}"
 INP_RESTARTS="${INP_RESTARTS:-5}"
 EVAL_PGD_SAMPLES="${EVAL_PGD_SAMPLES:-1000}"
 SEED="${SEED:-1}"
-USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-1}"
+USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-0}"
+PROFILE_INNER="${PROFILE_INNER:-0}"
+PROFILE_INNER_BATCHES="${PROFILE_INNER_BATCHES:-0}"
+SKIP_PGD_DURING_TRAIN="${SKIP_PGD_DURING_TRAIN:-0}"
+BENCHMARK_MODE="${BENCHMARK_MODE:-0}"
 EPOCHS_ICNN_PRETRAIN="${EPOCHS_ICNN_PRETRAIN:-0}"
+NPF_LASTQUAD_HIDDEN="${NPF_LASTQUAD_HIDDEN:-1024 512 512 256 128 64}"
+read -r -a NPF_LASTQUAD_HIDDEN_ARGS <<< "${NPF_LASTQUAD_HIDDEN}"
 
 # Per-algorithm save tag.
 SAVE_PATH="${SAVE_PATH:-results/${ALGORITHM}_lambda${PENALTY_LAMBDA}_${EPOCHS_ADV}ep.pth}"
@@ -69,6 +79,15 @@ COMMON_ARGS=(
 if [[ "${USE_MARGIN_LOSS}" == "1" ]]; then
   COMMON_ARGS+=(--use-margin-loss)
 fi
+if [[ "${PROFILE_INNER}" == "1" ]]; then
+  COMMON_ARGS+=(--profile-inner --profile-inner-batches "${PROFILE_INNER_BATCHES}")
+fi
+if [[ "${SKIP_PGD_DURING_TRAIN}" == "1" ]]; then
+  COMMON_ARGS+=(--skip-pgd-during-train)
+fi
+if [[ "${BENCHMARK_MODE}" == "1" ]]; then
+  COMMON_ARGS+=(--benchmark-mode)
+fi
 
 case "${ALGORITHM}" in
   npf)
@@ -81,12 +100,29 @@ case "${ALGORITHM}" in
       --npf-softplus-beta "${NPF_SOFTPLUS_BETA:-10.0}"
       --npf-init-eps "${NPF_INIT_EPS:-1e-4}"
       --npf-strong-convexity "${NPF_STRONG_CONVEXITY:-1.0}"
-      --npf-bb-alpha0 "${NPF_BB_ALPHA0:-2e-4}"
-      --npf-bb-alpha-min "${NPF_BB_ALPHA_MIN:-1e-7}"
-      --npf-bb-alpha-max "${NPF_BB_ALPHA_MAX:-0.25}"
-      --npf-bb-ls-c "${NPF_BB_LS_C:-1e-4}"
-      --npf-bb-ls-shrink "${NPF_BB_LS_SHRINK:-0.5}"
-      --npf-bb-ls-max-steps "${NPF_BB_LS_MAX_STEPS:-15}"
+      --bb-alpha0 "${NPF_BB_ALPHA0:-2e-4}"
+      --bb-alpha-min "${NPF_BB_ALPHA_MIN:-1e-7}"
+      --bb-alpha-max "${NPF_BB_ALPHA_MAX:-0.25}"
+      --bb-ls-c "${NPF_BB_LS_C:-1e-4}"
+      --bb-ls-shrink "${NPF_BB_LS_SHRINK:-0.5}"
+      --bb-ls-max-steps "${NPF_BB_LS_MAX_STEPS:-15}"
+    )
+    ;;
+  npf_lastquad)
+    EXTRA_ARGS=(
+      --omega-steps-per-batch "${OMEGA_STEPS}"
+      --npf-lastquad-hidden "${NPF_LASTQUAD_HIDDEN_ARGS[@]}"
+      --npf-lastquad-activation "${NPF_LASTQUAD_ACTIVATION:-${NPF_ACTIVATION:-softplus}}"
+      --npf-lastquad-elu-alpha "${NPF_LASTQUAD_ELU_ALPHA:-1.0}"
+      --npf-lastquad-softplus-beta "${NPF_LASTQUAD_SOFTPLUS_BETA:-${NPF_SOFTPLUS_BETA:-10.0}}"
+      --npf-lastquad-init-eps "${NPF_LASTQUAD_INIT_EPS:-${NPF_INIT_EPS:-1e-4}}"
+      --npf-lastquad-strong-convexity "${NPF_LASTQUAD_STRONG_CONVEXITY:-${NPF_STRONG_CONVEXITY:-1.0}}"
+      --bb-alpha0 "${NPF_LASTQUAD_BB_ALPHA0:-${NPF_BB_ALPHA0:-2e-4}}"
+      --bb-alpha-min "${NPF_LASTQUAD_BB_ALPHA_MIN:-${NPF_BB_ALPHA_MIN:-1e-7}}"
+      --bb-alpha-max "${NPF_LASTQUAD_BB_ALPHA_MAX:-${NPF_BB_ALPHA_MAX:-0.25}}"
+      --bb-ls-c "${NPF_LASTQUAD_BB_LS_C:-${NPF_BB_LS_C:-1e-4}}"
+      --bb-ls-shrink "${NPF_LASTQUAD_BB_LS_SHRINK:-${NPF_BB_LS_SHRINK:-0.5}}"
+      --bb-ls-max-steps "${NPF_LASTQUAD_BB_LS_MAX_STEPS:-${NPF_BB_LS_MAX_STEPS:-15}}"
     )
     ;;
   nn_dro)
@@ -108,7 +144,7 @@ case "${ALGORITHM}" in
     ;;
   wrm)
     EXTRA_ARGS=(
-      --wrm-inner-steps "${WRM_INNER_STEPS:-100}"
+      --wrm-inner-steps "${WRM_INNER_STEPS:-${OMEGA_STEPS}}"
       --wrm-inner-lr "${WRM_INNER_LR:-1e-2}"
     )
     ;;
@@ -139,7 +175,7 @@ case "${ALGORITHM}" in
     ;;
   *)
     echo "ERROR: unknown ALGORITHM=${ALGORITHM}" >&2
-    echo "Choose one of: npf nn_dro madry wrm wfr dual new_ppa" >&2
+    echo "Choose one of: npf npf_lastquad nn_dro madry wrm wfr dual new_ppa" >&2
     exit 1
     ;;
 esac

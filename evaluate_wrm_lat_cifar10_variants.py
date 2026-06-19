@@ -32,10 +32,13 @@ python evaluate_wrm_lat_cifar10_variants.py \
 """
 
 import os
+import sys
 import tarfile
 import json
 import argparse
+import csv
 import inspect
+import importlib.util
 from functools import partial
 import math
 from datetime import datetime
@@ -393,6 +396,10 @@ def _extract_state_dict(ckpt: dict) -> Tuple[dict, Optional[str]]:
     if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
         return ckpt["state_dict"], "state_dict"
 
+    # Input-ICNN / NPF training checkpoints save the evaluated classifier here.
+    if "classifier" in ckpt and isinstance(ckpt["classifier"], dict):
+        return ckpt["classifier"], "classifier"
+
     # Common natural-model checkpoints bundled with multiple versions
     for key in ("best", "swa_best", "swa_last", "last", "model", "net"):
         if key in ckpt and isinstance(ckpt[key], dict):
@@ -519,6 +526,8 @@ def load_backbone_from_ckpt(path: str, device: torch.device):
         "arch": arch,
         "arch_init": arch_init,
         "state_dict_key": sd_key,
+        "algorithm": ckpt.get("algorithm", None),
+        "robust_input_pgd_acc": ckpt.get("robust_input_pgd_acc", None),
     }
     return base, meta
 
@@ -1064,6 +1073,10 @@ def parse_args():
                    help="Step size for input-space PGD (pixel units). If <=0, auto = 2*eps/steps")
     p.add_argument("--inp-restarts", type=int, default=5,
                    help="Random restarts for input-space PGD")
+    p.add_argument("--inp-eps-sweep", type=float, nargs="+", default=None,
+                   help="Optional CIFAR-10 PGD epsilon sweep in pixel units, e.g. 0.1 0.2 ... 0.9")
+    p.add_argument("--inp-sweep-max-samples", type=int, default=-1,
+                   help="Limit PGD epsilon sweep to first N CIFAR-10 samples (<=0 means full test set).")
     return p.parse_args()
 
 
@@ -1083,6 +1096,11 @@ def main():
     autoattack_requested = bool(args.autoattack)
     advlib_requested = bool(args.advlib)
     perform_standard_eval = not (args.autoattack_only or args.advlib_only)
+
+    print("Python executable:", sys.executable)
+    if autoattack_requested:
+        autoattack_spec = importlib.util.find_spec("autoattack")
+        print("[autoattack] module:", autoattack_spec.origin if autoattack_spec is not None else "not found")
 
     if autoattack_requested and args.autoattack_bs <= 0:
         raise ValueError("--autoattack-bs must be positive.")
@@ -1457,9 +1475,80 @@ def main():
             print(f"  CIFAR-10   PGD: {acc_pgd_c10_pct:.2f}% (avg L2 {info_c10['avg_l2']:.3f}, Linf {info_c10['avg_linf']:.3f})")
             results["scores"]["cifar10_pgd"] = {
                 "acc": round(acc_pgd_c10_pct, 2),
+                "clean_acc": round(100.0 * float(info_c10.get("clean_acc", 0.0)), 2),
+                "clean_correct": int(info_c10.get("clean_correct", 0)),
+                "robust_correct": int(info_c10.get("robust_correct", 0)),
                 "avg_l2": round(info_c10["avg_l2"], 4),
                 "avg_linf": round(info_c10["avg_linf"], 4),
+                "max_l2": round(float(info_c10.get("max_l2", 0.0)), 4),
+                "max_linf": round(float(info_c10.get("max_linf", 0.0)), 4),
+                "samples": int(info_c10.get("samples", 0)),
             }
+
+            if args.inp_eps_sweep:
+                sweep_eps = list(dict.fromkeys(float(eps) for eps in args.inp_eps_sweep))
+                sweep_max_samples = (
+                    int(args.inp_sweep_max_samples)
+                    if int(args.inp_sweep_max_samples) > 0
+                    else None
+                )
+                print(
+                    "\nEvaluating CIFAR-10 input-space PGD epsilon sweep "
+                    f"(L{args.inp_p}, steps={args.inp_steps}, restarts={args.inp_restarts})..."
+                )
+                sweep_entries = []
+                sweep_by_eps = {}
+                for eps_i in sweep_eps:
+                    if eps_i <= 0:
+                        print(f"  eps={eps_i:g}: skipped (epsilon must be > 0)")
+                        continue
+                    step_i = auto_pgd_step_size(p_value, eps_i, args.inp_steps, args.inp_step_size)
+                    acc_i, info_i = evaluate_under_input_pgd(
+                        phi_identity,
+                        base,
+                        c10_loader,
+                        device,
+                        p=p_value,
+                        eps=eps_i,
+                        steps=args.inp_steps,
+                        step_size=step_i,
+                        restarts=args.inp_restarts,
+                        max_samples=sweep_max_samples,
+                    )
+                    entry = {
+                        "p": args.inp_p,
+                        "eps": float(eps_i),
+                        "steps": int(args.inp_steps),
+                        "step_size": float(step_i),
+                        "restarts": int(args.inp_restarts),
+                        "acc": round(100.0 * acc_i, 2),
+                        "clean_acc": round(100.0 * float(info_i.get("clean_acc", 0.0)), 2),
+                        "clean_correct": int(info_i.get("clean_correct", 0)),
+                        "robust_correct": int(info_i.get("robust_correct", 0)),
+                        "avg_l2": round(float(info_i["avg_l2"]), 4),
+                        "avg_linf": round(float(info_i["avg_linf"]), 4),
+                        "max_l2": round(float(info_i.get("max_l2", 0.0)), 4),
+                        "max_linf": round(float(info_i.get("max_linf", 0.0)), 4),
+                        "samples": int(info_i.get("samples", 0)),
+                    }
+                    sweep_entries.append(entry)
+                    sweep_by_eps[f"{eps_i:g}"] = entry
+                    print(
+                        f"  eps={eps_i:g}: robust_acc={entry['acc']:.2f}% "
+                        f"(clean={entry['clean_acc']:.2f}%, avg L2={entry['avg_l2']:.3f}, "
+                        f"max L2={entry['max_l2']:.3f}, n={entry['samples']})"
+                    )
+                results["scores"]["cifar10_pgd_sweep"] = {
+                    "params": {
+                        "p": args.inp_p,
+                        "steps": int(args.inp_steps),
+                        "restarts": int(args.inp_restarts),
+                        "step_size_mode": "auto=2*eps/steps" if args.inp_step_size <= 0 else "fixed",
+                        "max_samples": sweep_max_samples,
+                    },
+                    "entries": sweep_entries,
+                    "by_eps": sweep_by_eps,
+                }
 
             if c101_loader is not None:
                 acc_pgd_c101, info_c101 = run_input_pgd(c101_loader)
@@ -1530,6 +1619,7 @@ def main():
                     "eps": args.autoattack_eps,
                     "version": args.autoattack_version,
                     "verbose": True,
+                    "device": device,
                 }
                 if autoattack_attacks is not None:
                     aa_kwargs["attacks_to_run"] = autoattack_attacks
@@ -1547,6 +1637,15 @@ def main():
                         adversary.apgd.n_restarts = args.autoattack_restarts
                     if hasattr(adversary, "apgd_targeted"):
                         adversary.apgd_targeted.n_restarts = args.autoattack_restarts
+                effective_attacks = list(getattr(adversary, "attacks_to_run", autoattack_attacks or []))
+                apgd_n_iter = getattr(getattr(adversary, "apgd", None), "n_iter", None)
+                apgd_t_n_iter = getattr(getattr(adversary, "apgd_targeted", None), "n_iter", None)
+                print(
+                    "  AutoAttack effective config: "
+                    f"norm={args.autoattack_norm}, eps={args.autoattack_eps}, "
+                    f"version={args.autoattack_version}, attacks={effective_attacks}, "
+                    f"apgd_iters={apgd_n_iter}, apgd_t_iters={apgd_t_n_iter}"
+                )
                 x_adv = adversary.run_standard_evaluation(
                     x_c10_pix,
                     y_c10_cpu,
@@ -1571,7 +1670,10 @@ def main():
                     "max_examples": autoattack_max_examples,
                     "seed": args.autoattack_seed,
                     "attacks": autoattack_attacks,
+                    "effective_attacks": effective_attacks,
                     "iters": args.autoattack_iters,
+                    "apgd_iters": apgd_n_iter,
+                    "apgd_t_iters": apgd_t_n_iter,
                     "restarts": args.autoattack_restarts,
                 }
 
@@ -1752,6 +1854,35 @@ def main():
     with open(save_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved results to: {save_path}")
+
+    sweep = results.get("scores", {}).get("cifar10_pgd_sweep")
+    if isinstance(sweep, dict) and sweep.get("entries"):
+        sweep_csv = save_path.with_suffix(".pgd_sweep.csv")
+        fieldnames = [
+            "p",
+            "eps",
+            "steps",
+            "step_size",
+            "restarts",
+            "acc",
+            "clean_acc",
+            "clean_correct",
+            "robust_correct",
+            "avg_l2",
+            "avg_linf",
+            "max_l2",
+            "max_linf",
+            "samples",
+        ]
+        with sweep_csv.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for entry in sweep["entries"]:
+                writer.writerow({key: entry.get(key) for key in fieldnames})
+        results["scores"]["cifar10_pgd_sweep"]["csv"] = str(sweep_csv)
+        with open(save_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Saved PGD epsilon sweep CSV to: {sweep_csv}")
 
 
 if __name__ == "__main__":

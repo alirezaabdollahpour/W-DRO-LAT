@@ -3,14 +3,17 @@
 # Input-ICNN Runtime Sweep — DDP edition
 # =============================================================================
 #
-# Fair runtime comparison across 7 input-space adversarial training
-# algorithms on CIFAR-10, with each run distributed across NPROC GPUs
-# via torchrun + DistributedDataParallel.
+# Multi-GPU DDP launcher for the pretrained input-ICNN adversarial
+# training experiments. By default this script follows
+# run_pretrained_input_icnn.sh and runs only NPF-LastQuad on CIFAR-10,
+# distributed across NPROC GPUs via torchrun + DistributedDataParallel.
 #
 # Adversaries:
-#   * NPF      — NPF ICNN potential, BB+Armijo on ω parameters
+#   * NPF      — NPF ICNN potential, selectable BB+Armijo or Muon on
+#                ω parameters
 #   * NPF-LastQuad — NPF variant with only the final rank-0 diagonal
-#                quadratic layer trainable
+#                quadratic layer trainable; uses the same NPF optimizer
+#                selector
 #   * NN-DRO   — vanilla MLP adversary, BB+Armijo on ω parameters
 #                (replaces the legacy Adam ascent)
 #   * Madry/RO — fixed-step pixel-space l2-PGD threat model with
@@ -37,7 +40,8 @@
 #
 # All BB+Armijo hyperparameters (alpha0, alpha_min, alpha_max, ls_c,
 # ls_shrink, ls_max_steps) are SHARED across the DRO inner-ascent
-# methods, defaulting to NPF's settings from the LR-CIFAR10 reference.
+# methods that use BB. NPF / NPF-LastQuad can instead use Muon by setting
+# NPF_INNER_OPTIMIZER=muon.
 # Madry/RO is intentionally excluded: it is standard pixel-space l2-PGD with
 # epsilon, not a lambda-penalised DRO objective.
 #
@@ -57,10 +61,10 @@
 # Per-rank batch_size = BATCH_SIZE / NPROC, so the GLOBAL effective batch
 # matches the single-GPU configuration for fair throughput comparison.
 #
-# Algorithms are run sequentially within a script invocation. To run
-# subsets on multiple jobs concurrently, use the SPLIT mechanism below.
+# Other algorithms are kept below as commented reference for later runtime
+# sweeps, but they are intentionally disabled for the current launch.
 #
-# ---- Fairness rules baked in ----
+# ---- Run defaults baked in ----
 #
 #   * Same outer hyperparameters (epochs, lr_theta, λ for DRO methods,
 #     global batch). Madry/RO uses epsilon instead of λ.
@@ -69,11 +73,16 @@
 #     Madry/RO pgd_steps=K, New_PPA round0_steps=refine_steps=K, Dual
 #     langevin_steps=K via the Option-D MALA sampler).
 #   * Same BB+Armijo step rule and hyperparameters across the DRO
-#     inner-ascent methods. Madry/RO uses pixel-space l2-PGD; Dual uses the
-#     Langevin/MALA sampler for its entropic Gibbs target.
-#   * --skip-pgd-during-train: PGD eval would otherwise dominate.
-#   * --benchmark-mode: cuDNN autotune + TF32, identical for all algos.
-#   * Sequential (no in-script concurrency on the same GPUs).
+#     inner-ascent methods when they use BB. For NPF / NPF-LastQuad,
+#     NPF_INNER_OPTIMIZER=muon swaps only the NPF ω-ascent rule. Madry/RO
+#     uses pixel-space l2-PGD; Dual uses the Langevin/MALA sampler for its
+#     entropic Gibbs target.
+#   * Input PGD evaluation is enabled by default, matching
+#     run_pretrained_input_icnn.sh. Set SKIP_PGD_DURING_TRAIN=1 only for
+#     pure throughput timing.
+#   * BENCHMARK_MODE=0 by default, matching run_pretrained_input_icnn.sh.
+#     Set BENCHMARK_MODE=1 for cuDNN autotune + TF32 timing sweeps.
+#   * Sequential execution if more than one algorithm is enabled later.
 #   * Per-epoch CUDA-synced wallclock; analyzer drops epoch 1.
 #
 # ---- Memory safety ----
@@ -84,41 +93,52 @@
 #     budget — preserves global throughput at the cost of GPU memory pressure.
 #
 # Usage:
-#   bash run_runtime_sweep_ddp.sh [SPLIT] [SEED] [NPROC] [K] [EPOCHS]
+#   bash run_runtime_sweep_ddp.sh [SPLIT] [SEED] [NPROC] [K] [EPOCHS] [OUTPUT_FOLDER_NAME]
 #
-#   SPLIT 0  — run all 7 algorithms sequentially (single job)
+#   SPLIT 0 or 1 — run npf_lastquad
+#   SPLIT 2..4   — no-op while only npf_lastquad is enabled
+#
+# Output location:
+#   RESULTS_ROOT defaults to ${SRC_DIR}/input_icnn_ddp_runs.
+#   OUTPUT_FOLDER_NAME sets the subfolder under RESULTS_ROOT. This is the
+#   easiest way to start a fresh run when an old run already has .completed.
+#   RESULTS_DIR is still accepted as a full explicit output path.
+#
+# The old full-suite split map is intentionally commented out for now:
 #   SPLIT 1  — npf
 #   SPLIT 2  — nn_dro, madry
 #   SPLIT 3  — wrm, wfr
 #   SPLIT 4  — dual, new_ppa
 #
-# To run only the last-quadratic NPF variant, set
-#   RUN_ONLY_ALGO=npf_lastquad
-# and use SPLIT=1 (or keep the old 1..4 loop; splits 2..4 will no-op).
+# Cluster submission example (one 4-GPU NPF-LastQuad job):
+#   ./csub.py -n input-icnn-npf-lastquad-ddp -g 4 -t 1d --train \
+#     --command "cd /path/to/LAT && bash run_runtime_sweep_ddp.sh 0 1 4 20 50"
 #
-# Cluster submission example (one 4-GPU job per split, splits in parallel):
-#   for i in 1 2 3 4; do
-#     ./csub.py -n input-icnn-ddp-$i -g 4 -t 1d --train \
-#       --command "cd /path/to/LAT && bash run_runtime_sweep_ddp.sh \$i 1 4 20 30"
-#   done
+# Fresh output folder example:
+#   OUTPUT_FOLDER_NAME=debug_muon_$(date -u +%Y%m%dT%H%M%SZ) \
+#     bash run_runtime_sweep_ddp.sh 0 1 1 20 1
 # =============================================================================
 
 # Don't use set -e — we want OOM retry on individual algorithms.
 
-SPLIT=${1:-0}
-SEED=${2:-1}
-NPROC=${3:-4}
-K=${4:-20}
-EPOCHS_ADV=${5:-30}
+SPLIT=${1:-${SPLIT:-0}}
+SEED=${2:-${SEED:-1}}
+NPROC=${3:-${NPROC:-4}}
+K=${4:-${OMEGA_STEPS:-${K:-20}}}
+# Backward-compatible epoch aliases:
+#   ADV_EPOCHS controls classifier-updating adversarial epochs.
+#   WARMUP_EPOCHS controls fixed-theta ICNN/NPF adversary warmup epochs.
+# Positional arg 5 and the older EPOCHS_ADV/EPOCHS_ICNN_PRETRAIN names keep
+# precedence so existing launch commands remain unchanged.
+EPOCHS_ADV=${5:-${EPOCHS_ADV:-${ADV_EPOCHS:-50}}}
+OUTPUT_FOLDER_NAME=${6:-${OUTPUT_FOLDER_NAME:-${RESULTS_SUBDIR:-}}}
 
 # ---- Paths (override with env vars) ----
-SRC_DIR="${SRC_DIR:-/mnt/lts4/scratch/students/aabdolla/LAT}"
+SRC_DIR="${SRC_DIR:-/mloscratch/homes/aabdolla/LAT}"
 PRETRAINED_PATH="${PRETRAINED_PATH:-${SRC_DIR}/ResNet_checkpoints/R2.pth}"
 DATA_DIR="${DATA_DIR:-${SRC_DIR}/data}"
-RESULTS_DIR="${RESULTS_DIR:-${SRC_DIR}/runtime_sweep_K${K}_ddp${NPROC}}"
-LOG_DIR="${RESULTS_DIR}/logs"
-TIME_DIR="${RESULTS_DIR}/time"
-MANIFEST="${RESULTS_DIR}/run_manifest.tsv"
+RESULTS_ROOT="${RESULTS_ROOT:-${SRC_DIR}/input_icnn_ddp_runs}"
+RESULTS_DIR_OVERRIDE="${RESULTS_DIR:-}"
 
 cd "$SRC_DIR"
 
@@ -129,26 +149,34 @@ export MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
 export PYTHONUNBUFFERED=1
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
-mkdir -p "$RESULTS_DIR" "$LOG_DIR" "$TIME_DIR"
-if [ ! -f "$MANIFEST" ]; then
-    printf "status\talgorithm\tseed\tworld_size\tk\tepochs\tstarted_utc\tended_utc\telapsed_seconds\tlog_file\ttime_file\tcsv\n" > "$MANIFEST"
-fi
-
 # ---- Shared training hyperparameters ----
-COMMON_BATCH=${COMMON_BATCH:-512}     # global effective batch (split across ranks)
+COMMON_BATCH=${COMMON_BATCH:-${BATCH_SIZE:-512}}  # global effective batch (split across ranks)
 PENALTY_LAMBDA=${PENALTY_LAMBDA:-30}
+LAMBDA_SCHEDULE=${LAMBDA_SCHEDULE:-}
+LAMBDA_STAGE_EPOCHS=${LAMBDA_STAGE_EPOCHS:-0}
 LR_THETA=${LR_THETA:-0.1}
+FREEZE_BATCHNORM=${FREEZE_BATCHNORM:-1}
 INP_P=${INP_P:-2}
 INP_EPS=${INP_EPS:-0.5}
+INP_STEPS=${INP_STEPS:-20}
+INP_RESTARTS=${INP_RESTARTS:-5}
+EVAL_PGD_SAMPLES=${EVAL_PGD_SAMPLES:-1000}
 MADRY_PGD_STEP_SIZE=${MADRY_PGD_STEP_SIZE:-0}  # 0 => trainer default 2*epsilon/K
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
+SKIP_PGD_DURING_TRAIN=${SKIP_PGD_DURING_TRAIN:-0}
+BENCHMARK_MODE=${BENCHMARK_MODE:-0}
+PROFILE_INNER=${PROFILE_INNER:-0}
+PROFILE_INNER_BATCHES=${PROFILE_INNER_BATCHES:-0}
+RESUME_CHECKPOINT=${RESUME_CHECKPOINT:-}
+SAVE_EVERY_EPOCH_DIR=${SAVE_EVERY_EPOCH_DIR:-}
+CHECKPOINT_EPOCH_OFFSET=${CHECKPOINT_EPOCH_OFFSET:-0}
 # Conservative default — cluster containers typically ship with a tiny
 # /dev/shm (Docker's 64 MB default) and 4 workers/rank × 4 ranks = 16
 # worker processes is enough to exhaust it. CIFAR-10 fits in RAM and the
 # GPU adversary work dominates wallclock, so 2 workers/rank is plenty.
 # Set NUM_WORKERS=0 if you still hit "No space left on device".
 NUM_WORKERS=${NUM_WORKERS:-2}
-EPOCHS_ICNN_PRETRAIN=${EPOCHS_ICNN_PRETRAIN:-0}
+EPOCHS_ICNN_PRETRAIN=${EPOCHS_ICNN_PRETRAIN:-${WARMUP_EPOCHS:-0}}
 
 # ---- Shared BB+Armijo step rule (overridable; defaults match NPF's) ----
 BB_ALPHA0=${BB_ALPHA0:-2e-4}
@@ -182,15 +210,60 @@ DUAL_SAMPLE_LEVEL=${DUAL_SAMPLE_LEVEL:-3}  # m=8 — keeps wallclock comparable
 
 # ---- NPF last-quadratic-only architecture knobs ----
 RUN_ONLY_ALGO=${RUN_ONLY_ALGO:-}
+NPF_INNER_OPTIMIZER=${NPF_INNER_OPTIMIZER:-bb_armijo}  # bb_armijo | muon
+NPF_MUON_LR=${NPF_MUON_LR:-2e-4}
+NPF_MUON_MOMENTUM=${NPF_MUON_MOMENTUM:-0.95}
+NPF_MUON_NESTEROV=${NPF_MUON_NESTEROV:-1}
+NPF_MUON_NS_STEPS=${NPF_MUON_NS_STEPS:-5}
+NPF_MUON_MATRIX_LR_SCALE=${NPF_MUON_MATRIX_LR_SCALE:-auto}
+NPF_MUON_WEIGHT_DECAY=${NPF_MUON_WEIGHT_DECAY:-0.0}
+NPF_MUON_FALLBACK=${NPF_MUON_FALLBACK:-adamw}
+NPF_MUON_FALLBACK_LR=${NPF_MUON_FALLBACK_LR:-0.0}  # 0 => reuse NPF_MUON_LR
+NPF_MUON_FALLBACK_WEIGHT_DECAY=${NPF_MUON_FALLBACK_WEIGHT_DECAY:-0.0}
+NPF_MUON_ADAM_BETA1=${NPF_MUON_ADAM_BETA1:-0.9}
+NPF_MUON_ADAM_BETA2=${NPF_MUON_ADAM_BETA2:-0.999}
+NPF_MUON_ADAM_EPS=${NPF_MUON_ADAM_EPS:-1e-8}
+NPF_MUON_MAX_GRAD_NORM=${NPF_MUON_MAX_GRAD_NORM:-0.0}
 NPF_LASTQUAD_HIDDEN=${NPF_LASTQUAD_HIDDEN:-1024 512 512 256 128 64}
+# NPF_LASTQUAD_HIDDEN=${NPF_LASTQUAD_HIDDEN:-128 128 128 128}
 NPF_LASTQUAD_ACTIVATION=${NPF_LASTQUAD_ACTIVATION:-softplus}
 NPF_LASTQUAD_ELU_ALPHA=${NPF_LASTQUAD_ELU_ALPHA:-1.0}
 NPF_LASTQUAD_SOFTPLUS_BETA=${NPF_LASTQUAD_SOFTPLUS_BETA:-10.0}
 NPF_LASTQUAD_INIT_EPS=${NPF_LASTQUAD_INIT_EPS:-1e-4}
 NPF_LASTQUAD_STRONG_CONVEXITY=${NPF_LASTQUAD_STRONG_CONVEXITY:-1.0}
 
-DEFAULT_ALGOS=(npf nn_dro madry wrm wfr dual new_ppa)
-KNOWN_ALGOS=(npf npf_lastquad nn_dro madry wrm wfr dual new_ppa)
+HIDDEN_TAG="$(printf "%s" "$NPF_LASTQUAD_HIDDEN" | tr -s '[:space:]' 'x' | tr -cd '[:alnum:]_.=-')"
+OPT_TAG=""
+if [ "$NPF_INNER_OPTIMIZER" != "bb_armijo" ]; then
+    MUON_LR_TAG="$(printf "%s" "$NPF_MUON_LR" | tr -cd '[:alnum:]_.=-')"
+    OPT_TAG="_opt${NPF_INNER_OPTIMIZER}_muonlr${MUON_LR_TAG}"
+fi
+WARM_TAG=""
+if [ "${EPOCHS_ICNN_PRETRAIN}" != "0" ]; then
+    WARM_TAG="_warm${EPOCHS_ICNN_PRETRAIN}"
+fi
+AUTO_RUN_NAME="npf_lastquad_seed${SEED}_ep${EPOCHS_ADV}${WARM_TAG}_K${K}_ddp${NPROC}_lr${LR_THETA}_lam${PENALTY_LAMBDA}_eps${INP_EPS}_margin${USE_MARGIN_LOSS}_act${NPF_LASTQUAD_ACTIVATION}_init${NPF_LASTQUAD_INIT_EPS}_hidden${HIDDEN_TAG}${OPT_TAG}"
+RUN_NAME="${RUN_NAME:-${AUTO_RUN_NAME}}"
+OUTPUT_FOLDER_NAME="${OUTPUT_FOLDER_NAME:-${RUN_NAME}}"
+if [ -n "$RESULTS_DIR_OVERRIDE" ]; then
+    RESULTS_DIR="$RESULTS_DIR_OVERRIDE"
+else
+    RESULTS_DIR="${RESULTS_ROOT}/${OUTPUT_FOLDER_NAME}"
+fi
+LOG_DIR="${RESULTS_DIR}/logs"
+TIME_DIR="${RESULTS_DIR}/time"
+MANIFEST="${RESULTS_DIR}/run_manifest.tsv"
+
+mkdir -p "$RESULTS_DIR" "$LOG_DIR" "$TIME_DIR"
+if [ ! -f "$MANIFEST" ]; then
+    printf "status\trun_name\talgorithm\tseed\tworld_size\tk\tepochs\tstarted_utc\tended_utc\telapsed_seconds\tout_dir\tcheckpoint_last\tcheckpoint_best\tlog_file\ttime_file\tcsv\tsummary_json\thistory_json\n" > "$MANIFEST"
+fi
+
+DEFAULT_ALGOS=(npf_lastquad)
+# Full runtime sweep disabled for the current NPF-LastQuad launch:
+# DEFAULT_ALGOS=(npf nn_dro madry wrm wfr dual new_ppa)
+KNOWN_ALGOS=(npf_lastquad)
+# KNOWN_ALGOS=(npf npf_lastquad nn_dro madry wrm wfr dual new_ppa)
 
 is_known_algo() {
     local needle="$1" algo
@@ -218,6 +291,10 @@ if [ -n "$RUN_ONLY_ALGO" ] && ! is_known_algo "$RUN_ONLY_ALGO"; then
     echo "[FATAL] Unknown RUN_ONLY_ALGO=${RUN_ONLY_ALGO}. Known: ${KNOWN_ALGOS[*]}"
     exit 1
 fi
+if [[ "$NPF_INNER_OPTIMIZER" != "bb_armijo" && "$NPF_INNER_OPTIMIZER" != "muon" ]]; then
+    echo "[FATAL] Unknown NPF_INNER_OPTIMIZER=${NPF_INNER_OPTIMIZER}. Use bb_armijo or muon."
+    exit 1
+fi
 
 if [ -n "$RUN_ONLY_ALGO" ]; then
     ACTIVE_ALGOS=("$RUN_ONLY_ALGO")
@@ -226,23 +303,65 @@ else
 fi
 ACTIVE_ALGOS_CSV="$(join_by_comma "${ACTIVE_ALGOS[@]}")"
 
+NPF_MUON_NESTEROV_FLAG="--npf-muon-nesterov"
+case "$NPF_MUON_NESTEROV" in
+    0|false|False|FALSE|no|No|NO)
+        NPF_MUON_NESTEROV_FLAG="--no-npf-muon-nesterov"
+        ;;
+esac
+NPF_OPT_ARGS=(
+  --npf-inner-optimizer "${NPF_INNER_OPTIMIZER}"
+  --npf-muon-lr "${NPF_MUON_LR}"
+  --npf-muon-momentum "${NPF_MUON_MOMENTUM}"
+  "${NPF_MUON_NESTEROV_FLAG}"
+  --npf-muon-ns-steps "${NPF_MUON_NS_STEPS}"
+  --npf-muon-matrix-lr-scale "${NPF_MUON_MATRIX_LR_SCALE}"
+  --npf-muon-weight-decay "${NPF_MUON_WEIGHT_DECAY}"
+  --npf-muon-fallback "${NPF_MUON_FALLBACK}"
+  --npf-muon-fallback-lr "${NPF_MUON_FALLBACK_LR}"
+  --npf-muon-fallback-weight-decay "${NPF_MUON_FALLBACK_WEIGHT_DECAY}"
+  --npf-muon-adam-beta1 "${NPF_MUON_ADAM_BETA1}"
+  --npf-muon-adam-beta2 "${NPF_MUON_ADAM_BETA2}"
+  --npf-muon-adam-eps "${NPF_MUON_ADAM_EPS}"
+  --npf-muon-max-grad-norm "${NPF_MUON_MAX_GRAD_NORM}"
+)
+
 # ---- Pre-flight ----
 echo ""
 echo "================================================================"
-echo "  Input-ICNN Runtime Sweep — DDP"
+echo "  Input-ICNN NPF-LastQuad — DDP"
+echo "  Run name: ${RUN_NAME}"
+echo "  Output folder: ${OUTPUT_FOLDER_NAME}"
 echo "  SPLIT=${SPLIT}  SEED=${SEED}  NPROC=${NPROC}  K=${K}"
-echo "  Epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
+echo "  Warmup epochs=${EPOCHS_ICNN_PRETRAIN}  Adv epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
+echo "  Freeze BatchNorm running stats: ${FREEZE_BATCHNORM}"
+if [ -n "$LAMBDA_SCHEDULE" ]; then
+    echo "  Lambda schedule: ${LAMBDA_SCHEDULE}  stage_epochs=${LAMBDA_STAGE_EPOCHS}"
+fi
 echo "  Active algos: ${ACTIVE_ALGOS[*]}"
 echo "  Margin loss: ${USE_MARGIN_LOSS}"
+echo "  Input PGD eval: p=${INP_P} eps=${INP_EPS} steps=${INP_STEPS} restarts=${INP_RESTARTS} samples=${EVAL_PGD_SAMPLES}"
+echo "  Skip PGD during train: ${SKIP_PGD_DURING_TRAIN}  Benchmark mode: ${BENCHMARK_MODE}"
+echo "  Inner profiling: ${PROFILE_INNER}  batches=${PROFILE_INNER_BATCHES}"
+echo "  NPF optimizer: ${NPF_INNER_OPTIMIZER}"
 echo "  BB+Armijo:   alpha0=${BB_ALPHA0}  alpha=[${BB_ALPHA_MIN}, ${BB_ALPHA_MAX}]"
 echo "                ls_c=${BB_LS_C}  shrink=${BB_LS_SHRINK}  ls_max=${BB_LS_MAX_STEPS}"
-echo "  Madry/RO:    pixel l2-PGD eps=${INP_EPS}  step_size=${MADRY_PGD_STEP_SIZE:-0} (0=auto)"
-if [ "${DUAL_LANGEVIN_STEPS}" -gt 0 ]; then
-    echo "  Dual mode:   Option-D Langevin/MALA sampler"
-    echo "                eps=${DUAL_EPSILON}  m=2^${DUAL_SAMPLE_LEVEL}  K_langevin=${DUAL_LANGEVIN_STEPS}"
-    echo "                eta=${DUAL_LANGEVIN_STEP_SIZE}  MALA=${DUAL_MALA}  burn_in=${DUAL_BURN_IN}"
-else
-    echo "  Dual mode:   one-shot Gaussian (closed-form Sinkhorn)"
+if [ "$NPF_INNER_OPTIMIZER" = "muon" ]; then
+    echo "  Muon:        lr=${NPF_MUON_LR}  momentum=${NPF_MUON_MOMENTUM}  nesterov=${NPF_MUON_NESTEROV}"
+    echo "                ns_steps=${NPF_MUON_NS_STEPS}  scale=${NPF_MUON_MATRIX_LR_SCALE}  wd=${NPF_MUON_WEIGHT_DECAY}"
+    echo "                fallback=${NPF_MUON_FALLBACK}  fallback_lr=${NPF_MUON_FALLBACK_LR}  max_grad_norm=${NPF_MUON_MAX_GRAD_NORM}"
+fi
+if [[ " ${ACTIVE_ALGOS[*]} " == *" madry "* ]]; then
+    echo "  Madry/RO:    pixel l2-PGD eps=${INP_EPS}  step_size=${MADRY_PGD_STEP_SIZE:-0} (0=auto)"
+fi
+if [[ " ${ACTIVE_ALGOS[*]} " == *" dual "* ]]; then
+    if [ "${DUAL_LANGEVIN_STEPS}" -gt 0 ]; then
+        echo "  Dual mode:   Option-D Langevin/MALA sampler"
+        echo "                eps=${DUAL_EPSILON}  m=2^${DUAL_SAMPLE_LEVEL}  K_langevin=${DUAL_LANGEVIN_STEPS}"
+        echo "                eta=${DUAL_LANGEVIN_STEP_SIZE}  MALA=${DUAL_MALA}  burn_in=${DUAL_BURN_IN}"
+    else
+        echo "  Dual mode:   one-shot Gaussian (closed-form Sinkhorn)"
+    fi
 fi
 if [[ " ${ACTIVE_ALGOS[*]} " == *" npf_lastquad "* ]]; then
     echo "  NPF-LastQuad: hidden=${NPF_LASTQUAD_HIDDEN}"
@@ -343,15 +462,25 @@ run_algo() {
     local OUT_DIR="${RESULTS_DIR}/${ALGO}/seed_${SEED}"
     local LOG_FILE="${LOG_DIR}/${ALGO}_seed${SEED}.log"
     local TIME_FILE="${TIME_DIR}/${ALGO}_seed${SEED}.time.txt"
+    local FINAL_CKPT="${OUT_DIR}/${ALGO}_seed${SEED}_last.pth"
+    local BEST_CKPT="${OUT_DIR}/${ALGO}_seed${SEED}_best_robust.pth"
+    local SUMMARY_JSON="${OUT_DIR}/${ALGO}_seed${SEED}_last.summary.json"
+    local HISTORY_JSON="${OUT_DIR}/${ALGO}_seed${SEED}_last.history.json"
+    local RUN_CONFIG="${OUT_DIR}/run_config.env"
     local DONE="${OUT_DIR}/.completed"
     local CSV="${OUT_DIR}/epoch_log.csv"
 
     if [ -f "$DONE" ]; then
-        echo "[SKIP] ${ALGO} seed=${SEED} — already completed"
+        echo "[SKIP] ${ALGO} seed=${SEED} — already completed at ${OUT_DIR}"
+        echo "       Use OUTPUT_FOLDER_NAME=<new-name> or RESULTS_DIR=<full-path> for a fresh run."
         return 0
     fi
 
-    rm -rf "$OUT_DIR"
+    if [ -d "$OUT_DIR" ]; then
+        local STALE_DIR="${OUT_DIR}.incomplete_$(date -u +%Y%m%dT%H%M%SZ)"
+        echo "[INFO] Existing incomplete output found; moving it to ${STALE_DIR}"
+        mv "$OUT_DIR" "$STALE_DIR"
+    fi
     mkdir -p "$OUT_DIR"
 
     local BATCH_OVR=$COMMON_BATCH
@@ -377,10 +506,96 @@ run_algo() {
         local EXTRA_ARGS
         EXTRA_ARGS=$(algo_args "$ALGO" "$KEFF")
 
+        {
+            printf "RUN_NAME=%q\n" "$RUN_NAME"
+            printf "OUTPUT_FOLDER_NAME=%q\n" "$OUTPUT_FOLDER_NAME"
+            printf "ALGORITHM=%q\n" "$ALGO"
+            printf "SEED=%q\n" "$SEED"
+            printf "NPROC=%q\n" "$NPROC"
+            printf "K=%q\n" "$KEFF"
+            printf "EPOCHS_ADV=%q\n" "$EPOCHS_ADV"
+            printf "COMMON_BATCH=%q\n" "$BATCH_OVR"
+            printf "LR_THETA=%q\n" "$LR_THETA"
+            printf "FREEZE_BATCHNORM=%q\n" "$FREEZE_BATCHNORM"
+            printf "PENALTY_LAMBDA=%q\n" "$PENALTY_LAMBDA"
+            printf "LAMBDA_SCHEDULE=%q\n" "$LAMBDA_SCHEDULE"
+            printf "LAMBDA_STAGE_EPOCHS=%q\n" "$LAMBDA_STAGE_EPOCHS"
+            printf "USE_MARGIN_LOSS=%q\n" "$USE_MARGIN_LOSS"
+            printf "INP_P=%q\n" "$INP_P"
+            printf "INP_EPS=%q\n" "$INP_EPS"
+            printf "INP_STEPS=%q\n" "$INP_STEPS"
+            printf "INP_RESTARTS=%q\n" "$INP_RESTARTS"
+            printf "EVAL_PGD_SAMPLES=%q\n" "$EVAL_PGD_SAMPLES"
+            printf "PROFILE_INNER=%q\n" "$PROFILE_INNER"
+            printf "PROFILE_INNER_BATCHES=%q\n" "$PROFILE_INNER_BATCHES"
+            printf "RESUME_CHECKPOINT=%q\n" "$RESUME_CHECKPOINT"
+            printf "SAVE_EVERY_EPOCH_DIR=%q\n" "$SAVE_EVERY_EPOCH_DIR"
+            printf "CHECKPOINT_EPOCH_OFFSET=%q\n" "$CHECKPOINT_EPOCH_OFFSET"
+            printf "NPF_INNER_OPTIMIZER=%q\n" "$NPF_INNER_OPTIMIZER"
+            printf "NPF_MUON_LR=%q\n" "$NPF_MUON_LR"
+            printf "NPF_MUON_MOMENTUM=%q\n" "$NPF_MUON_MOMENTUM"
+            printf "NPF_MUON_NESTEROV=%q\n" "$NPF_MUON_NESTEROV"
+            printf "NPF_MUON_NS_STEPS=%q\n" "$NPF_MUON_NS_STEPS"
+            printf "NPF_MUON_MATRIX_LR_SCALE=%q\n" "$NPF_MUON_MATRIX_LR_SCALE"
+            printf "NPF_MUON_WEIGHT_DECAY=%q\n" "$NPF_MUON_WEIGHT_DECAY"
+            printf "NPF_MUON_FALLBACK=%q\n" "$NPF_MUON_FALLBACK"
+            printf "NPF_MUON_FALLBACK_LR=%q\n" "$NPF_MUON_FALLBACK_LR"
+            printf "NPF_MUON_FALLBACK_WEIGHT_DECAY=%q\n" "$NPF_MUON_FALLBACK_WEIGHT_DECAY"
+            printf "NPF_MUON_MAX_GRAD_NORM=%q\n" "$NPF_MUON_MAX_GRAD_NORM"
+            printf "NPF_LASTQUAD_HIDDEN=%q\n" "$NPF_LASTQUAD_HIDDEN"
+            printf "NPF_LASTQUAD_ACTIVATION=%q\n" "$NPF_LASTQUAD_ACTIVATION"
+            printf "NPF_LASTQUAD_INIT_EPS=%q\n" "$NPF_LASTQUAD_INIT_EPS"
+            printf "RESULTS_DIR=%q\n" "$RESULTS_DIR"
+            printf "OUT_DIR=%q\n" "$OUT_DIR"
+            printf "FINAL_CHECKPOINT=%q\n" "$FINAL_CKPT"
+            printf "BEST_ROBUST_CHECKPOINT=%q\n" "$BEST_CKPT"
+            printf "CSV=%q\n" "$CSV"
+            printf "SUMMARY_JSON=%q\n" "$SUMMARY_JSON"
+            printf "HISTORY_JSON=%q\n" "$HISTORY_JSON"
+            printf "EXTRA_ARGS=%q\n" "$EXTRA_ARGS"
+        } > "$RUN_CONFIG"
+
         local TIME_CMD=""
         if command -v /usr/bin/time >/dev/null 2>&1; then
             TIME_CMD="/usr/bin/time -v -o ${TIME_FILE}"
         fi
+
+        local -a COMMON_EXTRA_FLAGS=()
+        if [ "$USE_MARGIN_LOSS" = "1" ]; then
+            COMMON_EXTRA_FLAGS+=(--use-margin-loss)
+        fi
+        if [ "$SKIP_PGD_DURING_TRAIN" = "1" ]; then
+            COMMON_EXTRA_FLAGS+=(--skip-pgd-during-train)
+        fi
+        if [ "$BENCHMARK_MODE" = "1" ]; then
+            COMMON_EXTRA_FLAGS+=(--benchmark-mode)
+        fi
+        case "$FREEZE_BATCHNORM" in
+            0|false|False|FALSE|no|No|NO)
+                COMMON_EXTRA_FLAGS+=(--no-freeze-batchnorm)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--freeze-batchnorm)
+                ;;
+        esac
+        if [ "$PROFILE_INNER" = "1" ]; then
+            COMMON_EXTRA_FLAGS+=(--profile-inner --profile-inner-batches "$PROFILE_INNER_BATCHES")
+        fi
+        if [ -n "$LAMBDA_SCHEDULE" ]; then
+            LAMBDA_SCHEDULE_RAW="${LAMBDA_SCHEDULE//,/ }"
+            read -r -a LAMBDA_SCHEDULE_ARGS <<< "$LAMBDA_SCHEDULE_RAW"
+            COMMON_EXTRA_FLAGS+=(--lambda-schedule "${LAMBDA_SCHEDULE_ARGS[@]}")
+            if [ "${LAMBDA_STAGE_EPOCHS}" != "0" ]; then
+                COMMON_EXTRA_FLAGS+=(--lambda-stage-epochs "$LAMBDA_STAGE_EPOCHS")
+            fi
+        fi
+        if [ -n "$RESUME_CHECKPOINT" ]; then
+            COMMON_EXTRA_FLAGS+=(--resume-checkpoint "$RESUME_CHECKPOINT")
+        fi
+        if [ -n "$SAVE_EVERY_EPOCH_DIR" ]; then
+            COMMON_EXTRA_FLAGS+=(--save-every-epoch-dir "$SAVE_EVERY_EPOCH_DIR")
+        fi
+        COMMON_EXTRA_FLAGS+=(--checkpoint-epoch-offset "$CHECKPOINT_EPOCH_OFFSET")
 
         # The shared --bb-* knobs are passed to every algorithm. They
         # are consumed only by methods using BB+Armijo (NPF, NN-DRO,
@@ -399,12 +614,16 @@ run_algo() {
             --penalty-lambda "$PENALTY_LAMBDA" \
             --inp-p "$INP_P" \
             --inp-eps "$INP_EPS" \
-            --skip-pgd-during-train \
-            --benchmark-mode \
-            $([ "$USE_MARGIN_LOSS" = "1" ] && echo "--use-margin-loss") \
+            --inp-steps "$INP_STEPS" \
+            --inp-restarts "$INP_RESTARTS" \
+            --eval-input-pgd \
+            --eval-input-pgd-samples "$EVAL_PGD_SAMPLES" \
+            "${COMMON_EXTRA_FLAGS[@]}" \
             "${BB_ARGS[@]}" \
+            "${NPF_OPT_ARGS[@]}" \
             --seed "$SEED" \
-            --save "${OUT_DIR}/final.pth" \
+            --save "$FINAL_CKPT" \
+            --save-best-robust "$BEST_CKPT" \
             --log-csv "$CSV" \
             $EXTRA_ARGS 2>&1 | tee "$LOG_FILE"
 
@@ -436,16 +655,20 @@ run_algo() {
 
     if [ $STATUS -eq 0 ]; then
         touch "$DONE"
-        printf "completed\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$ALGO" "$SEED" "$NPROC" "$K" "$EPOCHS_ADV" \
-            "$STARTED_UTC" "$ENDED_UTC" "$ELAPSED" \
-            "$LOG_FILE" "$TIME_FILE" "$CSV" >> "$MANIFEST"
+        printf "completed\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$RUN_NAME" "$ALGO" "$SEED" "$NPROC" "$K" "$EPOCHS_ADV" \
+            "$STARTED_UTC" "$ENDED_UTC" "$ELAPSED" "$OUT_DIR" \
+            "$FINAL_CKPT" "$BEST_CKPT" "$LOG_FILE" "$TIME_FILE" "$CSV" \
+            "$SUMMARY_JSON" "$HISTORY_JSON" >> "$MANIFEST"
         echo "[OK] ${ALGO} seed=${SEED} elapsed=${ELAPSED}s"
+        echo "[OK] last checkpoint: ${FINAL_CKPT}"
+        echo "[OK] best robust checkpoint: ${BEST_CKPT}"
     else
-        printf "failed_%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$STATUS" "$ALGO" "$SEED" "$NPROC" "$K" "$EPOCHS_ADV" \
-            "$STARTED_UTC" "$ENDED_UTC" "$ELAPSED" \
-            "$LOG_FILE" "$TIME_FILE" "$CSV" >> "$MANIFEST"
+        printf "failed_%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$STATUS" "$RUN_NAME" "$ALGO" "$SEED" "$NPROC" "$K" "$EPOCHS_ADV" \
+            "$STARTED_UTC" "$ENDED_UTC" "$ELAPSED" "$OUT_DIR" \
+            "$FINAL_CKPT" "$BEST_CKPT" "$LOG_FILE" "$TIME_FILE" "$CSV" \
+            "$SUMMARY_JSON" "$HISTORY_JSON" >> "$MANIFEST"
     fi
 
     # Reset CUDA caches between algorithms (each is its own torchrun
@@ -474,20 +697,20 @@ if [ -n "$RUN_ONLY_ALGO" ]; then
     esac
 else
     case $SPLIT in
-        0)
-            run_algo "npf"
-            run_algo "nn_dro"
-            run_algo "madry"
-            run_algo "wrm"
-            run_algo "wfr"
-            run_algo "dual"
-            run_algo "new_ppa"
-            DID_RUN_ALGO=1
+        0|1)
+            for algo in "${ACTIVE_ALGOS[@]}"; do
+                run_algo "$algo"
+                DID_RUN_ALGO=1
+            done
             ;;
-        1) run_algo "npf"; DID_RUN_ALGO=1 ;;
-        2) run_algo "nn_dro"; run_algo "madry"; DID_RUN_ALGO=1 ;;
-        3) run_algo "wrm";    run_algo "wfr";   DID_RUN_ALGO=1 ;;
-        4) run_algo "dual";   run_algo "new_ppa"; DID_RUN_ALGO=1 ;;
+        2|3|4)
+            echo "[SKIP] Only NPF-LastQuad is enabled; split ${SPLIT} has no assigned work."
+            ;;
+        # Full runtime-sweep split map is intentionally disabled:
+        # 1) npf
+        # 2) nn_dro, madry
+        # 3) wrm, wfr
+        # 4) dual, new_ppa
         *)
             echo "[FATAL] Unknown SPLIT=${SPLIT}. Use 0 (sequential) or 1-4."
             exit 1
@@ -522,7 +745,7 @@ EPOCHS_ADV  = int(os.environ["EPOCHS_ADV"])
 ALGOS       = [
     a for a in os.environ.get(
         "ACTIVE_ALGOS",
-        "npf,nn_dro,madry,wrm,wfr,dual,new_ppa",
+        "npf_lastquad",
     ).replace(",", " ").split()
     if a
 ]
