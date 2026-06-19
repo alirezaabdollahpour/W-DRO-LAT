@@ -156,6 +156,10 @@ LAMBDA_SCHEDULE=${LAMBDA_SCHEDULE:-}
 LAMBDA_STAGE_EPOCHS=${LAMBDA_STAGE_EPOCHS:-0}
 LR_THETA=${LR_THETA:-0.1}
 FREEZE_BATCHNORM=${FREEZE_BATCHNORM:-1}
+RECALIBRATE_BATCHNORM=${RECALIBRATE_BATCHNORM:-0}
+BATCHNORM_RECALIBRATION_BATCHES=${BATCHNORM_RECALIBRATION_BATCHES:-0}
+BATCHNORM_RECALIBRATION_RESET=${BATCHNORM_RECALIBRATION_RESET:-1}
+BATCHNORM_RECALIBRATION_MOMENTUM=${BATCHNORM_RECALIBRATION_MOMENTUM:-}
 INP_P=${INP_P:-2}
 INP_EPS=${INP_EPS:-0.5}
 INP_STEPS=${INP_STEPS:-20}
@@ -335,6 +339,7 @@ echo "  Output folder: ${OUTPUT_FOLDER_NAME}"
 echo "  SPLIT=${SPLIT}  SEED=${SEED}  NPROC=${NPROC}  K=${K}"
 echo "  Warmup epochs=${EPOCHS_ICNN_PRETRAIN}  Adv epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
 echo "  Freeze BatchNorm running stats: ${FREEZE_BATCHNORM}"
+echo "  Recalibrate BatchNorm after adv epochs: ${RECALIBRATE_BATCHNORM}  batches=${BATCHNORM_RECALIBRATION_BATCHES}  reset=${BATCHNORM_RECALIBRATION_RESET}  momentum=${BATCHNORM_RECALIBRATION_MOMENTUM:-cumulative}"
 if [ -n "$LAMBDA_SCHEDULE" ]; then
     echo "  Lambda schedule: ${LAMBDA_SCHEDULE}  stage_epochs=${LAMBDA_STAGE_EPOCHS}"
 fi
@@ -517,6 +522,10 @@ run_algo() {
             printf "COMMON_BATCH=%q\n" "$BATCH_OVR"
             printf "LR_THETA=%q\n" "$LR_THETA"
             printf "FREEZE_BATCHNORM=%q\n" "$FREEZE_BATCHNORM"
+            printf "RECALIBRATE_BATCHNORM=%q\n" "$RECALIBRATE_BATCHNORM"
+            printf "BATCHNORM_RECALIBRATION_BATCHES=%q\n" "$BATCHNORM_RECALIBRATION_BATCHES"
+            printf "BATCHNORM_RECALIBRATION_RESET=%q\n" "$BATCHNORM_RECALIBRATION_RESET"
+            printf "BATCHNORM_RECALIBRATION_MOMENTUM=%q\n" "$BATCHNORM_RECALIBRATION_MOMENTUM"
             printf "PENALTY_LAMBDA=%q\n" "$PENALTY_LAMBDA"
             printf "LAMBDA_SCHEDULE=%q\n" "$LAMBDA_SCHEDULE"
             printf "LAMBDA_STAGE_EPOCHS=%q\n" "$LAMBDA_STAGE_EPOCHS"
@@ -578,6 +587,26 @@ run_algo() {
                 COMMON_EXTRA_FLAGS+=(--freeze-batchnorm)
                 ;;
         esac
+        case "$RECALIBRATE_BATCHNORM" in
+            1|true|True|TRUE|yes|Yes|YES)
+                COMMON_EXTRA_FLAGS+=(--recalibrate-batchnorm)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--no-recalibrate-batchnorm)
+                ;;
+        esac
+        COMMON_EXTRA_FLAGS+=(--batchnorm-recalibration-batches "$BATCHNORM_RECALIBRATION_BATCHES")
+        case "$BATCHNORM_RECALIBRATION_RESET" in
+            0|false|False|FALSE|no|No|NO)
+                COMMON_EXTRA_FLAGS+=(--no-batchnorm-recalibration-reset)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--batchnorm-recalibration-reset)
+                ;;
+        esac
+        if [ -n "$BATCHNORM_RECALIBRATION_MOMENTUM" ]; then
+            COMMON_EXTRA_FLAGS+=(--batchnorm-recalibration-momentum "$BATCHNORM_RECALIBRATION_MOMENTUM")
+        fi
         if [ "$PROFILE_INNER" = "1" ]; then
             COMMON_EXTRA_FLAGS+=(--profile-inner --profile-inner-batches "$PROFILE_INNER_BATCHES")
         fi

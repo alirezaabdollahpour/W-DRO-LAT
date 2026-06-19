@@ -77,6 +77,8 @@ class BaseAdvTrainer:
         device: torch.device,
         config,
         train_sampler: Optional[DistributedSampler] = None,
+        bn_recalibration_loader: Optional[DataLoader] = None,
+        bn_recalibration_sampler: Optional[DistributedSampler] = None,
     ) -> None:
         self.config = config
         self.dist = dist_helpers.info()
@@ -114,6 +116,8 @@ class BaseAdvTrainer:
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.train_sampler = train_sampler
+        self.bn_recalibration_loader = bn_recalibration_loader
+        self.bn_recalibration_sampler = bn_recalibration_sampler
 
         self.optimizer = self._make_classifier_optimizer()
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -334,6 +338,85 @@ class BaseAdvTrainer:
             if isinstance(module, nn.modules.batchnorm._BatchNorm):
                 module.eval()
 
+    @torch.no_grad()
+    def _recalibrate_batchnorm(self, epoch: int) -> Dict[str, float]:
+        cfg = self.config
+        if not bool(getattr(cfg, "recalibrate_batchnorm", False)):
+            return {}
+        loader = self.bn_recalibration_loader
+        if loader is None:
+            return {}
+
+        bn_modules = [
+            module
+            for module in self._classifier_module.modules()
+            if isinstance(module, nn.modules.batchnorm._BatchNorm)
+        ]
+        if not bn_modules:
+            return {}
+
+        if self.bn_recalibration_sampler is not None:
+            self.bn_recalibration_sampler.set_epoch(self._global_epoch(epoch))
+
+        max_batches = int(getattr(cfg, "batchnorm_recalibration_batches", 0) or 0)
+        reset_stats = bool(getattr(cfg, "batchnorm_recalibration_reset", True))
+        recalibration_momentum = getattr(cfg, "batchnorm_recalibration_momentum", None)
+        module_training = {
+            module: module.training for module in self._classifier_module.modules()
+        }
+        momenta = {module: module.momentum for module in bn_modules}
+
+        # Keep non-BN modules deterministic (e.g. dropout disabled) while BN
+        # layers alone recompute running statistics from clean train images.
+        self.classifier.eval()
+        for module in bn_modules:
+            if reset_stats:
+                module.reset_running_stats()
+            module.momentum = recalibration_momentum
+            module.train()
+
+        batches = 0
+        samples = 0
+        cuda_sync()
+        start = time.perf_counter()
+        try:
+            for batch in loader:
+                if max_batches > 0 and batches >= max_batches:
+                    break
+                x = batch[0] if isinstance(batch, (tuple, list)) else batch
+                x = x.to(self.device, non_blocking=True)
+                self.classifier(x)
+                batches += 1
+                samples += int(x.size(0))
+        finally:
+            cuda_sync()
+            seconds = time.perf_counter() - start
+            for module, momentum in momenta.items():
+                module.momentum = momentum
+            for module, was_training in module_training.items():
+                module.train(was_training)
+            dist_helpers.barrier()
+
+        if self.is_main_rank:
+            scope = "full" if max_batches <= 0 else str(max_batches)
+            momentum_label = (
+                "cumulative"
+                if recalibration_momentum is None
+                else str(recalibration_momentum)
+            )
+            print(
+                f"[{self.name}|bn] recalibrated BatchNorm at epoch {epoch} "
+                f"using {batches} clean-train batches ({samples} local samples; "
+                f"limit={scope}, reset={int(reset_stats)}, momentum={momentum_label}) "
+                f"in {seconds:.2f}s",
+                flush=True,
+            )
+        return {
+            "bn_recalibration_seconds": float(seconds),
+            "bn_recalibration_batches": float(batches),
+            "bn_recalibration_samples": float(samples),
+        }
+
     def classifier_update(self, x_adv: torch.Tensor, y: torch.Tensor) -> Tuple[float, float]:
         self.classifier.train()
         self._freeze_batchnorm_layers()
@@ -417,6 +500,7 @@ class BaseAdvTrainer:
                 total_epochs=total_epochs,
                 phase="adv",
             )
+            bn_extras = self._recalibrate_batchnorm(epoch)
             evaluations = self._evaluate(epoch)
             entry = {
                 "algorithm": self.name,
@@ -430,6 +514,7 @@ class BaseAdvTrainer:
                 "global_epoch": self._global_epoch(epoch),
                 "lambda_param": float(getattr(cfg, "lambda_param", 0.0)),
                 **metrics.extras,
+                **bn_extras,
                 **evaluations,
             }
             history.append(entry)

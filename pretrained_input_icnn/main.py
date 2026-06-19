@@ -24,7 +24,7 @@ except (RuntimeError, AttributeError):
 from . import distributed as dist_helpers
 from .algorithms import ALGORITHMS
 from .config import build_arg_parser, config_from_args
-from .data import get_cifar10_loaders
+from .data import get_cifar10_loaders, get_cifar10_train_loader
 from .models import load_pretrained_classifier
 from .utils import (
     evaluate_clean,
@@ -50,6 +50,9 @@ _LOG_FIELDS = (
     "train_weighted_penalty",
     "train_inner_objective",
     "epoch_seconds",
+    "bn_recalibration_seconds",
+    "bn_recalibration_batches",
+    "bn_recalibration_samples",
     "test_loss",
     "test_acc",
     "clean_loss",
@@ -163,6 +166,13 @@ def _metric_definitions(use_margin_loss: bool) -> Dict[str, str]:
         "input_pgd_max_linf": "Maximum pixel-space Linf perturbation norm selected by PGD.",
         "eval_transport_cost": "Mean raw pixel-space squared L2 test-set transport cost under transport_for_eval.",
         "eval_transport_weighted_penalty": "lambda_param * eval_transport_cost.",
+        "bn_recalibration_seconds": (
+            "Wallclock for the optional no-gradient clean-train BatchNorm "
+            "running-stat recalibration pass performed after an outer "
+            "classifier-update epoch and before evaluation."
+        ),
+        "bn_recalibration_batches": "Number of clean train batches used for BatchNorm recalibration.",
+        "bn_recalibration_samples": "Number of clean train samples used for BatchNorm recalibration.",
         "profile_*": (
             "Inner-maximization profiler fields. Timings are CUDA-synchronized "
             "seconds, off by default, and intended for ablation rather than "
@@ -212,6 +222,20 @@ def main() -> None:
         world_size=dist_info.world_size,
         rank=dist_info.rank,
     )
+    bn_recalibration_loader = None
+    bn_recalibration_sampler = None
+    if cfg.recalibrate_batchnorm:
+        bn_recalibration_loader, bn_recalibration_sampler = get_cifar10_train_loader(
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            data_root=cfg.data_dir,
+            augment_train=False,
+            seed=cfg.seed,
+            world_size=dist_info.world_size,
+            rank=dist_info.rank,
+            shuffle=False,
+            drop_last=False,
+        )
 
     classifier = load_pretrained_classifier(
         pretrained_path=cfg.pretrained_path,
@@ -240,6 +264,8 @@ def main() -> None:
         device=device,
         config=cfg,
         train_sampler=train_sampler,
+        bn_recalibration_loader=bn_recalibration_loader,
+        bn_recalibration_sampler=bn_recalibration_sampler,
     )
 
     if resume_payload is not None:
@@ -296,6 +322,9 @@ def main() -> None:
                 "train_weighted_penalty": entry.get("train_weighted_penalty"),
                 "train_inner_objective": entry.get("train_inner_objective"),
                 "epoch_seconds": entry.get("epoch_seconds"),
+                "bn_recalibration_seconds": entry.get("bn_recalibration_seconds"),
+                "bn_recalibration_batches": entry.get("bn_recalibration_batches"),
+                "bn_recalibration_samples": entry.get("bn_recalibration_samples"),
                 "test_loss": entry.get("test_loss"),
                 "test_acc": entry.get("test_acc"),
                 "clean_loss": entry.get("clean_loss", entry.get("test_loss")),

@@ -165,3 +165,76 @@ def get_cifar10_loaders(
         persistent_workers=persistent,
     )
     return train_loader, test_loader, train_sampler
+
+
+def get_cifar10_train_loader(
+    batch_size: int = 256,
+    num_workers: int = 2,
+    data_root: str = "./data",
+    augment_train: bool = False,
+    pin_memory: bool = True,
+    download: bool = True,
+    seed: Optional[int] = None,
+    world_size: int = 1,
+    rank: int = 0,
+    shuffle: bool = False,
+    drop_last: bool = False,
+) -> Tuple[DataLoader, Optional[DistributedSampler]]:
+    """Return a CIFAR-10 train loader, optionally sharded for DDP.
+
+    This is used for BatchNorm recalibration: by default it uses clean
+    training images (no crop/flip augmentation) and deterministic order.
+    """
+    import torchvision
+
+    if download:
+        _ddp_safe_cifar10_prepare(data_root, world_size=world_size, rank=rank)
+
+    download_each_rank = download if world_size <= 1 else False
+    dataset = torchvision.datasets.CIFAR10(
+        root=data_root,
+        train=True,
+        download=download_each_rank,
+        transform=_cifar10_transform(True, augment_train),
+    )
+
+    generator = worker_init_fn = None
+    if seed is not None:
+        generator, worker_init_fn = _dataloader_seed(seed, 2)
+
+    persistent = num_workers > 0
+    sampler: Optional[DistributedSampler] = None
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=int(seed) if seed is not None else 0,
+            drop_last=drop_last,
+        )
+        local_batch = max(1, batch_size // world_size)
+        loader = DataLoader(
+            dataset,
+            batch_size=local_batch,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
+            drop_last=drop_last,
+            persistent_workers=persistent,
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
+            drop_last=drop_last,
+            persistent_workers=persistent,
+        )
+    return loader, sampler

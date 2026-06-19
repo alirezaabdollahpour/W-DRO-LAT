@@ -21,6 +21,11 @@ set -euo pipefail
 #   INP_EPS               0.5
 #   USE_MARGIN_LOSS       0         (set to 1 to use logsumexp margin objective
 #                                    for the adversary on NPF/NN-DRO/WRM/Madry/PPA)
+#   FREEZE_BATCHNORM      1         (keep BN running stats fixed during adversarial updates)
+#   RECALIBRATE_BATCHNORM 0         (after each adversarial epoch, recompute BN stats on clean train data)
+#   BATCHNORM_RECALIBRATION_BATCHES 0  (0 = full clean train pass)
+#   BATCHNORM_RECALIBRATION_RESET 1    (1 = exact fresh stats; 0 = refresh existing stats)
+#   BATCHNORM_RECALIBRATION_MOMENTUM "" (empty = cumulative average)
 #   PROFILE_INNER         0         (set to 1 for synchronized inner-loop timing)
 #   PROFILE_INNER_BATCHES 0         (0 = profile every train batch)
 #   EPOCHS_ICNN_PRETRAIN  0         (warmup: train only the adversary (NPF/NN-DRO)
@@ -46,6 +51,11 @@ INP_RESTARTS="${INP_RESTARTS:-5}"
 EVAL_PGD_SAMPLES="${EVAL_PGD_SAMPLES:-1000}"
 SEED="${SEED:-1}"
 USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-0}"
+FREEZE_BATCHNORM="${FREEZE_BATCHNORM:-1}"
+RECALIBRATE_BATCHNORM="${RECALIBRATE_BATCHNORM:-0}"
+BATCHNORM_RECALIBRATION_BATCHES="${BATCHNORM_RECALIBRATION_BATCHES:-0}"
+BATCHNORM_RECALIBRATION_RESET="${BATCHNORM_RECALIBRATION_RESET:-1}"
+BATCHNORM_RECALIBRATION_MOMENTUM="${BATCHNORM_RECALIBRATION_MOMENTUM:-}"
 PROFILE_INNER="${PROFILE_INNER:-0}"
 PROFILE_INNER_BATCHES="${PROFILE_INNER_BATCHES:-0}"
 SKIP_PGD_DURING_TRAIN="${SKIP_PGD_DURING_TRAIN:-0}"
@@ -78,6 +88,34 @@ COMMON_ARGS=(
 )
 if [[ "${USE_MARGIN_LOSS}" == "1" ]]; then
   COMMON_ARGS+=(--use-margin-loss)
+fi
+case "${FREEZE_BATCHNORM}" in
+  0|false|False|FALSE|no|No|NO)
+    COMMON_ARGS+=(--no-freeze-batchnorm)
+    ;;
+  *)
+    COMMON_ARGS+=(--freeze-batchnorm)
+    ;;
+esac
+case "${RECALIBRATE_BATCHNORM}" in
+  1|true|True|TRUE|yes|Yes|YES)
+    COMMON_ARGS+=(--recalibrate-batchnorm)
+    ;;
+  *)
+    COMMON_ARGS+=(--no-recalibrate-batchnorm)
+    ;;
+esac
+COMMON_ARGS+=(--batchnorm-recalibration-batches "${BATCHNORM_RECALIBRATION_BATCHES}")
+case "${BATCHNORM_RECALIBRATION_RESET}" in
+  0|false|False|FALSE|no|No|NO)
+    COMMON_ARGS+=(--no-batchnorm-recalibration-reset)
+    ;;
+  *)
+    COMMON_ARGS+=(--batchnorm-recalibration-reset)
+    ;;
+esac
+if [[ -n "${BATCHNORM_RECALIBRATION_MOMENTUM}" ]]; then
+  COMMON_ARGS+=(--batchnorm-recalibration-momentum "${BATCHNORM_RECALIBRATION_MOMENTUM}")
 fi
 if [[ "${PROFILE_INNER}" == "1" ]]; then
   COMMON_ARGS+=(--profile-inner --profile-inner-batches "${PROFILE_INNER_BATCHES}")

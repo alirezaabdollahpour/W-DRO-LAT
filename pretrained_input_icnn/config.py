@@ -56,6 +56,10 @@ class TrainConfig:
     momentum: float = 0.9
     weight_decay: float = 5e-4
     freeze_batchnorm: bool = True
+    recalibrate_batchnorm: bool = False
+    batchnorm_recalibration_batches: int = 0
+    batchnorm_recalibration_reset: bool = True
+    batchnorm_recalibration_momentum: Optional[float] = None
     seed: int = 1
 
     # --- DRO core hyperparameters ---
@@ -347,6 +351,57 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Allow BatchNorm running statistics to update during classifier training.",
     )
     parser.set_defaults(freeze_batchnorm=True)
+    parser.add_argument(
+        "--recalibrate-batchnorm",
+        dest="recalibrate_batchnorm",
+        action="store_true",
+        help=(
+            "After each classifier-updating epoch, update BatchNorm running "
+            "statistics in a no-gradient pass over clean training data before "
+            "evaluation/checkpointing."
+        ),
+    )
+    parser.add_argument(
+        "--no-recalibrate-batchnorm",
+        dest="recalibrate_batchnorm",
+        action="store_false",
+    )
+    parser.set_defaults(recalibrate_batchnorm=False)
+    parser.add_argument(
+        "--batchnorm-recalibration-batches",
+        type=int,
+        default=0,
+        help="Number of clean train batches for BN recalibration; 0 means one full pass.",
+    )
+    parser.add_argument(
+        "--batchnorm-recalibration-reset",
+        dest="batchnorm_recalibration_reset",
+        action="store_true",
+        help=(
+            "Reset BatchNorm running statistics before the clean recalibration "
+            "pass. This gives exact fresh stats when momentum is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--no-batchnorm-recalibration-reset",
+        dest="batchnorm_recalibration_reset",
+        action="store_false",
+        help=(
+            "Keep existing BatchNorm running statistics and refresh them during "
+            "the clean recalibration pass."
+        ),
+    )
+    parser.set_defaults(batchnorm_recalibration_reset=True)
+    parser.add_argument(
+        "--batchnorm-recalibration-momentum",
+        type=float,
+        default=None,
+        help=(
+            "Optional BN momentum used only during recalibration. Omit for "
+            "PyTorch's cumulative average; use a small value such as 0.001 "
+            "with --no-batchnorm-recalibration-reset for a gentle refresh."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1)
 
     # λ
@@ -637,6 +692,14 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
 
     lambda_schedule = tuple(float(x) for x in (args.lambda_schedule or ()))
     lambda_stage_epochs = int(args.lambda_stage_epochs or 0)
+    if int(args.batchnorm_recalibration_batches) < 0:
+        raise ValueError("--batchnorm-recalibration-batches must be non-negative.")
+    if args.batchnorm_recalibration_momentum is not None:
+        bn_momentum = float(args.batchnorm_recalibration_momentum)
+        if not math.isfinite(bn_momentum) or bn_momentum < 0.0 or bn_momentum > 1.0:
+            raise ValueError(
+                "--batchnorm-recalibration-momentum must be finite and in [0, 1]."
+            )
     if not math.isfinite(lambda_param) or lambda_param <= 0.0:
         raise ValueError(f"lambda_param must be positive and finite, got {lambda_param}.")
     if lambda_schedule:
@@ -689,6 +752,10 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "momentum": "momentum",
         "weight_decay": "weight_decay",
         "freeze_batchnorm": "freeze_batchnorm",
+        "recalibrate_batchnorm": "recalibrate_batchnorm",
+        "batchnorm_recalibration_batches": "batchnorm_recalibration_batches",
+        "batchnorm_recalibration_reset": "batchnorm_recalibration_reset",
+        "batchnorm_recalibration_momentum": "batchnorm_recalibration_momentum",
         "seed": "seed",
         "omega_steps_per_batch": "omega_steps_per_batch",
         "npf_inner_optimizer": "npf_inner_optimizer",
