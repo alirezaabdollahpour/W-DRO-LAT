@@ -67,7 +67,9 @@
 # ---- Run defaults baked in ----
 #
 #   * Same outer hyperparameters (epochs, lr_theta, λ for DRO methods,
-#     global batch). Madry/RO uses epsilon instead of λ.
+#     global batch). DRO methods default to the legacy normalized-MSE
+#     transport penalty from pretrained_INPUT_icnn.py. Madry/RO uses
+#     epsilon instead of λ.
 #   * Same K=20 inner-iteration budget (per-algorithm interpretation
 #     applied: NPF/NN-DRO omega_steps=K, WRM/WFR inner_steps=K,
 #     Madry/RO pgd_steps=K, New_PPA round0_steps=refine_steps=K, Dual
@@ -80,6 +82,12 @@
 #   * Input PGD evaluation is enabled by default, matching
 #     run_pretrained_input_icnn.sh. Set SKIP_PGD_DURING_TRAIN=1 only for
 #     pure throughput timing.
+#   * Optional frozen-adversary post phase: set FROZEN_ADVERSARY_EPOCHS>0
+#     and FROZEN_ADVERSARY_MAP_STEPS=m to freeze the learned NPF/NN-DRO map
+#     after EPOCHS_ADV and continue classifier SGD on T_omega^m(x).
+#   * Online BatchNorm refresh can be combined with FREEZE_BATCHNORM=1: the
+#     clean refresh pass updates BN running stats, then adversary generation
+#     and classifier SGD keep BN layers in eval mode.
 #   * BENCHMARK_MODE=0 by default, matching run_pretrained_input_icnn.sh.
 #     Set BENCHMARK_MODE=1 for cuDNN autotune + TF32 timing sweeps.
 #   * Sequential execution if more than one algorithm is enabled later.
@@ -152,10 +160,14 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 # ---- Shared training hyperparameters ----
 COMMON_BATCH=${COMMON_BATCH:-${BATCH_SIZE:-512}}  # global effective batch (split across ranks)
 PENALTY_LAMBDA=${PENALTY_LAMBDA:-30}
+TRANSPORT_COST=${TRANSPORT_COST:-normalized_mse}
 LAMBDA_SCHEDULE=${LAMBDA_SCHEDULE:-}
 LAMBDA_STAGE_EPOCHS=${LAMBDA_STAGE_EPOCHS:-0}
 LR_THETA=${LR_THETA:-0.1}
 FREEZE_BATCHNORM=${FREEZE_BATCHNORM:-1}
+FREEZE_BATCHNORM_AFFINE=${FREEZE_BATCHNORM_AFFINE:-${FREEZE_BN_AFFINE:-$FREEZE_BATCHNORM}}
+BATCHNORM_ONLINE_REFRESH=${BATCHNORM_ONLINE_REFRESH:-${ONLINE_BATCHNORM_REFRESH:-0}}
+BATCHNORM_ONLINE_REFRESH_MOMENTUM=${BATCHNORM_ONLINE_REFRESH_MOMENTUM:-${ONLINE_BATCHNORM_REFRESH_MOMENTUM:-}}
 RECALIBRATE_BATCHNORM=${RECALIBRATE_BATCHNORM:-0}
 BATCHNORM_RECALIBRATION_BATCHES=${BATCHNORM_RECALIBRATION_BATCHES:-0}
 BATCHNORM_RECALIBRATION_RESET=${BATCHNORM_RECALIBRATION_RESET:-1}
@@ -165,6 +177,7 @@ INP_EPS=${INP_EPS:-0.5}
 INP_STEPS=${INP_STEPS:-20}
 INP_RESTARTS=${INP_RESTARTS:-5}
 EVAL_PGD_SAMPLES=${EVAL_PGD_SAMPLES:-1000}
+INPUT_PGD_LOSS=${INPUT_PGD_LOSS:-margin}
 MADRY_PGD_STEP_SIZE=${MADRY_PGD_STEP_SIZE:-0}  # 0 => trainer default 2*epsilon/K
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 SKIP_PGD_DURING_TRAIN=${SKIP_PGD_DURING_TRAIN:-0}
@@ -181,6 +194,8 @@ CHECKPOINT_EPOCH_OFFSET=${CHECKPOINT_EPOCH_OFFSET:-0}
 # Set NUM_WORKERS=0 if you still hit "No space left on device".
 NUM_WORKERS=${NUM_WORKERS:-2}
 EPOCHS_ICNN_PRETRAIN=${EPOCHS_ICNN_PRETRAIN:-${WARMUP_EPOCHS:-0}}
+FROZEN_ADVERSARY_EPOCHS=${FROZEN_ADVERSARY_EPOCHS:-${FROZEN_MAP_EPOCHS:-${POST_MAP_EPOCHS:-0}}}
+FROZEN_ADVERSARY_MAP_STEPS=${FROZEN_ADVERSARY_MAP_STEPS:-${FROZEN_MAP_STEPS:-${POST_MAP_STEPS:-1}}}
 
 # ---- Shared BB+Armijo step rule (overridable; defaults match NPF's) ----
 BB_ALPHA0=${BB_ALPHA0:-2e-4}
@@ -246,7 +261,11 @@ WARM_TAG=""
 if [ "${EPOCHS_ICNN_PRETRAIN}" != "0" ]; then
     WARM_TAG="_warm${EPOCHS_ICNN_PRETRAIN}"
 fi
-AUTO_RUN_NAME="npf_lastquad_seed${SEED}_ep${EPOCHS_ADV}${WARM_TAG}_K${K}_ddp${NPROC}_lr${LR_THETA}_lam${PENALTY_LAMBDA}_eps${INP_EPS}_margin${USE_MARGIN_LOSS}_act${NPF_LASTQUAD_ACTIVATION}_init${NPF_LASTQUAD_INIT_EPS}_hidden${HIDDEN_TAG}${OPT_TAG}"
+FROZEN_TAG=""
+if [ "${FROZEN_ADVERSARY_EPOCHS}" != "0" ]; then
+    FROZEN_TAG="_frozenadv${FROZEN_ADVERSARY_EPOCHS}x${FROZEN_ADVERSARY_MAP_STEPS}"
+fi
+AUTO_RUN_NAME="npf_lastquad_seed${SEED}_ep${EPOCHS_ADV}${WARM_TAG}${FROZEN_TAG}_K${K}_ddp${NPROC}_lr${LR_THETA}_lam${PENALTY_LAMBDA}_eps${INP_EPS}_margin${USE_MARGIN_LOSS}_act${NPF_LASTQUAD_ACTIVATION}_init${NPF_LASTQUAD_INIT_EPS}_hidden${HIDDEN_TAG}${OPT_TAG}"
 RUN_NAME="${RUN_NAME:-${AUTO_RUN_NAME}}"
 OUTPUT_FOLDER_NAME="${OUTPUT_FOLDER_NAME:-${RUN_NAME}}"
 if [ -n "$RESULTS_DIR_OVERRIDE" ]; then
@@ -338,13 +357,18 @@ echo "  Run name: ${RUN_NAME}"
 echo "  Output folder: ${OUTPUT_FOLDER_NAME}"
 echo "  SPLIT=${SPLIT}  SEED=${SEED}  NPROC=${NPROC}  K=${K}"
 echo "  Warmup epochs=${EPOCHS_ICNN_PRETRAIN}  Adv epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
+echo "  Transport cost: ${TRANSPORT_COST}"
+echo "  Frozen-adversary post phase: epochs=${FROZEN_ADVERSARY_EPOCHS}  map_steps=${FROZEN_ADVERSARY_MAP_STEPS}"
 echo "  Freeze BatchNorm running stats: ${FREEZE_BATCHNORM}"
+echo "  Freeze BatchNorm affine params: ${FREEZE_BATCHNORM_AFFINE}"
+echo "  Online clean BatchNorm refresh: ${BATCHNORM_ONLINE_REFRESH}  momentum=${BATCHNORM_ONLINE_REFRESH_MOMENTUM:-module-default}"
 echo "  Recalibrate BatchNorm after adv epochs: ${RECALIBRATE_BATCHNORM}  batches=${BATCHNORM_RECALIBRATION_BATCHES}  reset=${BATCHNORM_RECALIBRATION_RESET}  momentum=${BATCHNORM_RECALIBRATION_MOMENTUM:-cumulative}"
 if [ -n "$LAMBDA_SCHEDULE" ]; then
     echo "  Lambda schedule: ${LAMBDA_SCHEDULE}  stage_epochs=${LAMBDA_STAGE_EPOCHS}"
 fi
 echo "  Active algos: ${ACTIVE_ALGOS[*]}"
 echo "  Margin loss: ${USE_MARGIN_LOSS}"
+echo "  Input-PGD eval loss: ${INPUT_PGD_LOSS}"
 echo "  Input PGD eval: p=${INP_P} eps=${INP_EPS} steps=${INP_STEPS} restarts=${INP_RESTARTS} samples=${EVAL_PGD_SAMPLES}"
 echo "  Skip PGD during train: ${SKIP_PGD_DURING_TRAIN}  Benchmark mode: ${BENCHMARK_MODE}"
 echo "  Inner profiling: ${PROFILE_INNER}  batches=${PROFILE_INNER_BATCHES}"
@@ -519,14 +543,20 @@ run_algo() {
             printf "NPROC=%q\n" "$NPROC"
             printf "K=%q\n" "$KEFF"
             printf "EPOCHS_ADV=%q\n" "$EPOCHS_ADV"
+            printf "FROZEN_ADVERSARY_EPOCHS=%q\n" "$FROZEN_ADVERSARY_EPOCHS"
+            printf "FROZEN_ADVERSARY_MAP_STEPS=%q\n" "$FROZEN_ADVERSARY_MAP_STEPS"
             printf "COMMON_BATCH=%q\n" "$BATCH_OVR"
             printf "LR_THETA=%q\n" "$LR_THETA"
             printf "FREEZE_BATCHNORM=%q\n" "$FREEZE_BATCHNORM"
+            printf "FREEZE_BATCHNORM_AFFINE=%q\n" "$FREEZE_BATCHNORM_AFFINE"
+            printf "BATCHNORM_ONLINE_REFRESH=%q\n" "$BATCHNORM_ONLINE_REFRESH"
+            printf "BATCHNORM_ONLINE_REFRESH_MOMENTUM=%q\n" "$BATCHNORM_ONLINE_REFRESH_MOMENTUM"
             printf "RECALIBRATE_BATCHNORM=%q\n" "$RECALIBRATE_BATCHNORM"
             printf "BATCHNORM_RECALIBRATION_BATCHES=%q\n" "$BATCHNORM_RECALIBRATION_BATCHES"
             printf "BATCHNORM_RECALIBRATION_RESET=%q\n" "$BATCHNORM_RECALIBRATION_RESET"
             printf "BATCHNORM_RECALIBRATION_MOMENTUM=%q\n" "$BATCHNORM_RECALIBRATION_MOMENTUM"
             printf "PENALTY_LAMBDA=%q\n" "$PENALTY_LAMBDA"
+            printf "TRANSPORT_COST=%q\n" "$TRANSPORT_COST"
             printf "LAMBDA_SCHEDULE=%q\n" "$LAMBDA_SCHEDULE"
             printf "LAMBDA_STAGE_EPOCHS=%q\n" "$LAMBDA_STAGE_EPOCHS"
             printf "USE_MARGIN_LOSS=%q\n" "$USE_MARGIN_LOSS"
@@ -535,6 +565,7 @@ run_algo() {
             printf "INP_STEPS=%q\n" "$INP_STEPS"
             printf "INP_RESTARTS=%q\n" "$INP_RESTARTS"
             printf "EVAL_PGD_SAMPLES=%q\n" "$EVAL_PGD_SAMPLES"
+            printf "INPUT_PGD_LOSS=%q\n" "$INPUT_PGD_LOSS"
             printf "PROFILE_INNER=%q\n" "$PROFILE_INNER"
             printf "PROFILE_INNER_BATCHES=%q\n" "$PROFILE_INNER_BATCHES"
             printf "RESUME_CHECKPOINT=%q\n" "$RESUME_CHECKPOINT"
@@ -587,6 +618,25 @@ run_algo() {
                 COMMON_EXTRA_FLAGS+=(--freeze-batchnorm)
                 ;;
         esac
+        case "$FREEZE_BATCHNORM_AFFINE" in
+            1|true|True|TRUE|yes|Yes|YES)
+                COMMON_EXTRA_FLAGS+=(--freeze-batchnorm-affine)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--no-freeze-batchnorm-affine)
+                ;;
+        esac
+        case "$BATCHNORM_ONLINE_REFRESH" in
+            1|true|True|TRUE|yes|Yes|YES)
+                COMMON_EXTRA_FLAGS+=(--online-batchnorm-refresh)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--no-online-batchnorm-refresh)
+                ;;
+        esac
+        if [ -n "$BATCHNORM_ONLINE_REFRESH_MOMENTUM" ]; then
+            COMMON_EXTRA_FLAGS+=(--batchnorm-online-refresh-momentum "$BATCHNORM_ONLINE_REFRESH_MOMENTUM")
+        fi
         case "$RECALIBRATE_BATCHNORM" in
             1|true|True|TRUE|yes|Yes|YES)
                 COMMON_EXTRA_FLAGS+=(--recalibrate-batchnorm)
@@ -637,16 +687,20 @@ run_algo() {
             --data-dir "$DATA_DIR" \
             --epochs-adv "$EPOCHS_ADV" \
             --epochs-icnn-pretrain "$EPOCHS_ICNN_PRETRAIN" \
+            --frozen-adversary-epochs "$FROZEN_ADVERSARY_EPOCHS" \
+            --frozen-adversary-map-steps "$FROZEN_ADVERSARY_MAP_STEPS" \
             --batch-size "$BATCH_OVR" \
             --num-workers "$NUM_WORKERS" \
             --lr-theta "$LR_THETA" \
             --penalty-lambda "$PENALTY_LAMBDA" \
+            --transport-cost "$TRANSPORT_COST" \
             --inp-p "$INP_P" \
             --inp-eps "$INP_EPS" \
             --inp-steps "$INP_STEPS" \
             --inp-restarts "$INP_RESTARTS" \
             --eval-input-pgd \
             --eval-input-pgd-samples "$EVAL_PGD_SAMPLES" \
+            --input-pgd-loss "$INPUT_PGD_LOSS" \
             "${COMMON_EXTRA_FLAGS[@]}" \
             "${BB_ARGS[@]}" \
             "${NPF_OPT_ARGS[@]}" \

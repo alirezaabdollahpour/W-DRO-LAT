@@ -14,6 +14,8 @@ set -euo pipefail
 #   EPOCHS_ADV            50
 #   BATCH_SIZE            512
 #   PENALTY_LAMBDA        10
+#   TRANSPORT_COST        normalized_mse (legacy pretrained_INPUT_icnn.py scale;
+#                                    use pixel_l2_squared only for explicit ablations)
 #   LR_THETA              0.003
 #   OMEGA_STEPS           20        (NPF / NN-DRO)
 #   NPF_LASTQUAD_HIDDEN   "1024 512 512 256 128 64"
@@ -22,6 +24,11 @@ set -euo pipefail
 #   USE_MARGIN_LOSS       0         (set to 1 to use logsumexp margin objective
 #                                    for the adversary on NPF/NN-DRO/WRM/Madry/PPA)
 #   FREEZE_BATCHNORM      1         (keep BN running stats fixed during adversarial updates)
+#   FREEZE_BATCHNORM_AFFINE $FREEZE_BATCHNORM (also keep BN weight/bias fixed)
+#   BATCHNORM_ONLINE_REFRESH 0      (per batch, refresh BN stats on clean train data;
+#                                    with FREEZE_BATCHNORM=1 this is the only
+#                                    pass that mutates BN running stats)
+#   BATCHNORM_ONLINE_REFRESH_MOMENTUM "" (empty = keep module momentum)
 #   RECALIBRATE_BATCHNORM 0         (after each adversarial epoch, recompute BN stats on clean train data)
 #   BATCHNORM_RECALIBRATION_BATCHES 0  (0 = full clean train pass)
 #   BATCHNORM_RECALIBRATION_RESET 1    (1 = exact fresh stats; 0 = refresh existing stats)
@@ -42,6 +49,7 @@ PRETRAINED_PATH="${PRETRAINED_PATH:-/mloscratch/homes/aabdolla/LAT/ResNet_checkp
 EPOCHS_ADV="${EPOCHS_ADV:-50}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
 PENALTY_LAMBDA="${PENALTY_LAMBDA:-10}"
+TRANSPORT_COST="${TRANSPORT_COST:-normalized_mse}"
 LR_THETA="${LR_THETA:-0.003}"
 OMEGA_STEPS="${OMEGA_STEPS:-20}"
 INP_P="${INP_P:-2}"
@@ -49,9 +57,13 @@ INP_EPS="${INP_EPS:-0.5}"
 INP_STEPS="${INP_STEPS:-20}"
 INP_RESTARTS="${INP_RESTARTS:-5}"
 EVAL_PGD_SAMPLES="${EVAL_PGD_SAMPLES:-1000}"
+INPUT_PGD_LOSS="${INPUT_PGD_LOSS:-margin}"
 SEED="${SEED:-1}"
 USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-0}"
 FREEZE_BATCHNORM="${FREEZE_BATCHNORM:-1}"
+FREEZE_BATCHNORM_AFFINE="${FREEZE_BATCHNORM_AFFINE:-${FREEZE_BN_AFFINE:-${FREEZE_BATCHNORM}}}"
+BATCHNORM_ONLINE_REFRESH="${BATCHNORM_ONLINE_REFRESH:-${ONLINE_BATCHNORM_REFRESH:-0}}"
+BATCHNORM_ONLINE_REFRESH_MOMENTUM="${BATCHNORM_ONLINE_REFRESH_MOMENTUM:-${ONLINE_BATCHNORM_REFRESH_MOMENTUM:-}}"
 RECALIBRATE_BATCHNORM="${RECALIBRATE_BATCHNORM:-0}"
 BATCHNORM_RECALIBRATION_BATCHES="${BATCHNORM_RECALIBRATION_BATCHES:-0}"
 BATCHNORM_RECALIBRATION_RESET="${BATCHNORM_RECALIBRATION_RESET:-1}"
@@ -76,12 +88,14 @@ COMMON_ARGS=(
   --batch-size "${BATCH_SIZE}"
   --lr-theta "${LR_THETA}"
   --penalty-lambda "${PENALTY_LAMBDA}"
+  --transport-cost "${TRANSPORT_COST}"
   --inp-p "${INP_P}"
   --inp-eps "${INP_EPS}"
   --inp-steps "${INP_STEPS}"
   --inp-restarts "${INP_RESTARTS}"
   --eval-input-pgd
   --eval-input-pgd-samples "${EVAL_PGD_SAMPLES}"
+  --input-pgd-loss "${INPUT_PGD_LOSS}"
   --seed "${SEED}"
   --save "${SAVE_PATH}"
   --log-csv "${LOG_CSV}"
@@ -97,6 +111,25 @@ case "${FREEZE_BATCHNORM}" in
     COMMON_ARGS+=(--freeze-batchnorm)
     ;;
 esac
+case "${FREEZE_BATCHNORM_AFFINE}" in
+  1|true|True|TRUE|yes|Yes|YES)
+    COMMON_ARGS+=(--freeze-batchnorm-affine)
+    ;;
+  *)
+    COMMON_ARGS+=(--no-freeze-batchnorm-affine)
+    ;;
+esac
+case "${BATCHNORM_ONLINE_REFRESH}" in
+  1|true|True|TRUE|yes|Yes|YES)
+    COMMON_ARGS+=(--online-batchnorm-refresh)
+    ;;
+  *)
+    COMMON_ARGS+=(--no-online-batchnorm-refresh)
+    ;;
+esac
+if [[ -n "${BATCHNORM_ONLINE_REFRESH_MOMENTUM}" ]]; then
+  COMMON_ARGS+=(--batchnorm-online-refresh-momentum "${BATCHNORM_ONLINE_REFRESH_MOMENTUM}")
+fi
 case "${RECALIBRATE_BATCHNORM}" in
   1|true|True|TRUE|yes|Yes|YES)
     COMMON_ARGS+=(--recalibrate-batchnorm)

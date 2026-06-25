@@ -13,9 +13,10 @@ Inner loop: configurable optimizer on ω optimising
 
     max_ω  E[ CE(f(T_ω(x)), y) - λ ||T_ω(x) - x||_2^2 ]
 
-where classifier inputs are normalized CIFAR tensors, but the squared
-transport cost is measured after converting both arguments back to
-pixel coordinates in [0, 1], matching CIFAR L2 benchmark convention.
+where classifier inputs are normalized CIFAR tensors and the squared
+transport cost uses the configured convention. The default is the legacy
+pretrained_INPUT_icnn.py cost: per-sample mean squared difference in
+normalized CIFAR coordinates.
 
 The default inner optimizer is the existing BB+Armijo ascent. Passing
 ``--npf-inner-optimizer muon`` switches only the NPF / NPF-LastQuad
@@ -38,7 +39,6 @@ from ..utils import (
     clamped_normalized_copy,
     frozen_module,
     muon_step_params,
-    pixel_l2_squared,
     set_requires_grad,
 )
 from .base import BaseAdvTrainer
@@ -162,7 +162,7 @@ class NPFTrainer(BaseAdvTrainer):
                     logits = self._classifier_module(x_adv)
                 with self.profile_time("objective_loss_cost_s"):
                     primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
-                    transport_cost = pixel_l2_squared(x_adv, x)
+                    transport_cost = self._transport_cost(x_adv, x)
                     obj = (primary - lambda_param * transport_cost).mean()
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
@@ -216,6 +216,10 @@ class NPFTrainer(BaseAdvTrainer):
         finally:
             self.psi_omega.train(was_training)
         return x_adv.detach()
+
+    def freeze_adversary_parameters(self) -> None:
+        self.psi_omega.eval()
+        set_requires_grad(self.psi_omega, False)
 
     def adversary_state_dicts(self) -> Dict[str, Any]:
         return {"psi_omega": self.psi_omega.state_dict()}

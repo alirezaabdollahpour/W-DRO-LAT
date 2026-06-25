@@ -49,6 +49,12 @@ class TrainConfig:
     # WFR / Dual / New_PPA) warmup is a no-op since they don't have
     # persistent adversary state to carry across batches.
     epochs_icnn_pretrain: int = 0
+    # Optional post phase: after ordinary adversarial training, freeze the
+    # learned parametric adversary and continue updating only the classifier on
+    # T_omega^m(x). This is useful for testing whether the learned NPF map can
+    # be reused as a fixed data transform.
+    frozen_adversary_epochs: int = 0
+    frozen_adversary_map_steps: int = 1
     batch_size: int = 256
     num_workers: int = 2
     augment_train: bool = True
@@ -56,6 +62,9 @@ class TrainConfig:
     momentum: float = 0.9
     weight_decay: float = 5e-4
     freeze_batchnorm: bool = True
+    freeze_batchnorm_affine: bool = False
+    online_batchnorm_refresh: bool = False
+    batchnorm_online_refresh_momentum: Optional[float] = None
     recalibrate_batchnorm: bool = False
     batchnorm_recalibration_batches: int = 0
     batchnorm_recalibration_reset: bool = True
@@ -63,11 +72,11 @@ class TrainConfig:
     seed: int = 1
 
     # --- DRO core hyperparameters ---
-    # The penalty weight λ scales ||T(x) - x||^2 in every adversary's
-    # objective. For CIFAR input-space runs this cost is measured in
-    # pixel coordinates [0, 1], matching standard L2 robustness benchmark
-    # conventions, while classifier inputs remain normalized tensors.
-    # The CLI exposes both --penalty-lambda (the ICNN/NPF convention from
+    # The penalty weight λ scales the configured transport cost in every
+    # adversary's objective. The default cost matches the legacy
+    # pretrained_INPUT_icnn.py implementation: mean squared difference in
+    # normalized CIFAR coordinates. Classifier inputs remain normalized
+    # tensors throughout. The CLI exposes both --penalty-lambda (the ICNN/NPF convention from
     # the original script) and --tau (the Figure-6 convention,
     # λ = 1 / (2τ)). Whichever is passed wins.
     lambda_param: float = 30.0
@@ -85,6 +94,11 @@ class TrainConfig:
     # loss in every method; the outer classifier update remains CE for
     # primal adversarial-training methods.
     use_margin_loss: bool = True
+    # Transport penalty convention for DRO inner objectives. The default
+    # matches legacy pretrained_INPUT_icnn.py: mean squared difference in
+    # normalized CIFAR coordinates. Use pixel_l2_squared only for experiments
+    # that intentionally want standard pixel-space squared L2 scaling.
+    transport_cost: str = "normalized_mse"
 
     # --- Inner-loop budget shared by NPF / NN-DRO ---
     omega_steps_per_batch: int = 20
@@ -245,6 +259,7 @@ class TrainConfig:
     # --- Evaluation (input-space PGD) ---
     eval_input_pgd: bool = True
     eval_input_pgd_samples: int = 1000
+    input_pgd_loss: str = "margin"
     inp_p: str = "2"
     inp_eps: float = 0.5
     inp_steps: int = 20
@@ -327,6 +342,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "attacks (Madry / WRM / WFR / Dual / New_PPA) ignore this knob."
         ),
     )
+    parser.add_argument(
+        "--frozen-adversary-epochs",
+        type=int,
+        default=0,
+        help=(
+            "After --epochs-adv, freeze the learned parametric adversary and "
+            "continue training only the classifier for this many epochs."
+        ),
+    )
+    parser.add_argument(
+        "--frozen-adversary-map-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of times to apply the frozen adversary map per sample "
+            "during --frozen-adversary-epochs, e.g. 2 means T_omega(T_omega(x))."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--no-augment", dest="augment_train", action="store_false")
@@ -340,8 +373,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Keep BatchNorm layers in eval mode during classifier updates, "
-            "preserving pretrained running statistics while still training "
-            "non-BN weights and BN affine parameters."
+            "preserving pretrained running statistics."
         ),
     )
     parser.add_argument(
@@ -351,6 +383,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Allow BatchNorm running statistics to update during classifier training.",
     )
     parser.set_defaults(freeze_batchnorm=True)
+    parser.add_argument(
+        "--freeze-batchnorm-affine",
+        dest="freeze_batchnorm_affine",
+        action="store_true",
+        help=(
+            "Also freeze BatchNorm affine weight/bias parameters so pretrained "
+            "normalization is fixed apart from optional running-stat "
+            "recalibration."
+        ),
+    )
+    parser.add_argument(
+        "--no-freeze-batchnorm-affine",
+        dest="freeze_batchnorm_affine",
+        action="store_false",
+        help="Allow BatchNorm affine weight/bias parameters to train.",
+    )
+    parser.set_defaults(freeze_batchnorm_affine=False)
+    parser.add_argument(
+        "--online-batchnorm-refresh",
+        dest="online_batchnorm_refresh",
+        action="store_true",
+        help=(
+            "Before each classifier-updating training batch, run a no-gradient "
+            "clean forward that updates only BatchNorm running statistics. "
+            "When --freeze-batchnorm is also set, the subsequent adversary and "
+            "classifier updates still keep BatchNorm layers in eval mode; only "
+            "this clean refresh pass mutates running statistics."
+        ),
+    )
+    parser.add_argument(
+        "--no-online-batchnorm-refresh",
+        dest="online_batchnorm_refresh",
+        action="store_false",
+        help="Disable per-batch clean BatchNorm running-stat refresh.",
+    )
+    parser.set_defaults(online_batchnorm_refresh=False)
+    parser.add_argument(
+        "--batchnorm-online-refresh-momentum",
+        type=float,
+        default=None,
+        help=(
+            "Optional BN momentum used only for the per-batch clean online "
+            "refresh. Omit to keep each BatchNorm module's configured momentum."
+        ),
+    )
     parser.add_argument(
         "--recalibrate-batchnorm",
         dest="recalibrate_batchnorm",
@@ -476,6 +553,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
     )
     parser.set_defaults(use_margin_loss=False)
+    parser.add_argument(
+        "--transport-cost",
+        type=str,
+        default="normalized_mse",
+        choices=["normalized_mse", "pixel_l2_squared"],
+        help=(
+            "Transport penalty convention for DRO objectives. normalized_mse "
+            "matches legacy pretrained_INPUT_icnn.py; pixel_l2_squared uses "
+            "standard CIFAR pixel-coordinate squared L2."
+        ),
+    )
 
     # NPF
     npf = parser.add_argument_group("npf")
@@ -673,6 +761,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-eval-input-pgd", dest="eval_input_pgd", action="store_false")
     parser.set_defaults(eval_input_pgd=True)
     parser.add_argument("--eval-input-pgd-samples", type=int, default=1000)
+    parser.add_argument(
+        "--input-pgd-loss",
+        type=str,
+        default="margin",
+        choices=["margin", "ce"],
+        help=(
+            "Loss maximized by input-space PGD evaluation. The default "
+            "logsumexp margin avoids CE saturation artifacts; pass ce only "
+            "for legacy comparisons."
+        ),
+    )
     parser.add_argument("--inp-p", type=str, default="2", choices=["2", "inf"])
     parser.add_argument("--inp-eps", type=float, default=0.5)
     parser.add_argument("--inp-steps", type=int, default=20)
@@ -694,11 +793,25 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
     lambda_stage_epochs = int(args.lambda_stage_epochs or 0)
     if int(args.batchnorm_recalibration_batches) < 0:
         raise ValueError("--batchnorm-recalibration-batches must be non-negative.")
+    if int(args.frozen_adversary_epochs) < 0:
+        raise ValueError("--frozen-adversary-epochs must be non-negative.")
+    if int(args.frozen_adversary_map_steps) < 1:
+        raise ValueError("--frozen-adversary-map-steps must be at least 1.")
     if args.batchnorm_recalibration_momentum is not None:
         bn_momentum = float(args.batchnorm_recalibration_momentum)
         if not math.isfinite(bn_momentum) or bn_momentum < 0.0 or bn_momentum > 1.0:
             raise ValueError(
                 "--batchnorm-recalibration-momentum must be finite and in [0, 1]."
+            )
+    if args.batchnorm_online_refresh_momentum is not None:
+        online_bn_momentum = float(args.batchnorm_online_refresh_momentum)
+        if (
+            not math.isfinite(online_bn_momentum)
+            or online_bn_momentum < 0.0
+            or online_bn_momentum > 1.0
+        ):
+            raise ValueError(
+                "--batchnorm-online-refresh-momentum must be finite and in [0, 1]."
             )
     if not math.isfinite(lambda_param) or lambda_param <= 0.0:
         raise ValueError(f"lambda_param must be positive and finite, got {lambda_param}.")
@@ -741,6 +854,8 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "algorithm": "algorithm",
         "epochs_adv": "epochs_adv",
         "epochs_icnn_pretrain": "epochs_icnn_pretrain",
+        "frozen_adversary_epochs": "frozen_adversary_epochs",
+        "frozen_adversary_map_steps": "frozen_adversary_map_steps",
         "benchmark_mode": "benchmark_mode",
         "skip_pgd_during_train": "skip_pgd_during_train",
         "profile_inner": "profile_inner",
@@ -752,6 +867,9 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "momentum": "momentum",
         "weight_decay": "weight_decay",
         "freeze_batchnorm": "freeze_batchnorm",
+        "freeze_batchnorm_affine": "freeze_batchnorm_affine",
+        "online_batchnorm_refresh": "online_batchnorm_refresh",
+        "batchnorm_online_refresh_momentum": "batchnorm_online_refresh_momentum",
         "recalibrate_batchnorm": "recalibrate_batchnorm",
         "batchnorm_recalibration_batches": "batchnorm_recalibration_batches",
         "batchnorm_recalibration_reset": "batchnorm_recalibration_reset",
@@ -766,6 +884,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "bb_ls_shrink": "bb_ls_shrink",
         "bb_ls_max_steps": "bb_ls_max_steps",
         "use_margin_loss": "use_margin_loss",
+        "transport_cost": "transport_cost",
         "lambda_stage_epochs": "lambda_stage_epochs",
         "npf_hidden": "npf_hidden",
         "npf_outer_rank": "npf_outer_rank",
@@ -831,6 +950,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "ppa_gain_rtol": "ppa_gain_rtol",
         "eval_input_pgd": "eval_input_pgd",
         "eval_input_pgd_samples": "eval_input_pgd_samples",
+        "input_pgd_loss": "input_pgd_loss",
         "inp_p": "inp_p",
         "inp_eps": "inp_eps",
         "inp_steps": "inp_steps",

@@ -9,8 +9,8 @@ directly (the per-batch DRO inner objective is
 BB state is reset every batch — z changes per-batch, so the (s, y)
 history from a previous batch isn't meaningful. K=cfg.wrm_inner_steps
 BB+Armijo iterations are taken per batch. We clamp z to the valid
-normalized pixel range after each accepted step. The penalty is measured
-in pixel coordinates [0, 1], matching CIFAR L2 benchmark convention.
+normalized pixel range after each accepted step. The penalty uses the
+configured transport-cost convention, defaulting to legacy normalized MSE.
 """
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from ..utils import (
     bb_armijo_step_tensor,
     clamped_normalized_copy,
     frozen_module,
-    pixel_l2_squared,
 )
 from .base import BaseAdvTrainer
 
@@ -61,7 +60,7 @@ class WRMTrainer(BaseAdvTrainer):
                     primary = adversary_loss_per_sample(
                         logits, y, use_margin=use_margin
                     )
-                    cost = pixel_l2_squared(z_var, x)
+                    cost = self._transport_cost(z_var, x)
                     return (primary - lam * cost).mean()
 
             # Per-batch BB+Armijo state — z changes batch-to-batch so the

@@ -11,10 +11,12 @@ The original LR-CIFAR10 reference uses constant-LR WRM ascent inside
 each round. Here we replace that with the SAME BB+Armijo step rule
 used by NPF, applied to z directly. The projection rounds are
 unchanged; BB state is fresh at the start of each ascent burst because
-z is anchored / re-projected between bursts. All transport costs are
-measured in pixel coordinates [0, 1].
+z is anchored / re-projected between bursts. Transport costs use the
+configured convention, defaulting to legacy normalized-coordinate MSE.
 """
 from __future__ import annotations
+
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -27,7 +29,6 @@ from ..utils import (
     clamped_normalized_copy,
     free_weight_projection_images,
     frozen_module,
-    pixel_l2_squared,
 )
 from .base import BaseAdvTrainer
 
@@ -40,6 +41,7 @@ def _bb_armijo_ascent(
     lam: float,
     num_steps: int,
     use_margin: bool,
+    cost_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     bb_alpha0: float,
     bb_alpha_min: float,
     bb_alpha_max: float,
@@ -68,7 +70,7 @@ def _bb_armijo_ascent(
 
     def f_obj(z_var: torch.Tensor, create_graph: bool) -> torch.Tensor:
         primary = adversary_loss_per_sample(classifier(z_var), y, use_margin=use_margin)
-        cost = pixel_l2_squared(z_var, x_anchor)
+        cost = cost_fn(z_var, x_anchor)
         return (primary - lam * cost).mean()
 
     z = z0.detach().clone()
@@ -102,6 +104,7 @@ class NewPPATrainer(BaseAdvTrainer):
                 x, x, clf, y, lam,
                 num_steps=int(cfg.ppa_round0_steps),
                 use_margin=use_margin,
+                cost_fn=self._transport_cost,
                 **bb_kwargs,
             )
 
@@ -109,7 +112,8 @@ class NewPPATrainer(BaseAdvTrainer):
             # ascent, with adaptive early stopping on the projection gain.
             for round_idx in range(1, max(1, int(cfg.ppa_num_rounds))):
                 z, _y_proj, gain, obj_scale, _ = free_weight_projection_images(
-                    z, x, y, clf, lam, use_margin=use_margin
+                    z, x, y, clf, lam, use_margin=use_margin,
+                    transport_cost=getattr(cfg, "transport_cost", "normalized_mse")
                 )
                 if (
                     round_idx >= int(cfg.ppa_min_rounds)
@@ -120,13 +124,15 @@ class NewPPATrainer(BaseAdvTrainer):
                     z, x, clf, y, lam,
                     num_steps=int(cfg.ppa_refine_steps),
                     use_margin=use_margin,
+                    cost_fn=self._transport_cost,
                     **bb_kwargs,
                 )
 
             # Final projection so the outer step sees within-class best
             # responses (matches MNIST_Cuturi's contract).
             z, _y_proj, _, _, _ = free_weight_projection_images(
-                z, x, y, clf, lam, use_margin=use_margin
+                z, x, y, clf, lam, use_margin=use_margin,
+                transport_cost=getattr(cfg, "transport_cost", "normalized_mse")
             )
 
             with torch.no_grad():

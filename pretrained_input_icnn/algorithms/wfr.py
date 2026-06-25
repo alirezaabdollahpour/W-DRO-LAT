@@ -11,7 +11,8 @@ BB+Armijo step rule as NPF. The Gaussian noise (the Fisher-Rao part)
 is then added on top. The deterministic drift and the particle
 reweighting use the same primary - lambda * ||z - x||^2 energy so the
 lambda convention matches the other DRO trainers. The squared transport
-cost and Langevin noise scale are interpreted in pixel coordinates [0, 1].
+cost uses the configured convention; the Langevin noise is still injected
+in pixel coordinates before converting back to normalized tensors.
 """
 from __future__ import annotations
 
@@ -27,8 +28,6 @@ from ..utils import (
     bb_armijo_step_tensor,
     clamped_normalized_copy,
     frozen_module,
-    pixel_l2_squared,
-    set_requires_grad,
     to_normalized,
     to_pixel,
 )
@@ -87,7 +86,7 @@ class WFRTrainer(BaseAdvTrainer):
             ce = adversary_loss_per_sample(
                 self._classifier_module(z_var), y_rep, use_margin=use_margin
             )
-            cost = pixel_l2_squared(z_var, x_anchor)
+            cost = self._transport_cost(z_var, x_anchor)
             return (ce - lam * cost).mean()
 
         for _ in range(self.inner_steps):
@@ -102,7 +101,7 @@ class WFRTrainer(BaseAdvTrainer):
                 cur_loss = adversary_loss_per_sample(
                     self._classifier_module(z), y_rep, use_margin=use_margin
                 ).view(bs, m)
-                dist_sq = pixel_l2_squared(z, x_anchor).view(bs, m)
+                dist_sq = self._transport_cost(z, x_anchor).view(bs, m)
                 # Same objective as the deterministic drift:
                 # primary(classifier(z), y) - lambda * ||z - x||^2.
                 energy = cur_loss - lam * dist_sq
@@ -158,8 +157,7 @@ class WFRTrainer(BaseAdvTrainer):
     def classifier_update(self, x_adv, y):
         # Override the base trainer to use the importance-weighted loss
         # over all particles rather than only the top-weight survivor.
-        self.classifier.train()
-        set_requires_grad(self.classifier, True)
+        self._prepare_classifier_for_update()
         self.optimizer.zero_grad(set_to_none=True)
         logits = self.classifier(self._wfr_z)
         ce = nn.CrossEntropyLoss(reduction="none")(logits, self._wfr_y_rep)

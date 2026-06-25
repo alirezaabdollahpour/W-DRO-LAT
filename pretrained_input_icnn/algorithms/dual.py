@@ -19,8 +19,9 @@ Two operating modes:
 
       U(z) = ℓ(f_θ(z), y) / (2λε)  −  ‖z − x‖² / (2ε).
 
-  The classifier sees normalized CIFAR tensors, but the Gaussian prior
-  and squared distance above are interpreted in pixel coordinates [0, 1].
+  The classifier sees normalized CIFAR tensors. The squared distance uses
+  the configured transport-cost convention, while the optional Gaussian
+  particle initialization is still expressed in pixel coordinates [0, 1].
 
   The shared factor 2 makes the zero-temperature limit
   ``max_z ℓ(f_θ(z), y) - λ‖z - x‖²``, matching NPF / NN-DRO / WRM /
@@ -62,8 +63,6 @@ from ..utils import (
     clamped_normalized_copy,
     frozen_module,
     normalized_pixel_bounds,
-    pixel_l2_squared,
-    set_requires_grad,
     to_normalized,
     to_pixel,
 )
@@ -124,7 +123,7 @@ class SDRODualTrainer(BaseAdvTrainer):
         ce = adversary_loss_per_sample(
             logits, y_rep, use_margin=bool(self.config.use_margin_loss)
         )
-        sq = pixel_l2_squared(z_in, x_rep)
+        sq = self._transport_cost(z_in, x_rep)
         U_per_particle = ce / lam_eps - 0.5 * sq / self.epsilon
         # autograd.grad wrt z_in returns dU_total/dz_in. We want
         # dU_per_particle / dz_in (per-particle drift). Since U_per_particle
@@ -271,8 +270,7 @@ class SDRODualTrainer(BaseAdvTrainer):
         # The actual outer loss IS the Sinkhorn dual on the (potentially
         # Langevin-refined) particles. ``x_adv`` from step() is just a
         # diagnostic — we use ``self._dual_z`` here.
-        self.classifier.train()
-        set_requires_grad(self.classifier, True)
+        self._prepare_classifier_for_update()
         self.optimizer.zero_grad(set_to_none=True)
         logits = self.classifier(self._dual_z)
         residuals = adversary_loss_per_sample(

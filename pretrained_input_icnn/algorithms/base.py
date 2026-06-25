@@ -13,6 +13,9 @@ The schedule is a two-phase one:
   WRM / WFR / Dual / New_PPA) ignore this phase since they don't carry
   state across batches.
 * ``epochs_adv`` standard adversarial epochs do the full minimax update.
+* ``frozen_adversary_epochs`` optional post epochs freeze the learned
+  parametric adversary and keep training only the classifier on
+  repeatedly transported inputs ``T_omega^m(x)``.
 """
 from __future__ import annotations
 
@@ -39,8 +42,8 @@ from ..utils import (
     evaluate_clean,
     evaluate_under_input_pgd,
     evaluate_under_transport,
+    normalized_mse,
     pixel_l2_squared,
-    set_requires_grad,
 )
 
 
@@ -102,6 +105,8 @@ class BaseAdvTrainer:
             if device.type == "cuda":
                 classifier = nn.SyncBatchNorm.convert_sync_batchnorm(classifier)
             self._classifier_module = classifier
+            if bool(getattr(self.config, "freeze_batchnorm_affine", False)):
+                self._set_batchnorm_affine_requires_grad(False)
             self.classifier = DDP(
                 classifier,
                 device_ids=[self.dist.local_rank] if device.type == "cuda" else None,
@@ -111,6 +116,8 @@ class BaseAdvTrainer:
             )
         else:
             self._classifier_module = classifier
+            if bool(getattr(self.config, "freeze_batchnorm_affine", False)):
+                self._set_batchnorm_affine_requires_grad(False)
             self.classifier = classifier
 
         self.train_loader = train_loader
@@ -121,9 +128,12 @@ class BaseAdvTrainer:
 
         self.optimizer = self._make_classifier_optimizer()
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
-        if config.epochs_adv > 0:
+        classifier_update_epochs = int(config.epochs_adv) + int(
+            getattr(config, "frozen_adversary_epochs", 0) or 0
+        )
+        if classifier_update_epochs > 0:
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=max(1, config.epochs_adv)
+                self.optimizer, T_max=max(1, classifier_update_epochs)
             )
 
         self.best_robust_acc: Optional[float] = None
@@ -173,6 +183,34 @@ class BaseAdvTrainer:
         """
         return x.detach()
 
+    def repeated_transport_for_eval(
+        self,
+        x: torch.Tensor,
+        *,
+        steps: int,
+    ) -> torch.Tensor:
+        """Apply the learned transport map repeatedly without updating it."""
+        z = x.detach()
+        for _ in range(max(1, int(steps))):
+            z = self.transport_for_eval(z).detach()
+        return z.detach()
+
+    def freeze_adversary_parameters(self) -> None:  # pragma: no cover - default no-op
+        """Hook for parametric adversaries before the frozen-map post phase."""
+        return
+
+    def frozen_adversary_transport(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        steps: int,
+    ) -> torch.Tensor:
+        """Return T^steps(x) for the frozen-adversary classifier-only phase."""
+        del y
+        self._last_inner_loss = 0.0
+        return self.repeated_transport_for_eval(x, steps=steps)
+
     def adversary_state_dicts(self) -> Dict[str, Any]:
         """Optional extra checkpoint payload (adversary parameters)."""
         return {}
@@ -211,6 +249,14 @@ class BaseAdvTrainer:
         # lambda scheduling is a deliberate runtime control. Existing
         # algorithms read cfg.lambda_param, so update that one field centrally.
         object.__setattr__(self.config, "lambda_param", float(value))
+
+    def _transport_cost(self, x_adv: torch.Tensor, x_clean: torch.Tensor) -> torch.Tensor:
+        mode = str(getattr(self.config, "transport_cost", "normalized_mse")).lower()
+        if mode in {"normalized_mse", "normalized", "legacy"}:
+            return normalized_mse(x_adv, x_clean)
+        if mode in {"pixel_l2_squared", "pixel_l2", "pixel"}:
+            return pixel_l2_squared(x_adv, x_clean)
+        raise ValueError(f"Unsupported transport_cost mode: {mode}")
 
     # ------------------------------------------------------------------
     # Inner-loop profiler helpers
@@ -338,6 +384,83 @@ class BaseAdvTrainer:
             if isinstance(module, nn.modules.batchnorm._BatchNorm):
                 module.eval()
 
+    def _classifier_training_modes(self) -> Dict[nn.Module, bool]:
+        return {module: module.training for module in self._classifier_module.modules()}
+
+    def _restore_classifier_training_modes(
+        self,
+        training_modes: Dict[nn.Module, bool],
+    ) -> None:
+        for module, was_training in training_modes.items():
+            module.train(was_training)
+
+    def _set_batchnorm_affine_requires_grad(self, flag: bool) -> None:
+        for module in self._classifier_module.modules():
+            if not isinstance(module, nn.modules.batchnorm._BatchNorm):
+                continue
+            if module.weight is not None:
+                module.weight.requires_grad_(flag)
+            if module.bias is not None:
+                module.bias.requires_grad_(flag)
+
+    def _set_classifier_update_requires_grad(self) -> None:
+        freeze_bn_affine = bool(
+            getattr(self.config, "freeze_batchnorm_affine", False)
+        )
+        for module in self._classifier_module.modules():
+            is_bn = isinstance(module, nn.modules.batchnorm._BatchNorm)
+            for name, param in module.named_parameters(recurse=False):
+                if freeze_bn_affine and is_bn and name in {"weight", "bias"}:
+                    param.requires_grad_(False)
+                else:
+                    param.requires_grad_(True)
+
+    def _prepare_classifier_for_update(self) -> None:
+        self.classifier.train()
+        self._set_classifier_update_requires_grad()
+        self._freeze_batchnorm_layers()
+
+    @torch.no_grad()
+    def _online_refresh_batchnorm(self, x: torch.Tensor) -> Dict[str, float]:
+        cfg = self.config
+        if not bool(getattr(cfg, "online_batchnorm_refresh", False)):
+            return {}
+
+        bn_modules = [
+            module
+            for module in self._classifier_module.modules()
+            if isinstance(module, nn.modules.batchnorm._BatchNorm)
+        ]
+        if not bn_modules:
+            return {}
+
+        refresh_momentum = getattr(cfg, "batchnorm_online_refresh_momentum", None)
+        wrapper_training = self.classifier.training
+        module_training = self._classifier_training_modes()
+        momenta = {module: module.momentum for module in bn_modules}
+
+        start = time.perf_counter()
+        try:
+            self.classifier.eval()
+            for module in bn_modules:
+                if refresh_momentum is not None:
+                    module.momentum = refresh_momentum
+                module.train()
+            self.classifier(x)
+        finally:
+            seconds = time.perf_counter() - start
+            for module, momentum in momenta.items():
+                module.momentum = momentum
+            self.classifier.train(wrapper_training)
+            self._restore_classifier_training_modes(module_training)
+            self._freeze_batchnorm_layers()
+
+        return {
+            "bn_online_refresh_seconds": float(seconds),
+            "bn_online_refresh_batches": 1.0,
+            "bn_online_refresh_samples": float(x.size(0)),
+        }
+
     @torch.no_grad()
     def _recalibrate_batchnorm(self, epoch: int) -> Dict[str, float]:
         cfg = self.config
@@ -361,9 +484,7 @@ class BaseAdvTrainer:
         max_batches = int(getattr(cfg, "batchnorm_recalibration_batches", 0) or 0)
         reset_stats = bool(getattr(cfg, "batchnorm_recalibration_reset", True))
         recalibration_momentum = getattr(cfg, "batchnorm_recalibration_momentum", None)
-        module_training = {
-            module: module.training for module in self._classifier_module.modules()
-        }
+        module_training = self._classifier_training_modes()
         momenta = {module: module.momentum for module in bn_modules}
 
         # Keep non-BN modules deterministic (e.g. dropout disabled) while BN
@@ -393,8 +514,7 @@ class BaseAdvTrainer:
             seconds = time.perf_counter() - start
             for module, momentum in momenta.items():
                 module.momentum = momentum
-            for module, was_training in module_training.items():
-                module.train(was_training)
+            self._restore_classifier_training_modes(module_training)
             dist_helpers.barrier()
 
         if self.is_main_rank:
@@ -418,9 +538,7 @@ class BaseAdvTrainer:
         }
 
     def classifier_update(self, x_adv: torch.Tensor, y: torch.Tensor) -> Tuple[float, float]:
-        self.classifier.train()
-        self._freeze_batchnorm_layers()
-        set_requires_grad(self.classifier, True)
+        self._prepare_classifier_for_update()
         self.optimizer.zero_grad(set_to_none=True)
         logits = self.classifier(x_adv)
         loss = F.cross_entropy(logits, y)
@@ -442,7 +560,11 @@ class BaseAdvTrainer:
         history: List[Dict[str, Any]] = []
         warmup_epochs = max(0, int(cfg.epochs_icnn_pretrain))
         adv_epochs = max(0, int(cfg.epochs_adv))
-        total_epochs = warmup_epochs + adv_epochs
+        frozen_epochs = max(0, int(getattr(cfg, "frozen_adversary_epochs", 0) or 0))
+        frozen_map_steps = max(
+            1, int(getattr(cfg, "frozen_adversary_map_steps", 1) or 1)
+        )
+        total_epochs = warmup_epochs + adv_epochs + frozen_epochs
         if total_epochs <= 0:
             return history
 
@@ -450,6 +572,12 @@ class BaseAdvTrainer:
             print(
                 f"[{self.name}] --epochs-icnn-pretrain={warmup_epochs} requested but "
                 f"{self.name} has no persistent adversary state; treating warmup as a no-op."
+            )
+        if frozen_epochs > 0 and not self.has_parametric_adversary:
+            print(
+                f"[{self.name}] --frozen-adversary-epochs={frozen_epochs} requested but "
+                f"{self.name} has no persistent adversary state; the frozen phase "
+                "will use transport_for_eval()."
             )
         if tuple(getattr(cfg, "lambda_schedule", ()) or ()):
             self._set_active_lambda(self._lambda_for_adv_epoch(1))
@@ -528,6 +656,50 @@ class BaseAdvTrainer:
             if self.scheduler is not None:
                 self.scheduler.step()
             self.last_completed_epoch = epoch
+
+        if frozen_epochs > 0:
+            self.freeze_adversary_parameters()
+
+        # Frozen-adversary post phase: keep T_omega fixed and continue
+        # classifier SGD on T_omega^m(x).
+        for frozen_idx in range(1, frozen_epochs + 1):
+            epoch = warmup_epochs + adv_epochs + frozen_idx
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(self._global_epoch(epoch))
+            metrics = self._train_one_epoch(
+                epoch=epoch,
+                total_epochs=total_epochs,
+                phase="frozen_adversary",
+            )
+            bn_extras = self._recalibrate_batchnorm(epoch)
+            evaluations = self._evaluate(epoch, transport_steps=frozen_map_steps)
+            entry = {
+                "algorithm": self.name,
+                "epoch": epoch,
+                "phase": "frozen_adversary",
+                "frozen_adversary_map_steps": frozen_map_steps,
+                "train_loss": metrics.train_loss,
+                "train_acc": metrics.train_acc,
+                "train_mse": metrics.train_mse,
+                "inner_loss": metrics.inner_loss,
+                "epoch_seconds": metrics.epoch_seconds,
+                "global_epoch": self._global_epoch(epoch),
+                "lambda_param": float(getattr(cfg, "lambda_param", 0.0)),
+                **metrics.extras,
+                **bn_extras,
+                **evaluations,
+            }
+            history.append(entry)
+            self._print_epoch_summary(entry, total_epochs)
+            self._maybe_checkpoint_best(epoch, evaluations.get("input_pgd_acc"))
+            self._save_epoch_checkpoint(
+                epoch,
+                phase="frozen_adversary",
+                robust_acc=evaluations.get("input_pgd_acc"),
+            )
+            if self.scheduler is not None:
+                self.scheduler.step()
+            self.last_completed_epoch = epoch
         return history
 
     def _train_one_epoch(
@@ -538,6 +710,10 @@ class BaseAdvTrainer:
     ) -> EpochMetrics:
         cfg = self.config
         is_warmup = phase == "warmup"
+        is_frozen_adversary = phase == "frozen_adversary"
+        frozen_map_steps = max(
+            1, int(getattr(cfg, "frozen_adversary_map_steps", 1) or 1)
+        )
         self._reset_inner_profile_epoch()
         total_loss = 0.0
         total_acc = 0.0
@@ -547,10 +723,18 @@ class BaseAdvTrainer:
         total_transport_cost = 0.0
         total_weighted_penalty = 0.0
         total_inner_objective = 0.0
+        total_bn_online_seconds = 0.0
+        total_bn_online_batches = 0.0
+        total_bn_online_samples = 0.0
         total_samples = 0
         total_batches = 0
         smoke_max_batches = int(os.environ.get("SMOKE_MAX_TRAIN_BATCHES", "0") or 0)
-        desc_phase = "Warmup" if is_warmup else "Adv"
+        if is_warmup:
+            desc_phase = "Warmup"
+        elif is_frozen_adversary:
+            desc_phase = f"FrozenAdvx{frozen_map_steps}"
+        else:
+            desc_phase = "Adv"
         primary_name = "margin" if bool(getattr(cfg, "use_margin_loss", False)) else "adv_ce"
         # CUDA-synced wallclock around the training loop. Async kernel
         # launches mean reading the clock without sync only counts
@@ -568,9 +752,25 @@ class BaseAdvTrainer:
             total_batches += 1
             x = x.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
+            if not is_warmup:
+                bn_online = self._online_refresh_batchnorm(x)
+                total_bn_online_seconds += float(
+                    bn_online.get("bn_online_refresh_seconds", 0.0)
+                )
+                total_bn_online_batches += float(
+                    bn_online.get("bn_online_refresh_batches", 0.0)
+                )
+                total_bn_online_samples += float(
+                    bn_online.get("bn_online_refresh_samples", 0.0)
+                )
             self._begin_inner_profile_batch()
             try:
-                x_adv = self.step(x, y)
+                if is_frozen_adversary:
+                    x_adv = self.frozen_adversary_transport(
+                        x, y, steps=frozen_map_steps
+                    )
+                else:
+                    x_adv = self.step(x, y)
             finally:
                 self._finish_inner_profile_batch()
             if not torch.is_tensor(x_adv):
@@ -584,6 +784,7 @@ class BaseAdvTrainer:
                 # the classifier update so θ stays frozen this epoch.
                 loss = float(getattr(self, "_last_inner_loss", 0.0))
                 was_training = self.classifier.training
+                module_training = self._classifier_training_modes()
                 self.classifier.eval()
                 try:
                     with torch.no_grad():
@@ -592,10 +793,11 @@ class BaseAdvTrainer:
                         ).float().mean().item()
                 finally:
                     self.classifier.train(was_training)
+                    self._restore_classifier_training_modes(module_training)
             else:
                 loss, acc = self.classifier_update(x_adv, y)
             with torch.no_grad():
-                mse = pixel_l2_squared(x_adv, x).mean().item()
+                mse = self._transport_cost(x_adv, x).mean().item()
             bs = x.size(0)
             total_loss += loss * bs
             total_acc += acc * bs
@@ -630,6 +832,10 @@ class BaseAdvTrainer:
         }
         if smoke_max_batches > 0:
             extras["smoke_max_train_batches"] = float(smoke_max_batches)
+        if total_bn_online_batches > 0:
+            extras["bn_online_refresh_seconds"] = float(total_bn_online_seconds)
+            extras["bn_online_refresh_batches"] = float(total_bn_online_batches)
+            extras["bn_online_refresh_samples"] = float(total_bn_online_samples)
         extras.update(
             self._inner_profile_epoch_extras(
                 train_batches_total=total_batches,
@@ -653,7 +859,7 @@ class BaseAdvTrainer:
     ) -> Dict[str, float]:
         cfg = self.config
         lam = float(getattr(cfg, "lambda_param", 0.0))
-        was_training = self.classifier_module.training
+        module_training = self._classifier_training_modes()
         self.classifier_module.eval()
         try:
             with torch.no_grad():
@@ -661,11 +867,11 @@ class BaseAdvTrainer:
                 primary = adversary_loss_per_sample(
                     logits, y, use_margin=bool(getattr(cfg, "use_margin_loss", False))
                 )
-                cost = pixel_l2_squared(x_adv, x)
+                cost = self._transport_cost(x_adv, x)
                 adv_loss = float(primary.mean().item())
                 transport_cost = float(cost.mean().item())
         finally:
-            self.classifier_module.train(was_training)
+            self._restore_classifier_training_modes(module_training)
         weighted_penalty = lam * transport_cost
         return {
             "train_adv_loss": adv_loss,
@@ -677,7 +883,7 @@ class BaseAdvTrainer:
     # ------------------------------------------------------------------
     # Evaluation + checkpointing
     # ------------------------------------------------------------------
-    def _evaluate(self, epoch: int) -> Dict[str, Any]:
+    def _evaluate(self, epoch: int, *, transport_steps: int = 1) -> Dict[str, Any]:
         cfg = self.config
         # Eval is rank-0-only — sharding PGD restarts cleanly across ranks
         # adds complexity for marginal speedup at this scale (~1k samples).
@@ -692,10 +898,11 @@ class BaseAdvTrainer:
 
         adv_loss, adv_acc, adv_cost, adv_pen = evaluate_under_transport(
             self.classifier_module,
-            lambda x: self.transport_for_eval(x),
+            lambda x: self.repeated_transport_for_eval(x, steps=transport_steps),
             self.test_loader,
             self.device,
             penalty_lambda=getattr(cfg, "lambda_param", 0.0),
+            cost_fn=self._transport_cost,
         )
 
         result: Dict[str, Any] = {
@@ -743,6 +950,7 @@ class BaseAdvTrainer:
                 restarts=cfg.inp_restarts,
                 max_batches=max_batches,
                 max_samples=sample_limit,
+                loss=getattr(cfg, "input_pgd_loss", "margin"),
             )
             result["input_pgd_acc"] = pgd_acc
             result["input_pgd_clean_acc"] = pgd_info["clean_acc"]
@@ -753,6 +961,9 @@ class BaseAdvTrainer:
             result["input_pgd_max_l2"] = pgd_info["max_l2"]
             result["input_pgd_max_linf"] = pgd_info["max_linf"]
             result["input_pgd_samples"] = pgd_info["samples"]
+            result["input_pgd_loss"] = pgd_info.get(
+                "loss", getattr(cfg, "input_pgd_loss", "margin")
+            )
         dist_helpers.barrier()
         return result
 
@@ -775,6 +986,11 @@ class BaseAdvTrainer:
             f"pen {entry.get('train_weighted_penalty', 0.0):.4f}",
             f"obj {entry.get('train_inner_objective', entry.get('inner_loss', 0.0)):.4f}",
         ]
+        if entry.get("phase") == "frozen_adversary":
+            parts.insert(
+                3,
+                f"T^{int(entry.get('frozen_adversary_map_steps', 1))} fixed",
+            )
         if "test_acc" in entry:
             parts.append(
                 f"clean {entry.get('test_loss', 0.0):.4f}/{entry['test_acc']*100:.2f}%"

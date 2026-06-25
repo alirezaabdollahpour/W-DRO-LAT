@@ -6,8 +6,9 @@ MLP. We clamp the resulting adversarial inputs to the valid normalized
 pixel range so the classifier is never fed values outside its training
 support.
 
-The Wasserstein penalty is measured in pixel coordinates [0, 1] even
-though the adversary and classifier exchange normalized CIFAR tensors.
+The Wasserstein penalty uses the configured transport-cost convention
+while the adversary and classifier exchange normalized CIFAR tensors.
+The default matches the legacy input-ICNN code: normalized-coordinate MSE.
 
 The original LR-CIFAR10 reference used Adam on ω. Here we replace that
 with the SAME BB+Armijo step rule used by NPF, so every parametric
@@ -28,7 +29,6 @@ from ..utils import (
     bb_armijo_step_params,
     clamped_normalized_copy,
     frozen_module,
-    pixel_l2_squared,
     set_requires_grad,
 )
 from .base import BaseAdvTrainer
@@ -78,7 +78,7 @@ class NNDROTrainer(BaseAdvTrainer):
                 x_adv = self._transport(x)  # MLP forward; create_graph unused
                 logits = self._classifier_module(x_adv)
                 primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
-                cost = pixel_l2_squared(x_adv, x)
+                cost = self._transport_cost(x_adv, x)
                 obj = (primary - lam * cost).mean()
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
@@ -116,6 +116,10 @@ class NNDROTrainer(BaseAdvTrainer):
         finally:
             self.adversary.train(was_training)
         return x_adv.detach()
+
+    def freeze_adversary_parameters(self) -> None:
+        self.adversary.eval()
+        set_requires_grad(self.adversary, False)
 
     def adversary_state_dicts(self) -> Dict[str, Any]:
         return {"adversary": self.adversary.state_dict()}

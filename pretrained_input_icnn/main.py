@@ -39,6 +39,7 @@ _LOG_FIELDS = (
     "algorithm",
     "epoch",
     "phase",
+    "frozen_adversary_map_steps",
     "timestamp",
     "train_loss",
     "train_acc",
@@ -53,6 +54,9 @@ _LOG_FIELDS = (
     "bn_recalibration_seconds",
     "bn_recalibration_batches",
     "bn_recalibration_samples",
+    "bn_online_refresh_seconds",
+    "bn_online_refresh_batches",
+    "bn_online_refresh_samples",
     "test_loss",
     "test_acc",
     "clean_loss",
@@ -73,9 +77,15 @@ _LOG_FIELDS = (
     "input_pgd_max_l2",
     "input_pgd_max_linf",
     "input_pgd_samples",
+    "input_pgd_loss",
+    "transport_cost",
     "lambda_param",
     "lr_theta",
     "batch_size",
+    "freeze_batchnorm",
+    "freeze_batchnorm_affine",
+    "online_batchnorm_refresh",
+    "batchnorm_online_refresh_momentum",
     "seed",
     "pretrained_path",
 )
@@ -137,20 +147,26 @@ def _load_resume_payload(path: str) -> Dict[str, Any]:
     return payload
 
 
-def _metric_definitions(use_margin_loss: bool) -> Dict[str, str]:
+def _metric_definitions(use_margin_loss: bool, transport_cost: str = "normalized_mse") -> Dict[str, str]:
     adv_loss = (
         "Mean logsumexp margin on T_omega(x): logsumexp_{j != y}(logit_j - logit_y)."
         if use_margin_loss
         else "Mean cross-entropy on T_omega(x)."
+    )
+    cost_label = (
+        "legacy normalized-coordinate mean squared distance"
+        if str(transport_cost).lower() == "normalized_mse"
+        else "pixel-coordinate squared L2"
     )
     return {
         "train_loss": "Outer classifier update loss: cross-entropy on adversarial training inputs.",
         "train_acc": "Outer classifier accuracy on adversarial training inputs.",
         "inner_loss": "Last optimizer-reported inner objective value for the batch, averaged over the epoch.",
         "train_adv_loss": adv_loss,
-        "train_transport_cost": "Mean raw transport cost ||T_omega(x) - x||_2^2 in pixel coordinates on training batches.",
-        "train_mse": "Backward-compatible alias for train_transport_cost; despite the old name, this is now pixel-space squared L2.",
+        "train_transport_cost": f"Mean raw configured transport cost on training batches ({cost_label}).",
+        "train_mse": "Backward-compatible alias for train_transport_cost; name kept for old CSV consumers.",
         "train_weighted_penalty": "lambda_param * train_transport_cost.",
+        "transport_cost": "Transport penalty convention used by DRO inner objectives.",
         "train_inner_objective": "train_adv_loss - train_weighted_penalty.",
         "clean_loss": "Clean test cross-entropy after the epoch.",
         "clean_acc": "Clean test accuracy after the epoch.",
@@ -164,7 +180,9 @@ def _metric_definitions(use_margin_loss: bool) -> Dict[str, str]:
         "input_pgd_avg_linf": "Average pixel-space Linf perturbation norm selected by PGD.",
         "input_pgd_max_l2": "Maximum pixel-space L2 perturbation norm selected by PGD.",
         "input_pgd_max_linf": "Maximum pixel-space Linf perturbation norm selected by PGD.",
-        "eval_transport_cost": "Mean raw pixel-space squared L2 test-set transport cost under transport_for_eval.",
+        "input_pgd_samples": "Number of examples evaluated by input-space PGD.",
+        "input_pgd_loss": "Loss maximized by input-space PGD evaluation: margin or ce.",
+        "eval_transport_cost": f"Mean raw configured test-set transport cost under transport_for_eval ({cost_label}).",
         "eval_transport_weighted_penalty": "lambda_param * eval_transport_cost.",
         "bn_recalibration_seconds": (
             "Wallclock for the optional no-gradient clean-train BatchNorm "
@@ -173,6 +191,12 @@ def _metric_definitions(use_margin_loss: bool) -> Dict[str, str]:
         ),
         "bn_recalibration_batches": "Number of clean train batches used for BatchNorm recalibration.",
         "bn_recalibration_samples": "Number of clean train samples used for BatchNorm recalibration.",
+        "bn_online_refresh_seconds": (
+            "Wallclock for per-batch no-gradient clean BatchNorm running-stat "
+            "refreshes performed before adversarial/classifier updates."
+        ),
+        "bn_online_refresh_batches": "Number of clean train batches used for online BatchNorm refresh.",
+        "bn_online_refresh_samples": "Number of clean train samples used for online BatchNorm refresh.",
         "profile_*": (
             "Inner-maximization profiler fields. Timings are CUDA-synchronized "
             "seconds, off by default, and intended for ablation rather than "
@@ -300,6 +324,7 @@ def main() -> None:
             **entry,
             "run_id": run_id,
             "adversary_loss_type": adversary_loss_type,
+            "transport_cost": cfg.transport_cost,
             "lambda_param": entry.get("lambda_param", cfg.lambda_param),
         }
         for entry in history
@@ -311,6 +336,7 @@ def main() -> None:
                 "algorithm": entry.get("algorithm", cfg.algorithm),
                 "epoch": entry.get("epoch"),
                 "phase": entry.get("phase", "adv"),
+                "frozen_adversary_map_steps": entry.get("frozen_adversary_map_steps"),
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "train_loss": entry.get("train_loss"),
                 "train_acc": entry.get("train_acc"),
@@ -325,6 +351,9 @@ def main() -> None:
                 "bn_recalibration_seconds": entry.get("bn_recalibration_seconds"),
                 "bn_recalibration_batches": entry.get("bn_recalibration_batches"),
                 "bn_recalibration_samples": entry.get("bn_recalibration_samples"),
+                "bn_online_refresh_seconds": entry.get("bn_online_refresh_seconds"),
+                "bn_online_refresh_batches": entry.get("bn_online_refresh_batches"),
+                "bn_online_refresh_samples": entry.get("bn_online_refresh_samples"),
                 "test_loss": entry.get("test_loss"),
                 "test_acc": entry.get("test_acc"),
                 "clean_loss": entry.get("clean_loss", entry.get("test_loss")),
@@ -345,9 +374,15 @@ def main() -> None:
                 "input_pgd_max_l2": entry.get("input_pgd_max_l2"),
                 "input_pgd_max_linf": entry.get("input_pgd_max_linf"),
                 "input_pgd_samples": entry.get("input_pgd_samples"),
+                "input_pgd_loss": entry.get("input_pgd_loss", cfg.input_pgd_loss),
+                "transport_cost": cfg.transport_cost,
                 "lambda_param": entry.get("lambda_param", cfg.lambda_param),
                 "lr_theta": cfg.lr_theta,
                 "batch_size": cfg.batch_size,
+                "freeze_batchnorm": cfg.freeze_batchnorm,
+                "freeze_batchnorm_affine": cfg.freeze_batchnorm_affine,
+                "online_batchnorm_refresh": cfg.online_batchnorm_refresh,
+                "batchnorm_online_refresh_momentum": cfg.batchnorm_online_refresh_momentum,
                 "seed": cfg.seed,
                 "pretrained_path": cfg.pretrained_path,
             }
@@ -355,7 +390,7 @@ def main() -> None:
         rows.append(row)
 
     _append_csv(Path(cfg.log_csv), rows)
-    metric_definitions = _metric_definitions(cfg.use_margin_loss)
+    metric_definitions = _metric_definitions(cfg.use_margin_loss, cfg.transport_cost)
     history_payload = {
         "run_id": run_id,
         "algorithm": cfg.algorithm,

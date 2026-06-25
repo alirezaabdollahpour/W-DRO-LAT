@@ -41,6 +41,20 @@ def clamped_normalized_copy(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp(x, min=lower, max=upper)
 
 
+def normalized_mse(
+    x_adv_norm: torch.Tensor,
+    x_clean_norm: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample mean squared distance in normalized CIFAR coordinates.
+
+    This is the transport penalty convention used by the legacy
+    ``pretrained_INPUT_icnn.py`` input-space ICNN implementation. It divides
+    by the number of input coordinates and does not undo CIFAR normalization.
+    """
+    diff = x_adv_norm - x_clean_norm
+    return diff.reshape(diff.size(0), -1).pow(2).mean(dim=1)
+
+
 def pixel_l2_squared(
     x_adv_norm: torch.Tensor,
     x_clean_norm: torch.Tensor,

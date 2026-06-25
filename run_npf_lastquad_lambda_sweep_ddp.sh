@@ -17,6 +17,13 @@
 #                   In this mode ADV_EPOCHS defaults to MAP_EPOCHS and
 #                   WARMUP_EPOCHS defaults to EPOCHS_ICNN_PRETRAIN or 0.
 #
+# Optional post phase:
+#   FROZEN_ADVERSARY_EPOCHS=10 FROZEN_ADVERSARY_MAP_STEPS=2
+#                   After ordinary adversarial training, freeze the learned
+#                   NPF map and continue classifier-only training on
+#                   T_omega^2(x). Aliases POST_MAP_EPOCHS and POST_MAP_STEPS
+#                   are also accepted.
+#
 # Example:
 #   LAMBDAS="3 5 10 20 30 60" \
 #   FREEZE_THETA=1 MAP_EPOCHS=50 \
@@ -38,6 +45,8 @@ RESULTS_ROOT="${RESULTS_ROOT:-${SRC_DIR}/input_icnn_ddp_runs}"
 LAMBDAS=${LAMBDAS:-"3 5 10 20 30 60"}
 MAP_EPOCHS=${MAP_EPOCHS:-50}
 FREEZE_THETA=${FREEZE_THETA:-1}
+FROZEN_ADVERSARY_EPOCHS=${FROZEN_ADVERSARY_EPOCHS:-${FROZEN_MAP_EPOCHS:-${POST_MAP_EPOCHS:-0}}}
+FROZEN_ADVERSARY_MAP_STEPS=${FROZEN_ADVERSARY_MAP_STEPS:-${FROZEN_MAP_STEPS:-${POST_MAP_STEPS:-1}}}
 OUTPUT_PREFIX=${OUTPUT_PREFIX:-npf_lastquad_lambda_ablation}
 SKIP_PGD_DURING_TRAIN=${SKIP_PGD_DURING_TRAIN:-1}
 EVAL_PGD_SAMPLES=${EVAL_PGD_SAMPLES:-1000}
@@ -53,7 +62,7 @@ is_nonnegative_int() {
     esac
 }
 
-for name in SEED NPROC K MAP_EPOCHS; do
+for name in SEED NPROC K MAP_EPOCHS FROZEN_ADVERSARY_EPOCHS FROZEN_ADVERSARY_MAP_STEPS; do
     value="${!name}"
     if ! is_nonnegative_int "$value"; then
         echo "[FATAL] ${name} must be a non-negative integer, got '${value}'."
@@ -66,6 +75,10 @@ if [ "$NPROC" -lt 1 ]; then
 fi
 if [ "$K" -lt 1 ]; then
     echo "[FATAL] K must be >= 1, got '${K}'."
+    exit 1
+fi
+if [ "$FROZEN_ADVERSARY_MAP_STEPS" -lt 1 ]; then
+    echo "[FATAL] FROZEN_ADVERSARY_MAP_STEPS must be >= 1, got '${FROZEN_ADVERSARY_MAP_STEPS}'."
     exit 1
 fi
 
@@ -111,12 +124,17 @@ echo "  NPF-LastQuad lambda sweep"
 echo "  mode=${MODE_TAG}  seed=${SEED}  GPUs=${NPROC}  K=${K}"
 echo "  lambdas=${LAMBDAS}"
 echo "  map_epochs=${MAP_EPOCHS}  adv_epochs=${ADV_EPOCHS}  warmup_epochs=${WARMUP_EPOCHS}"
+echo "  frozen_adversary_epochs=${FROZEN_ADVERSARY_EPOCHS}  frozen_adversary_map_steps=${FROZEN_ADVERSARY_MAP_STEPS}"
 echo "  results_root=${RESULTS_ROOT}"
 echo "================================================================"
 
 for LAM in $LAMBDAS; do
     LAM_TAG=$(sanitize_float "$LAM")
-    OUTPUT_FOLDER_NAME="${OUTPUT_PREFIX}_${MODE_TAG}_lam${LAM_TAG}_seed${SEED}_K${K}_warm${WARMUP_EPOCHS}_adv${ADV_EPOCHS}"
+    FROZEN_TAG=""
+    if [ "$FROZEN_ADVERSARY_EPOCHS" != "0" ]; then
+        FROZEN_TAG="_frozenadv${FROZEN_ADVERSARY_EPOCHS}x${FROZEN_ADVERSARY_MAP_STEPS}"
+    fi
+    OUTPUT_FOLDER_NAME="${OUTPUT_PREFIX}_${MODE_TAG}_lam${LAM_TAG}_seed${SEED}_K${K}_warm${WARMUP_EPOCHS}_adv${ADV_EPOCHS}${FROZEN_TAG}"
     echo ""
     echo "----------------------------------------------------------------"
     echo "  lambda=${LAM} -> ${OUTPUT_FOLDER_NAME}"
@@ -125,6 +143,8 @@ for LAM in $LAMBDAS; do
     OUTPUT_FOLDER_NAME="$OUTPUT_FOLDER_NAME" \
     RESULTS_ROOT="$RESULTS_ROOT" \
     EPOCHS_ICNN_PRETRAIN="$WARMUP_EPOCHS" \
+    FROZEN_ADVERSARY_EPOCHS="$FROZEN_ADVERSARY_EPOCHS" \
+    FROZEN_ADVERSARY_MAP_STEPS="$FROZEN_ADVERSARY_MAP_STEPS" \
     SKIP_PGD_DURING_TRAIN="$SKIP_PGD_DURING_TRAIN" \
     EVAL_PGD_SAMPLES="$EVAL_PGD_SAMPLES" \
     bash "${SRC_DIR}/run_runtime_sweep_ddp.sh" 0 "$SEED" "$NPROC" "$K" "$ADV_EPOCHS"

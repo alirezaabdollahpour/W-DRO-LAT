@@ -76,7 +76,7 @@ def set_requires_grad(module: nn.Module, flag: bool) -> None:
 @contextmanager
 def frozen_module(module: nn.Module, *, eval_mode: bool = True) -> Iterator[nn.Module]:
     """Temporarily freeze a module's parameters and restore its prior state."""
-    was_training = module.training
+    training_modes = {m: m.training for m in module.modules()}
     params = list(module.parameters())
     requires_grad = [p.requires_grad for p in params]
     if eval_mode:
@@ -88,4 +88,5 @@ def frozen_module(module: nn.Module, *, eval_mode: bool = True) -> Iterator[nn.M
     finally:
         for p, req in zip(params, requires_grad):
             p.requires_grad_(req)
-        module.train(was_training)
+        for m, was_training in training_modes.items():
+            m.train(was_training)
