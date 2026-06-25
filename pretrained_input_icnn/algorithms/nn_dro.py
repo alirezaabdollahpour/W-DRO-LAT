@@ -51,7 +51,11 @@ class NNDROTrainer(BaseAdvTrainer):
         ).to(self.device)
         # Persistent BB+Armijo state on the MLP adversary parameters —
         # ω lives across batches so the (s, y) history carries over.
-        self.bb_state = BBArmijoState.create(
+        self.bb_state = self._new_bb_state()
+
+    def _new_bb_state(self) -> BBArmijoState:
+        cfg = self.config
+        return BBArmijoState.create(
             alpha0=cfg.bb_alpha0,
             alpha_min=cfg.bb_alpha_min,
             alpha_max=cfg.bb_alpha_max,
@@ -68,6 +72,11 @@ class NNDROTrainer(BaseAdvTrainer):
         cfg = self.config
         lam = float(cfg.lambda_param)
         use_margin = bool(cfg.use_margin_loss)
+        attack_mask = None
+        if bool(getattr(cfg, "attack_clean_correct_only", True)):
+            attack_mask = self._clean_correct_attack_mask(x, y)
+        reset_bb_each_batch = bool(getattr(cfg, "reset_parametric_bb_each_batch", True))
+        bb_state = self._new_bb_state() if reset_bb_each_batch else self.bb_state
 
         # Inner loop: BB+Armijo ascent on ω with the classifier frozen.
         self.adversary.train()
@@ -79,7 +88,7 @@ class NNDROTrainer(BaseAdvTrainer):
                 logits = self._classifier_module(x_adv)
                 primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
                 cost = self._transport_cost(x_adv, x)
-                obj = (primary - lam * cost).mean()
+                obj = self._masked_mean(primary - lam * cost, attack_mask)
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
             # Same DDP reducers as NPF: ω is shared across ranks, so each
@@ -93,19 +102,22 @@ class NNDROTrainer(BaseAdvTrainer):
 
             last_f_val = 0.0
             for _ in range(int(cfg.omega_steps_per_batch)):
-                _, self.bb_state, last_f_val, _ = bb_armijo_step_params(
+                _, bb_state, last_f_val, _ = bb_armijo_step_params(
                     self.adversary.parameters(),
                     omega_objective,
-                    self.bb_state,
+                    bb_state,
                     reduce_grad_fn=reduce_grad_fn,
                     reduce_scalar_fn=reduce_scalar_fn,
                 )
+        if not reset_bb_each_batch:
+            self.bb_state = bb_state
         self._last_inner_loss = last_f_val
 
         self.adversary.eval()
         set_requires_grad(self.adversary, False)
         with torch.no_grad():
             x_adv = self._transport(x)
+            x_adv = self._keep_clean_for_unattacked(x_adv, x, attack_mask)
         return x_adv.detach()
 
     def transport_for_eval(self, x: torch.Tensor) -> torch.Tensor:

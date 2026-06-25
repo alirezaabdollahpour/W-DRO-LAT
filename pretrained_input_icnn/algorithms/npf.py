@@ -72,18 +72,9 @@ class NPFTrainer(BaseAdvTrainer):
         self.bb_state = None
         self.muon_state = None
         if self.npf_inner_optimizer == "bb_armijo":
-            # Shared BB+Armijo config — same hyperparameters as every other
-            # adversary in the comparison. NPF was the source of the defaults
-            # so behaviour is unchanged.
-            self.bb_state = BBArmijoState.create(
-                alpha0=cfg.bb_alpha0,
-                alpha_min=cfg.bb_alpha_min,
-                alpha_max=cfg.bb_alpha_max,
-                ls_c=cfg.bb_ls_c,
-                ls_shrink=cfg.bb_ls_shrink,
-                ls_max_steps=cfg.bb_ls_max_steps,
-                reject_on_armijo_failure=True,
-            )
+            # This state is used only when --persistent-parametric-bb is set.
+            # The default legacy-compatible path resets BB history per batch.
+            self.bb_state = self._new_bb_state()
         else:
             self.muon_state = MuonState.create(
                 lr=cfg.npf_muon_lr,
@@ -100,6 +91,18 @@ class NPFTrainer(BaseAdvTrainer):
                 adam_eps=cfg.npf_muon_adam_eps,
                 max_grad_norm=cfg.npf_muon_max_grad_norm,
             )
+
+    def _new_bb_state(self) -> BBArmijoState:
+        cfg = self.config
+        return BBArmijoState.create(
+            alpha0=cfg.bb_alpha0,
+            alpha_min=cfg.bb_alpha_min,
+            alpha_max=cfg.bb_alpha_max,
+            ls_c=cfg.bb_ls_c,
+            ls_shrink=cfg.bb_ls_shrink,
+            ls_max_steps=cfg.bb_ls_max_steps,
+            reject_on_armijo_failure=True,
+        )
 
     def _potential_kwargs(self) -> Dict[str, Any]:
         cfg = self.config
@@ -139,6 +142,11 @@ class NPFTrainer(BaseAdvTrainer):
         use_margin: bool,
     ) -> torch.Tensor:
         cfg = self.config
+        attack_mask = None
+        if bool(getattr(cfg, "attack_clean_correct_only", True)):
+            attack_mask = self._clean_correct_attack_mask(x, y)
+        reset_bb_each_batch = bool(getattr(cfg, "reset_parametric_bb_each_batch", True))
+        bb_state = self._new_bb_state() if reset_bb_each_batch else self.bb_state
 
         # Inner loop: ω-ascent. Freeze the classifier so its gradients are not
         # accumulated; the inner optimizers route gradients only to ψ_ω
@@ -163,7 +171,8 @@ class NPFTrainer(BaseAdvTrainer):
                 with self.profile_time("objective_loss_cost_s"):
                     primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
                     transport_cost = self._transport_cost(x_adv, x)
-                    obj = (primary - lambda_param * transport_cost).mean()
+                    objective_per_sample = primary - lambda_param * transport_cost
+                    obj = self._masked_mean(objective_per_sample, attack_mask)
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
             # Plumb the cross-rank reducers when DDP is active so every rank
@@ -179,10 +188,10 @@ class NPFTrainer(BaseAdvTrainer):
             with self.profile_time("inner_loop_wall_s"):
                 for _ in range(int(cfg.omega_steps_per_batch)):
                     if self.npf_inner_optimizer == "bb_armijo":
-                        _, self.bb_state, last_f_val, _ = bb_armijo_step_params(
+                        _, bb_state, last_f_val, _ = bb_armijo_step_params(
                             self.psi_omega.parameters(),
                             omega_objective,
-                            self.bb_state,
+                            bb_state,
                             reduce_grad_fn=reduce_grad_fn,
                             reduce_scalar_fn=reduce_scalar_fn,
                             profile=self if self.is_inner_profile_active else None,
@@ -196,6 +205,8 @@ class NPFTrainer(BaseAdvTrainer):
                             reduce_scalar_fn=reduce_scalar_fn,
                             profile=self if self.is_inner_profile_active else None,
                         )
+        if self.npf_inner_optimizer == "bb_armijo" and not reset_bb_each_batch:
+            self.bb_state = bb_state
         self._last_inner_loss = last_f_val
 
         # Switch contract for the outer step. The base trainer will set
@@ -206,6 +217,7 @@ class NPFTrainer(BaseAdvTrainer):
         with torch.no_grad():
             with self.profile_time("final_transport_s"):
                 x_adv = self._transport(x, create_graph=False)
+                x_adv = self._keep_clean_for_unattacked(x_adv, x, attack_mask)
         return x_adv.detach()
 
     def transport_for_eval(self, x: torch.Tensor) -> torch.Tensor:

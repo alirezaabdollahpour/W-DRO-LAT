@@ -21,6 +21,19 @@ from pretrained_input_icnn.utils.eval import (
 )
 
 
+
+
+class AlwaysZeroClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(10))
+        with torch.no_grad():
+            self.bias[0] = 1.0
+
+    def forward(self, x):
+        return self.bias.view(1, -1).expand(x.size(0), -1)
+
+
 class TinyClassifier(nn.Module):
     def __init__(self):
         super().__init__()
@@ -596,8 +609,16 @@ def test_transport_cost_defaults_to_legacy_normalized_mse_and_cli_override():
         parser.parse_args(["--transport-cost", "pixel_l2_squared"])
     )
 
+    ablation_cfg = config_from_args(
+        parser.parse_args(["--attack-all-samples", "--persistent-parametric-bb"])
+    )
+
     assert default_cfg.transport_cost == "normalized_mse"
+    assert default_cfg.attack_clean_correct_only
+    assert default_cfg.reset_parametric_bb_each_batch
     assert pixel_cfg.transport_cost == "pixel_l2_squared"
+    assert not ablation_cfg.attack_clean_correct_only
+    assert not ablation_cfg.reset_parametric_bb_each_batch
 
 
 def test_trainer_transport_cost_matches_legacy_normalized_mse_by_default():
@@ -631,6 +652,34 @@ def test_trainer_transport_cost_matches_legacy_normalized_mse_by_default():
         pixel_trainer._transport_cost(x_adv, x),
         pixel_l2_squared(x_adv, x),
     )
+
+
+def test_npf_legacy_attack_mask_keeps_clean_incorrect_samples_clean():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    classifier = AlwaysZeroClassifier().to(device)
+    loader = _loader()
+    cfg = replace(
+        _config("npf_lastquad"),
+        attack_clean_correct_only=True,
+        reset_parametric_bb_each_batch=True,
+        npf_lastquad_hidden=(4,),
+        omega_steps_per_batch=1,
+    )
+    trainer = ALGORITHMS["npf_lastquad"](
+        classifier=classifier,
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=cfg,
+    )
+
+    x = torch.randn(2, 3, 32, 32, device=device)
+    y = torch.tensor([1, 1], device=device)
+
+    x_adv = trainer.step(x, y)
+
+    assert torch.allclose(x_adv, x)
 
 
 def test_input_pgd_loss_cli_defaults_to_margin_and_allows_ce():

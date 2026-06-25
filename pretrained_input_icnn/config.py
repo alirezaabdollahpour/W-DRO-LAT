@@ -94,6 +94,15 @@ class TrainConfig:
     # loss in every method; the outer classifier update remains CE for
     # primal adversarial-training methods.
     use_margin_loss: bool = True
+    # Legacy pretrained_INPUT_icnn.py semantics: build adversarial transports
+    # only for examples currently classified correctly by the clean classifier.
+    # Clean-misclassified examples stay at x in the outer update.
+    attack_clean_correct_only: bool = True
+    # Legacy BB+Armijo semantics for parametric adversaries: reset the BB
+    # secant history at each batch because the stochastic objective changes
+    # with the batch and with the classifier. Persistent BB can shrink to a
+    # weak adversary late in training.
+    reset_parametric_bb_each_batch: bool = True
     # Transport penalty convention for DRO inner objectives. The default
     # matches legacy pretrained_INPUT_icnn.py: mean squared difference in
     # normalized CIFAR coordinates. Use pixel_l2_squared only for experiments
@@ -554,6 +563,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(use_margin_loss=False)
     parser.add_argument(
+        "--attack-clean-correct-only",
+        dest="attack_clean_correct_only",
+        action="store_true",
+        help=(
+            "Match legacy pretrained_INPUT_icnn.py: train/apply the transport "
+            "adversary only on clean-correct examples; clean-misclassified "
+            "examples remain untransported in the outer update."
+        ),
+    )
+    parser.add_argument(
+        "--attack-all-samples",
+        dest="attack_clean_correct_only",
+        action="store_false",
+        help="Ablation: train/apply the transport adversary on every sample.",
+    )
+    parser.set_defaults(attack_clean_correct_only=True)
+    parser.add_argument(
+        "--reset-parametric-bb-each-batch",
+        dest="reset_parametric_bb_each_batch",
+        action="store_true",
+        help=(
+            "Reset BB+Armijo history each batch for parametric adversaries "
+            "(legacy input-ICNN behavior; default)."
+        ),
+    )
+    parser.add_argument(
+        "--persistent-parametric-bb",
+        dest="reset_parametric_bb_each_batch",
+        action="store_false",
+        help="Ablation: carry BB+Armijo secant history across batches.",
+    )
+    parser.set_defaults(reset_parametric_bb_each_batch=True)
+    parser.add_argument(
         "--transport-cost",
         type=str,
         default="normalized_mse",
@@ -884,6 +926,8 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "bb_ls_shrink": "bb_ls_shrink",
         "bb_ls_max_steps": "bb_ls_max_steps",
         "use_margin_loss": "use_margin_loss",
+        "attack_clean_correct_only": "attack_clean_correct_only",
+        "reset_parametric_bb_each_batch": "reset_parametric_bb_each_batch",
         "transport_cost": "transport_cost",
         "lambda_stage_epochs": "lambda_stage_epochs",
         "npf_hidden": "npf_hidden",

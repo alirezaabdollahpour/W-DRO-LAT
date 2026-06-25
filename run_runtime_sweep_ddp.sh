@@ -163,7 +163,9 @@ PENALTY_LAMBDA=${PENALTY_LAMBDA:-30}
 TRANSPORT_COST=${TRANSPORT_COST:-normalized_mse}
 LAMBDA_SCHEDULE=${LAMBDA_SCHEDULE:-}
 LAMBDA_STAGE_EPOCHS=${LAMBDA_STAGE_EPOCHS:-0}
-LR_THETA=${LR_THETA:-0.1}
+LR_THETA=${LR_THETA:-0.003}
+ATTACK_CLEAN_CORRECT_ONLY=${ATTACK_CLEAN_CORRECT_ONLY:-1}
+RESET_PARAMETRIC_BB_EACH_BATCH=${RESET_PARAMETRIC_BB_EACH_BATCH:-1}
 FREEZE_BATCHNORM=${FREEZE_BATCHNORM:-1}
 FREEZE_BATCHNORM_AFFINE=${FREEZE_BATCHNORM_AFFINE:-${FREEZE_BN_AFFINE:-$FREEZE_BATCHNORM}}
 BATCHNORM_ONLINE_REFRESH=${BATCHNORM_ONLINE_REFRESH:-${ONLINE_BATCHNORM_REFRESH:-0}}
@@ -357,7 +359,10 @@ echo "  Run name: ${RUN_NAME}"
 echo "  Output folder: ${OUTPUT_FOLDER_NAME}"
 echo "  SPLIT=${SPLIT}  SEED=${SEED}  NPROC=${NPROC}  K=${K}"
 echo "  Warmup epochs=${EPOCHS_ICNN_PRETRAIN}  Adv epochs=${EPOCHS_ADV}  Batch=${COMMON_BATCH} (global)  λ=${PENALTY_LAMBDA}"
+echo "  Classifier LR: ${LR_THETA}"
 echo "  Transport cost: ${TRANSPORT_COST}"
+echo "  Attack clean-correct only: ${ATTACK_CLEAN_CORRECT_ONLY}"
+echo "  Reset parametric BB each batch: ${RESET_PARAMETRIC_BB_EACH_BATCH}"
 echo "  Frozen-adversary post phase: epochs=${FROZEN_ADVERSARY_EPOCHS}  map_steps=${FROZEN_ADVERSARY_MAP_STEPS}"
 echo "  Freeze BatchNorm running stats: ${FREEZE_BATCHNORM}"
 echo "  Freeze BatchNorm affine params: ${FREEZE_BATCHNORM_AFFINE}"
@@ -547,6 +552,8 @@ run_algo() {
             printf "FROZEN_ADVERSARY_MAP_STEPS=%q\n" "$FROZEN_ADVERSARY_MAP_STEPS"
             printf "COMMON_BATCH=%q\n" "$BATCH_OVR"
             printf "LR_THETA=%q\n" "$LR_THETA"
+            printf "ATTACK_CLEAN_CORRECT_ONLY=%q\n" "$ATTACK_CLEAN_CORRECT_ONLY"
+            printf "RESET_PARAMETRIC_BB_EACH_BATCH=%q\n" "$RESET_PARAMETRIC_BB_EACH_BATCH"
             printf "FREEZE_BATCHNORM=%q\n" "$FREEZE_BATCHNORM"
             printf "FREEZE_BATCHNORM_AFFINE=%q\n" "$FREEZE_BATCHNORM_AFFINE"
             printf "BATCHNORM_ONLINE_REFRESH=%q\n" "$BATCHNORM_ONLINE_REFRESH"
@@ -584,7 +591,15 @@ run_algo() {
             printf "NPF_MUON_MAX_GRAD_NORM=%q\n" "$NPF_MUON_MAX_GRAD_NORM"
             printf "NPF_LASTQUAD_HIDDEN=%q\n" "$NPF_LASTQUAD_HIDDEN"
             printf "NPF_LASTQUAD_ACTIVATION=%q\n" "$NPF_LASTQUAD_ACTIVATION"
+            printf "NPF_LASTQUAD_SOFTPLUS_BETA=%q\n" "$NPF_LASTQUAD_SOFTPLUS_BETA"
             printf "NPF_LASTQUAD_INIT_EPS=%q\n" "$NPF_LASTQUAD_INIT_EPS"
+            printf "NPF_LASTQUAD_STRONG_CONVEXITY=%q\n" "$NPF_LASTQUAD_STRONG_CONVEXITY"
+            printf "BB_ALPHA0=%q\n" "$BB_ALPHA0"
+            printf "BB_ALPHA_MIN=%q\n" "$BB_ALPHA_MIN"
+            printf "BB_ALPHA_MAX=%q\n" "$BB_ALPHA_MAX"
+            printf "BB_LS_C=%q\n" "$BB_LS_C"
+            printf "BB_LS_SHRINK=%q\n" "$BB_LS_SHRINK"
+            printf "BB_LS_MAX_STEPS=%q\n" "$BB_LS_MAX_STEPS"
             printf "RESULTS_DIR=%q\n" "$RESULTS_DIR"
             printf "OUT_DIR=%q\n" "$OUT_DIR"
             printf "FINAL_CHECKPOINT=%q\n" "$FINAL_CKPT"
@@ -610,6 +625,22 @@ run_algo() {
         if [ "$BENCHMARK_MODE" = "1" ]; then
             COMMON_EXTRA_FLAGS+=(--benchmark-mode)
         fi
+        case "$ATTACK_CLEAN_CORRECT_ONLY" in
+            0|false|False|FALSE|no|No|NO)
+                COMMON_EXTRA_FLAGS+=(--attack-all-samples)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--attack-clean-correct-only)
+                ;;
+        esac
+        case "$RESET_PARAMETRIC_BB_EACH_BATCH" in
+            0|false|False|FALSE|no|No|NO)
+                COMMON_EXTRA_FLAGS+=(--persistent-parametric-bb)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--reset-parametric-bb-each-batch)
+                ;;
+        esac
         case "$FREEZE_BATCHNORM" in
             0|false|False|FALSE|no|No|NO)
                 COMMON_EXTRA_FLAGS+=(--no-freeze-batchnorm)

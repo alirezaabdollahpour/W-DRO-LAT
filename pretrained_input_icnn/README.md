@@ -4,10 +4,13 @@ Input-space adversarial training for CIFAR-10 using a pretrained classifier and 
 
 ## Critical default
 
-For runs that should match the legacy `pretrained_INPUT_icnn.py` implementation, always use:
+For runs that should match the legacy `pretrained_INPUT_icnn.py` implementation, use these defaults:
 
 ```bash
 TRANSPORT_COST=normalized_mse
+ATTACK_CLEAN_CORRECT_ONLY=1
+RESET_PARAMETRIC_BB_EACH_BATCH=1
+LR_THETA=0.003
 ```
 
 This is now the package default, and `run_runtime_sweep_ddp.sh` forwards it as `--transport-cost normalized_mse`. It computes the per-sample mean squared distance in normalized CIFAR coordinates:
@@ -17,6 +20,10 @@ This is now the package default, and `run_runtime_sweep_ddp.sh` forwards it as `
 ```
 
 Do not use `TRANSPORT_COST=pixel_l2_squared` unless you intentionally want the newer pixel-space squared-L2 ablation. With the same `PENALTY_LAMBDA`, that changes the scale of the inner DRO penalty substantially.
+
+`ATTACK_CLEAN_CORRECT_ONLY=1` matches the legacy outer loop: the learned transport is trained and applied only on examples that the clean classifier currently gets right; clean-misclassified examples stay at the clean input for the classifier update.
+
+`RESET_PARAMETRIC_BB_EACH_BATCH=1` matches the legacy BB+Armijo loop: the BB secant history is reset at every batch. Carrying BB history across batches is an ablation because the stochastic objective changes with both the batch and the classifier.
 
 ## PGD evaluation loss
 
@@ -63,6 +70,8 @@ python csub.py -n lastquad-lam30-logsum-bb-k15-legacycost-pgdce-bnonline -g 2 -t
     LR_THETA=0.003 \
     PENALTY_LAMBDA=30 \
     TRANSPORT_COST=normalized_mse \
+    ATTACK_CLEAN_CORRECT_ONLY=1 \
+    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
     LAMBDA_SCHEDULE='' \
     LAMBDA_STAGE_EPOCHS=0 \
     FREEZE_BATCHNORM=1 \
@@ -122,6 +131,8 @@ SMOKE_MAX_TRAIN_BATCHES=1 /mloscratch/homes/aabdolla/optiselect/.venv/bin/python
   --lr-theta 0.003 \
   --penalty-lambda 30 \
   --transport-cost normalized_mse \
+  --attack-clean-correct-only \
+  --reset-parametric-bb-each-batch \
   --omega-steps-per-batch 0 \
   --npf-lastquad-hidden 4 \
   --eval-input-pgd \

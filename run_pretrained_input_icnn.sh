@@ -17,6 +17,8 @@ set -euo pipefail
 #   TRANSPORT_COST        normalized_mse (legacy pretrained_INPUT_icnn.py scale;
 #                                    use pixel_l2_squared only for explicit ablations)
 #   LR_THETA              0.003
+#   ATTACK_CLEAN_CORRECT_ONLY 1     (legacy: transport only clean-correct samples)
+#   RESET_PARAMETRIC_BB_EACH_BATCH 1 (legacy: reset BB history every batch)
 #   OMEGA_STEPS           20        (NPF / NN-DRO)
 #   NPF_LASTQUAD_HIDDEN   "1024 512 512 256 128 64"
 #   INP_P                 2
@@ -51,6 +53,8 @@ BATCH_SIZE="${BATCH_SIZE:-512}"
 PENALTY_LAMBDA="${PENALTY_LAMBDA:-10}"
 TRANSPORT_COST="${TRANSPORT_COST:-normalized_mse}"
 LR_THETA="${LR_THETA:-0.003}"
+ATTACK_CLEAN_CORRECT_ONLY="${ATTACK_CLEAN_CORRECT_ONLY:-1}"
+RESET_PARAMETRIC_BB_EACH_BATCH="${RESET_PARAMETRIC_BB_EACH_BATCH:-1}"
 OMEGA_STEPS="${OMEGA_STEPS:-20}"
 INP_P="${INP_P:-2}"
 INP_EPS="${INP_EPS:-0.5}"
@@ -103,6 +107,22 @@ COMMON_ARGS=(
 if [[ "${USE_MARGIN_LOSS}" == "1" ]]; then
   COMMON_ARGS+=(--use-margin-loss)
 fi
+case "${ATTACK_CLEAN_CORRECT_ONLY}" in
+  0|false|False|FALSE|no|No|NO)
+    COMMON_ARGS+=(--attack-all-samples)
+    ;;
+  *)
+    COMMON_ARGS+=(--attack-clean-correct-only)
+    ;;
+esac
+case "${RESET_PARAMETRIC_BB_EACH_BATCH}" in
+  0|false|False|FALSE|no|No|NO)
+    COMMON_ARGS+=(--persistent-parametric-bb)
+    ;;
+  *)
+    COMMON_ARGS+=(--reset-parametric-bb-each-batch)
+    ;;
+esac
 case "${FREEZE_BATCHNORM}" in
   0|false|False|FALSE|no|No|NO)
     COMMON_ARGS+=(--no-freeze-batchnorm)

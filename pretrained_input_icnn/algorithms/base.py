@@ -258,6 +258,38 @@ class BaseAdvTrainer:
             return pixel_l2_squared(x_adv, x_clean)
         raise ValueError(f"Unsupported transport_cost mode: {mode}")
 
+    def _clean_correct_attack_mask(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return clean-correct mask without mutating classifier training modes."""
+        module_training = self._classifier_training_modes()
+        self.classifier_module.eval()
+        try:
+            with torch.no_grad():
+                return self.classifier_module(x).argmax(dim=1).eq(y)
+        finally:
+            self._restore_classifier_training_modes(module_training)
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return values.mean()
+        if values.dim() != 1:
+            raise ValueError("_masked_mean expects per-sample values.")
+        if mask.shape != values.shape:
+            raise ValueError("mask shape must match per-sample values.")
+        weights = mask.to(device=values.device, dtype=values.dtype)
+        return (values * weights).sum() / weights.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _keep_clean_for_unattacked(
+        x_adv: torch.Tensor,
+        x_clean: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if mask is None:
+            return x_adv
+        view_shape = (mask.size(0),) + (1,) * (x_adv.dim() - 1)
+        return torch.where(mask.view(view_shape), x_adv, x_clean)
+
     # ------------------------------------------------------------------
     # Inner-loop profiler helpers
     # ------------------------------------------------------------------
