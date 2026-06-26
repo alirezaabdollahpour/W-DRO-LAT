@@ -168,6 +168,86 @@ RUN_NAME=npf_lq_lam30_logsum_lr0p1_K7_bb_stablepolicy_warm2_pgdce_seed1
 bash run_runtime_sweep_ddp.sh 0 1 2 7 30
 ```
 
+## Lambda-schedule ablation: descending lambda, K=20
+
+This ablation uses the stable-policy run settings, but replaces the fixed `lambda=30` objective with a descending schedule. The training process is continuous: `pretrained_input_icnn` updates the active `lambda_param` at epoch boundaries while keeping the ResNet-18 classifier weights, the NPF adversary weights, and the NPF optimizer/adversary state alive.
+
+The effective inner budget is `K=20`, because both `OMEGA_STEPS=20` and the final launcher call `bash run_runtime_sweep_ddp.sh 0 1 2 20 50` set the NPF adversary updates per batch to 20.
+
+| Group | Setting | Value | Notes |
+| --- | --- | --- | --- |
+| Lambda schedule | `LAMBDA_SCHEDULE` | `30 20 15 10 5` | Active lambda values in order. |
+| Lambda schedule | `LAMBDA_STAGE_EPOCHS` | `10` | Each lambda is used for 10 adversarial epochs. |
+| Lambda schedule | epoch 1-10 | `30` | Starts from the stable fixed-lambda value. |
+| Lambda schedule | epoch 11-20 | `20` | Same adversary and classifier continue training. |
+| Lambda schedule | epoch 21-30 | `15` | No restart between stages. |
+| Lambda schedule | epoch 31-40 | `10` | NPF weights are retained and adapted. |
+| Lambda schedule | epoch 41-50 | `5` | Final low-penalty stage. |
+| Launcher | `K` / `OMEGA_STEPS` | `20` | Twenty NPF adversary updates per batch. |
+| Launcher | adversarial epochs | `50` | Must equal `len(schedule) * stage_epochs`. |
+| Classifier | `LR_THETA` | `0.1` | Stable-policy classifier learning rate. |
+| DRO | `PENALTY_LAMBDA` | `30` | Initial/print value; Python uses `LAMBDA_SCHEDULE` once provided. |
+| DRO | `TRANSPORT_COST` | `normalized_mse` | Legacy normalized-coordinate mean squared transport cost. |
+| Legacy semantics | `ATTACK_CLEAN_CORRECT_ONLY` | `1` | Attack only clean-correct samples. |
+| Legacy semantics | `RESET_PARAMETRIC_BB_EACH_BATCH` | `1` | Reset BB secant history each batch. |
+| BatchNorm | `FREEZE_BATCHNORM` | `0` | Stable-policy BatchNorm behavior. |
+| BatchNorm | `FREEZE_BATCHNORM_AFFINE` | `0` | BN affine parameters remain trainable. |
+| BatchNorm | `BATCHNORM_ONLINE_REFRESH` | `0` | No clean BN refresh pass. |
+| BatchNorm | `RECALIBRATE_BATCHNORM` | `0` | No post-epoch BN recalibration. |
+| NPF architecture | `NPF_LASTQUAD_HIDDEN` | `1024 512 512 256` | Same LastQuad width as stable-policy run. |
+| NPF architecture | `NPF_LASTQUAD_SOFTPLUS_BETA` | `20.0` | Same softplus beta as stable-policy run. |
+| NPF optimizer | `NPF_INNER_OPTIMIZER` | `bb_armijo` | Custom BB+Armijo gradient ascent on NPF weights. |
+| NPF optimizer | `BB_ALPHA0`, `BB_ALPHA_MIN`, `BB_ALPHA_MAX` | `5e-4`, `1e-6`, `1.0` | BB step-size controls. |
+| NPF optimizer | `BB_LS_C`, `BB_LS_SHRINK`, `BB_LS_MAX_STEPS` | `0.1`, `0.5`, `10` | Armijo line-search controls. |
+| PGD eval | `INPUT_PGD_LOSS` | `ce` | Cross-entropy PGD evaluation. |
+| PGD eval | `EVAL_PGD_SAMPLES` | `2000` | Test samples used per epoch. |
+
+Use this cleanly named command for reproducible reruns:
+
+```bash
+python csub.py -n lastquad-lamsched-30-20-15-10-5-k20-lr0p1 -g 2 -t 1d --train --large-shm --node-type h100 \
+  --command "cd /mloscratch/homes/aabdolla/LAT && \
+    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
+    RUN_NAME=npf_lq_lamsched_30_20_15_10_5_stage10_logsum_lr0p1_K20_bb_stablepolicy_pgdce_seed1 \
+    LR_THETA=0.1 \
+    PENALTY_LAMBDA=30 \
+    TRANSPORT_COST=normalized_mse \
+    EPOCHS_ICNN_PRETRAIN=0 \
+    LAMBDA_SCHEDULE='30 20 15 10 5' \
+    LAMBDA_STAGE_EPOCHS=10 \
+    ATTACK_CLEAN_CORRECT_ONLY=1 \
+    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
+    FREEZE_BATCHNORM=0 \
+    FREEZE_BATCHNORM_AFFINE=0 \
+    BATCHNORM_ONLINE_REFRESH=0 \
+    RECALIBRATE_BATCHNORM=0 \
+    USE_MARGIN_LOSS=1 \
+    COMMON_BATCH=512 \
+    NPF_LASTQUAD_HIDDEN='1024 512 512 256' \
+    NPF_LASTQUAD_ACTIVATION=softplus \
+    NPF_LASTQUAD_SOFTPLUS_BETA=20.0 \
+    NPF_LASTQUAD_INIT_EPS=1e-4 \
+    NPF_LASTQUAD_STRONG_CONVEXITY=1.0 \
+    NPF_INNER_OPTIMIZER=bb_armijo \
+    BB_ALPHA0=5e-4 \
+    BB_ALPHA_MIN=1e-6 \
+    BB_ALPHA_MAX=1.0 \
+    BB_LS_C=0.1 \
+    BB_LS_SHRINK=0.5 \
+    BB_LS_MAX_STEPS=10 \
+    EVAL_PGD_SAMPLES=2000 \
+    INPUT_PGD_LOSS=ce \
+    INP_STEPS=20 \
+    INP_RESTARTS=5 \
+    OMEGA_STEPS=20 \
+    FROZEN_ADVERSARY_EPOCHS=0 \
+    FROZEN_ADVERSARY_MAP_STEPS=1 \
+    OUTPUT_FOLDER_NAME=BB_lamsched_30_20_15_10_5_stage10_logsum_lr0p1_K20_pgdce_seed1 \
+    bash run_runtime_sweep_ddp.sh 0 1 2 20 50"
+```
+
+Artifact note: the originally submitted command used names containing `5_10_15_20_30` and `K7`, but the actual executed hyperparameters were `LAMBDA_SCHEDULE='30 20 15 10 5'`, `OMEGA_STEPS=20`, and launcher `K=20`.
+
 ## Margin-PGD ablation
 
 To rerun the same training but evaluate PGD with the margin objective, change only these fields:
