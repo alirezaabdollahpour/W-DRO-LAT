@@ -621,6 +621,36 @@ def test_transport_cost_defaults_to_legacy_normalized_mse_and_cli_override():
     assert not ablation_cfg.reset_parametric_bb_each_batch
 
 
+def test_disabled_frozen_adversary_allows_zero_map_steps():
+    parser = build_arg_parser()
+
+    cfg = config_from_args(
+        parser.parse_args(
+            [
+                "--frozen-adversary-epochs",
+                "0",
+                "--frozen-adversary-map-steps",
+                "0",
+            ]
+        )
+    )
+
+    assert cfg.frozen_adversary_epochs == 0
+    assert cfg.frozen_adversary_map_steps == 1
+
+    with pytest.raises(ValueError, match="frozen-adversary-map-steps"):
+        config_from_args(
+            parser.parse_args(
+                [
+                    "--frozen-adversary-epochs",
+                    "1",
+                    "--frozen-adversary-map-steps",
+                    "0",
+                ]
+            )
+        )
+
+
 def test_trainer_transport_cost_matches_legacy_normalized_mse_by_default():
     torch.manual_seed(123)
     device = torch.device("cpu")

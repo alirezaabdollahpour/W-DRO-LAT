@@ -835,10 +835,19 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
     lambda_stage_epochs = int(args.lambda_stage_epochs or 0)
     if int(args.batchnorm_recalibration_batches) < 0:
         raise ValueError("--batchnorm-recalibration-batches must be non-negative.")
-    if int(args.frozen_adversary_epochs) < 0:
+    frozen_adversary_epochs = int(args.frozen_adversary_epochs)
+    frozen_adversary_map_steps = int(args.frozen_adversary_map_steps)
+    if frozen_adversary_epochs < 0:
         raise ValueError("--frozen-adversary-epochs must be non-negative.")
-    if int(args.frozen_adversary_map_steps) < 1:
-        raise ValueError("--frozen-adversary-map-steps must be at least 1.")
+    if frozen_adversary_epochs > 0 and frozen_adversary_map_steps < 1:
+        raise ValueError(
+            "--frozen-adversary-map-steps must be at least 1 when "
+            "--frozen-adversary-epochs is positive."
+        )
+    if frozen_adversary_epochs == 0 and frozen_adversary_map_steps < 1:
+        # The map-step count is unused when the frozen-adversary phase is
+        # disabled, so tolerate legacy launch commands that set both to 0.
+        args.frozen_adversary_map_steps = 1
     if args.batchnorm_recalibration_momentum is not None:
         bn_momentum = float(args.batchnorm_recalibration_momentum)
         if not math.isfinite(bn_momentum) or bn_momentum < 0.0 or bn_momentum > 1.0:
