@@ -138,6 +138,15 @@ def all_reduce_scalar(x: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def all_reduce_sum_scalar(x: torch.Tensor) -> torch.Tensor:
+    """Sum-reduce a 0-dim tensor across ranks. Returns a fresh tensor."""
+    if not _DIST.is_distributed:
+        return x.detach().clone()
+    t = x.detach().clone().contiguous()
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t
+
+
 def all_reduce_grads_(params) -> None:
     """In-place mean-reduce ``param.grad`` across ranks for an iterable of Parameters."""
     if not _DIST.is_distributed:

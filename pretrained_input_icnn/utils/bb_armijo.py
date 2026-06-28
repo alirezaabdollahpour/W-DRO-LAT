@@ -71,14 +71,20 @@ class BBArmijoState:
             s = params_vec - self.prev_params_vec
             y = grad_vec - self.prev_grad_vec
             denom = torch.dot(s, y)
-            num = torch.dot(s, s)
-            cond = torch.isfinite(denom) & (denom < -1e-12)
-            alpha_bb = torch.where(
-                cond,
-                -num / denom,
-                torch.tensor(self.alpha_prev, device=denom.device, dtype=denom.dtype),
-            )
-            alpha = float(alpha_bb.clamp(self.alpha_min, self.alpha_max).item())
+            if bool(torch.isfinite(denom).item()):
+                denom_float = float(denom.item())
+                if denom_float < -1e-12:
+                    num = torch.dot(s, s)
+                    alpha = float((-num / denom).item())
+                elif abs(denom_float) > 1e-12:
+                    # Wrong curvature for ascent. Reusing a stale alpha_prev
+                    # can keep taking large steps after the local objective has
+                    # become convex/noisy; fall back to the conservative bound.
+                    alpha = self.alpha_min
+                else:
+                    alpha = self.alpha_prev
+            else:
+                alpha = self.alpha_prev
         if not math.isfinite(alpha):
             alpha = self.alpha_prev
         return max(self.alpha_min, min(self.alpha_max, float(alpha)))
@@ -125,6 +131,23 @@ def _profile_time(profile: Any, key: str) -> Iterator[None]:
         _profile_add(profile, key, time.perf_counter() - start)
 
 
+def _clip_flat_grad(
+    grad_vec: torch.Tensor,
+    max_grad_norm: Optional[float],
+    profile: Any,
+) -> Tuple[torch.Tensor, float]:
+    grad_norm_t = grad_vec.norm()
+    grad_norm = float(grad_norm_t.item())
+    if max_grad_norm is None or float(max_grad_norm) <= 0.0:
+        return grad_vec, grad_norm
+    if not math.isfinite(grad_norm) or grad_norm <= float(max_grad_norm):
+        return grad_vec, grad_norm
+
+    scale = float(max_grad_norm) / max(grad_norm, 1e-12)
+    _profile_add(profile, "bb_grad_clip_events", 1.0)
+    return grad_vec * scale, float(max_grad_norm)
+
+
 def bb_armijo_step_params(
     params,
     f_params,
@@ -132,6 +155,7 @@ def bb_armijo_step_params(
     reduce_grad_fn=None,
     reduce_scalar_fn=None,
     profile=None,
+    max_grad_norm: Optional[float] = None,
 ) -> Tuple[List[torch.nn.Parameter], BBArmijoState, float, float]:
     """Single BB+Armijo gradient-ascent step on a parameter collection.
 
@@ -142,9 +166,11 @@ def bb_armijo_step_params(
     function behaves exactly as before. Plumbing both reducers ensures
     every rank picks the same Armijo trial step and stays in lockstep.
 
-    The returned ``grad_norm`` is the gradient norm at the START of this
-    call. The next call recomputes the gradient at the new iterate, so an
-    extra fwd+bwd just for logging would double the inner-loop wallclock.
+    ``max_grad_norm`` clips the packed, reduced gradient before the BB
+    proposal and Armijo trials. The returned ``grad_norm`` is the norm of
+    the gradient actually used for this step. The next call recomputes the
+    gradient at the new iterate, so an extra fwd+bwd just for logging would
+    double the inner-loop wallclock.
     """
     _profile_add(profile, "bb_steps", 1.0)
     with _profile_time(profile, "bb_params_prepare_s"):
@@ -174,7 +200,7 @@ def bb_armijo_step_params(
         if reduce_grad_fn is not None:
             grad_tensors = reduce_grad_fn(grad_tensors)
         grad_vec = torch.cat([g.reshape(-1) for g in grad_tensors])
-        grad_norm = grad_vec.norm().item()
+        grad_vec, grad_norm = _clip_flat_grad(grad_vec, max_grad_norm, profile)
         if reduce_scalar_fn is not None:
             f_val_float = float(reduce_scalar_fn(f_val.detach()))
         else:

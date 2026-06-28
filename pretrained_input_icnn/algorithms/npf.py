@@ -25,9 +25,10 @@ outer update, and evaluation path unchanged.
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 import torch
+import torch.nn as nn
 
 from .. import distributed as dist_helpers
 from ..models.npf import NPFInputConvexPotential, npf_T_omega
@@ -172,7 +173,10 @@ class NPFTrainer(BaseAdvTrainer):
                     primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
                     transport_cost = self._transport_cost(x_adv, x)
                     objective_per_sample = primary - lambda_param * transport_cost
-                    obj = self._masked_mean(objective_per_sample, attack_mask)
+                    obj = self._shared_adversary_masked_mean(
+                        objective_per_sample,
+                        attack_mask,
+                    )
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
             # Plumb the cross-rank reducers when DDP is active so every rank
@@ -195,6 +199,7 @@ class NPFTrainer(BaseAdvTrainer):
                             reduce_grad_fn=reduce_grad_fn,
                             reduce_scalar_fn=reduce_scalar_fn,
                             profile=self if self.is_inner_profile_active else None,
+                            max_grad_norm=getattr(cfg, "parametric_bb_max_grad_norm", 1.0),
                         )
                     else:
                         _, self.muon_state, last_f_val, _ = muon_step_params(
@@ -235,6 +240,9 @@ class NPFTrainer(BaseAdvTrainer):
 
     def adversary_state_dicts(self) -> Dict[str, Any]:
         return {"psi_omega": self.psi_omega.state_dict()}
+
+    def adversary_delta_parameters(self) -> Iterator[nn.Parameter]:
+        return self.psi_omega.parameters()
 
     def load_adversary_state_dicts(
         self,

@@ -10,6 +10,7 @@ For runs that should preserve the legacy `pretrained_INPUT_icnn.py` training sem
 TRANSPORT_COST=normalized_mse
 ATTACK_CLEAN_CORRECT_ONLY=1
 RESET_PARAMETRIC_BB_EACH_BATCH=1
+PARAMETRIC_BB_MAX_GRAD_NORM=1.0
 ```
 
 These are now package defaults, and `run_runtime_sweep_ddp.sh` forwards `TRANSPORT_COST=normalized_mse` as `--transport-cost normalized_mse`. The stable-policy diagnostic command below separately sets `LR_THETA=0.1`; newer low-LR ablations should encode their own learning rate in `RUN_NAME` and `OUTPUT_FOLDER_NAME`.
@@ -25,6 +26,23 @@ Do not use `TRANSPORT_COST=pixel_l2_squared` unless you intentionally want the n
 `ATTACK_CLEAN_CORRECT_ONLY=1` matches the legacy outer loop: the learned transport is trained and applied only on examples that the clean classifier currently gets right; clean-misclassified examples stay at the clean input for the classifier update.
 
 `RESET_PARAMETRIC_BB_EACH_BATCH=1` matches the legacy BB+Armijo loop: the BB secant history is reset at every batch. Carrying BB history across batches is an ablation because the stochastic objective changes with both the batch and the classifier.
+
+`PARAMETRIC_BB_MAX_GRAD_NORM=1.0` matches the legacy ICNN ascent loop: the shared parametric adversary gradient is clipped to global norm 1.0 before the BB step proposal and before Armijo trial steps. Set it to `0` only for a clipping ablation.
+
+## NPF / BB+Armijo fixes
+
+The current refactored NPF path includes the following fixes relative to the earlier `pretrained_input_icnn` implementation:
+
+| Area | Fix | Why it matters |
+| --- | --- | --- |
+| NPF LastQuad initialization | `NPF_LASTQUAD_INIT_EPS` now represents the quadratic coefficient scale; the trainable quadratic factor is initialized at `sqrt(init_eps)`. | The old factor initialization made the final quadratic contribution scale like `init_eps^2`; with `1e-4`, the actual coefficient was `1e-8` and `q_out.delta_raw` barely moved. |
+| BB wrong-curvature fallback | When the ascent BB secant has the wrong curvature sign, the step proposal falls back to `BB_ALPHA_MIN` instead of reusing a stale `alpha_prev`. | Reusing a stale large step can keep forcing unstable adversary updates after the stochastic local objective becomes noisy or locally convex. |
+| BB adversary gradient clipping | Shared parametric BB adversaries use `PARAMETRIC_BB_MAX_GRAD_NORM=1.0` by default. | This restores the legacy ICNN behavior (`clip_grad_norm_(icnn.parameters(), max_norm=1.0)`) before the BB/Armijo update. |
+| Clean-correct mask under DDP | NPF and NN-DRO now optimize the globally masked objective by reducing the clean-correct count across ranks. | The old DDP path averaged each rank's masked mean equally, biasing the adversary gradient when ranks had different numbers of clean-correct samples. |
+| Epoch diagnostics | `theta_l2_delta` and `omega_l2_delta` are printed each epoch and written to `epoch_log.csv`. | Tracks `||theta_t - theta_{t-1}||_2` for the classifier and `||omega_t - omega_{t-1}||_2` for the NPF adversary. |
+| Interrupted jobs | Epoch CSV rows are appended at epoch end, not only after `fit()` returns. | Completed epochs remain analyzable even if the cluster job is interrupted later. |
+
+The ResNet loader unwraps `R2.pth` using the shared checkpoint priority in `utils.unwrap_state_dict`. For the current `R2.pth`, whose top-level keys are `last`, `best`, `swa_last`, and `swa_best`, the loaded classifier branch is `last`.
 
 ## PGD evaluation loss
 
@@ -91,6 +109,7 @@ The run name and output folder use `lr0p1` because `LR_THETA=0.1`. Avoid naming 
 | DRO | `LAMBDA_STAGE_EPOCHS` | `0` | No staged schedule. |
 | Legacy semantics | `ATTACK_CLEAN_CORRECT_ONLY` | `1` | Attack only clean-correct samples; clean-incorrect samples stay clean. |
 | Legacy semantics | `RESET_PARAMETRIC_BB_EACH_BATCH` | `1` | Reset BB secant history each batch. |
+| Legacy semantics | `PARAMETRIC_BB_MAX_GRAD_NORM` | `1.0` | Clip shared parametric BB adversary gradients before BB/Armijo. |
 | Warmup | `EPOCHS_ICNN_PRETRAIN` | `0` | No adversary-only warmup in this run. |
 | BatchNorm | `FREEZE_BATCHNORM` | `0` | BatchNorm running stats update during classifier training. |
 | BatchNorm | `FREEZE_BATCHNORM_AFFINE` | `0` | BN affine parameters remain trainable. |
@@ -146,6 +165,7 @@ python csub.py -n lastquad-lam30-logsum-bb-k7-lr0p1-stablepolicy -g 2 -t 1d --tr
     BB_LS_C=0.1 \
     BB_LS_SHRINK=0.5 \
     BB_LS_MAX_STEPS=10 \
+    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
     EVAL_PGD_SAMPLES=2000 \
     INPUT_PGD_LOSS=ce \
     INP_STEPS=20 \
@@ -155,6 +175,53 @@ python csub.py -n lastquad-lam30-logsum-bb-k7-lr0p1-stablepolicy -g 2 -t 1d --tr
     FROZEN_ADVERSARY_MAP_STEPS=1 \
     OUTPUT_FOLDER_NAME=BB_lam30_legacyfix_logsum_lr0p1_K7_pgdce_seed1 \
     bash run_runtime_sweep_ddp.sh 0 1 2 7 50"
+```
+
+## Corrected K10 low-LR fixed-lambda command
+
+Use this command for the low-learning-rate K10 diagnostic after the NPF/BB fixes above. The run names encode `lr0p01`, `K10`, the legacy BB fixes, and gradient clipping.
+
+```bash
+python csub.py -n lastquad-lam30-logsum-bb-k10-lr0p01-fix -g 2 -t 1d --train --large-shm --node-type h100 \
+  --command "cd /mloscratch/homes/aabdolla/LAT && \
+    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
+    RUN_NAME=npf_lq_lam30_logsum_lr0p01_K10_bb_legacyfix_clip1_pgdce_seed1 \
+    LR_THETA=0.01 \
+    PENALTY_LAMBDA=30 \
+    TRANSPORT_COST=normalized_mse \
+    EPOCHS_ICNN_PRETRAIN=0 \
+    LAMBDA_SCHEDULE='' \
+    LAMBDA_STAGE_EPOCHS=0 \
+    ATTACK_CLEAN_CORRECT_ONLY=1 \
+    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
+    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
+    FREEZE_BATCHNORM=0 \
+    FREEZE_BATCHNORM_AFFINE=0 \
+    BATCHNORM_ONLINE_REFRESH=0 \
+    RECALIBRATE_BATCHNORM=0 \
+    USE_MARGIN_LOSS=1 \
+    COMMON_BATCH=512 \
+    NPF_LASTQUAD_HIDDEN='1024 512 512 256 128 64' \
+    NPF_LASTQUAD_ACTIVATION=softplus \
+    NPF_LASTQUAD_SOFTPLUS_BETA=20.0 \
+    NPF_LASTQUAD_INIT_EPS=1e-4 \
+    NPF_LASTQUAD_STRONG_CONVEXITY=1.0 \
+    NPF_INNER_OPTIMIZER=bb_armijo \
+    BB_ALPHA0=5e-4 \
+    BB_ALPHA_MIN=1e-6 \
+    BB_ALPHA_MAX=1.0 \
+    BB_LS_C=0.1 \
+    BB_LS_SHRINK=0.5 \
+    BB_LS_MAX_STEPS=10 \
+    EVAL_PGD_SAMPLES=2000 \
+    INPUT_PGD_LOSS=ce \
+    INP_STEPS=20 \
+    INP_RESTARTS=5 \
+    OMEGA_STEPS=10 \
+    FROZEN_ADVERSARY_EPOCHS=0 \
+    FROZEN_ADVERSARY_MAP_STEPS=1 \
+    OUTPUT_FOLDER_NAME=BB_lam30_legacyfix_logsum_lr0p01_K10_clip1_pgdce_seed1 \
+    bash run_runtime_sweep_ddp.sh 0 1 2 10 50"
 ```
 
 ### Exact legacy-script comparison knobs
@@ -190,6 +257,7 @@ The effective inner budget is `K=20`, because both `OMEGA_STEPS=20` and the fina
 | DRO | `TRANSPORT_COST` | `normalized_mse` | Legacy normalized-coordinate mean squared transport cost. |
 | Legacy semantics | `ATTACK_CLEAN_CORRECT_ONLY` | `1` | Attack only clean-correct samples. |
 | Legacy semantics | `RESET_PARAMETRIC_BB_EACH_BATCH` | `1` | Reset BB secant history each batch. |
+| Legacy semantics | `PARAMETRIC_BB_MAX_GRAD_NORM` | `1.0` | Clip shared parametric BB adversary gradients before BB/Armijo. |
 | BatchNorm | `FREEZE_BATCHNORM` | `0` | Stable-policy BatchNorm behavior. |
 | BatchNorm | `FREEZE_BATCHNORM_AFFINE` | `0` | BN affine parameters remain trainable. |
 | BatchNorm | `BATCHNORM_ONLINE_REFRESH` | `0` | No clean BN refresh pass. |
@@ -235,6 +303,7 @@ python csub.py -n lastquad-lamsched-30-20-15-10-5-k20-lr0p1 -g 2 -t 1d --train -
     BB_LS_C=0.1 \
     BB_LS_SHRINK=0.5 \
     BB_LS_MAX_STEPS=10 \
+    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
     EVAL_PGD_SAMPLES=2000 \
     INPUT_PGD_LOSS=ce \
     INP_STEPS=20 \
@@ -275,6 +344,7 @@ SMOKE_MAX_TRAIN_BATCHES=1 /mloscratch/homes/aabdolla/optiselect/.venv/bin/python
   --transport-cost normalized_mse \
   --attack-clean-correct-only \
   --reset-parametric-bb-each-batch \
+  --parametric-bb-max-grad-norm 1.0 \
   --omega-steps-per-batch 0 \
   --npf-lastquad-hidden 4 \
   --eval-input-pgd \
@@ -300,4 +370,5 @@ Run these before pushing changes:
 python -m py_compile pretrained_input_icnn/config.py pretrained_input_icnn/main.py pretrained_input_icnn/utils/eval.py pretrained_input_icnn/utils/projections.py pretrained_input_icnn/algorithms/base.py pretrained_input_icnn/algorithms/npf.py pretrained_input_icnn/algorithms/nn_dro.py pretrained_input_icnn/algorithms/wrm.py pretrained_input_icnn/algorithms/wfr.py pretrained_input_icnn/algorithms/dual.py pretrained_input_icnn/algorithms/new_ppa.py
 bash -n run_pretrained_input_icnn.sh run_runtime_sweep_ddp.sh
 python -m pytest tests/test_pretrained_input_icnn_inner_steps.py
+python -m pytest tests
 ```

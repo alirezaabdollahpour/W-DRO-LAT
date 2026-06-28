@@ -50,6 +50,8 @@ _LOG_FIELDS = (
     "train_transport_cost",
     "train_weighted_penalty",
     "train_inner_objective",
+    "theta_l2_delta",
+    "omega_l2_delta",
     "epoch_seconds",
     "bn_recalibration_seconds",
     "bn_recalibration_batches",
@@ -81,6 +83,7 @@ _LOG_FIELDS = (
     "transport_cost",
     "attack_clean_correct_only",
     "reset_parametric_bb_each_batch",
+    "parametric_bb_max_grad_norm",
     "lambda_param",
     "lr_theta",
     "batch_size",
@@ -96,27 +99,41 @@ _LOG_FIELDS = (
 def _append_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     rows = list(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
+    extra_fields = sorted(
+        {
+            key
+            for row in rows
+            for key in row.keys()
+            if key not in _LOG_FIELDS
+        }
+    )
+    desired_fieldnames = list(_LOG_FIELDS) + extra_fields
     file_exists = path.exists()
+    needs_header = not file_exists
     if file_exists:
         with path.open(newline="") as f:
-            reader = csv.reader(f)
-            try:
-                fieldnames = next(reader)
-            except StopIteration:
-                fieldnames = list(_LOG_FIELDS)
+            reader = csv.DictReader(f)
+            needs_header = reader.fieldnames is None
+            fieldnames = list(reader.fieldnames or desired_fieldnames)
+            existing_rows = list(reader)
+        missing_fields = [
+            field for field in desired_fieldnames if field not in fieldnames
+        ]
+        if missing_fields:
+            fieldnames.extend(missing_fields)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with tmp_path.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in existing_rows:
+                    writer.writerow({k: row.get(k) for k in fieldnames})
+            tmp_path.replace(path)
+            needs_header = False
     else:
-        extra_fields = sorted(
-            {
-                key
-                for row in rows
-                for key in row.keys()
-                if key not in _LOG_FIELDS
-            }
-        )
-        fieldnames = list(_LOG_FIELDS) + extra_fields
+        fieldnames = desired_fieldnames
     with path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
+        if needs_header:
             writer.writeheader()
         for row in rows:
             writer.writerow({k: row.get(k) for k in fieldnames})
@@ -171,7 +188,16 @@ def _metric_definitions(use_margin_loss: bool, transport_cost: str = "normalized
         "transport_cost": "Transport penalty convention used by DRO inner objectives.",
         "attack_clean_correct_only": "Whether transport adversaries are trained/applied only on clean-correct examples.",
         "reset_parametric_bb_each_batch": "Whether parametric BB+Armijo history is reset at each batch.",
+        "parametric_bb_max_grad_norm": "Global norm clip applied to shared parametric adversary gradients before BB+Armijo; 0 disables clipping.",
         "train_inner_objective": "train_adv_loss - train_weighted_penalty.",
+        "theta_l2_delta": (
+            "Epoch-to-epoch classifier parameter L2 change "
+            "||theta_t - theta_{t-1}||_2, starting from the loaded checkpoint."
+        ),
+        "omega_l2_delta": (
+            "Epoch-to-epoch NPF adversary parameter L2 change "
+            "||omega_t - omega_{t-1}||_2."
+        ),
         "clean_loss": "Clean test cross-entropy after the epoch.",
         "clean_acc": "Clean test accuracy after the epoch.",
         "transport_adv_loss": "Test cross-entropy under the learned transport adversary.",
@@ -210,6 +236,96 @@ def _metric_definitions(use_margin_loss: bool, transport_cost: str = "normalized
             "objectives."
         ),
     }
+
+
+def _enrich_history_entry(
+    entry: Dict[str, Any],
+    *,
+    cfg,
+    run_id: str,
+    adversary_loss_type: str,
+) -> Dict[str, Any]:
+    return {
+        **entry,
+        "run_id": run_id,
+        "adversary_loss_type": adversary_loss_type,
+        "transport_cost": cfg.transport_cost,
+        "attack_clean_correct_only": cfg.attack_clean_correct_only,
+        "reset_parametric_bb_each_batch": cfg.reset_parametric_bb_each_batch,
+        "parametric_bb_max_grad_norm": cfg.parametric_bb_max_grad_norm,
+        "lambda_param": entry.get("lambda_param", cfg.lambda_param),
+    }
+
+
+def _csv_row_from_entry(
+    entry: Dict[str, Any],
+    *,
+    cfg,
+    run_id: str,
+    adversary_loss_type: str,
+) -> Dict[str, Any]:
+    row = {
+        "run_id": run_id,
+        "algorithm": entry.get("algorithm", cfg.algorithm),
+        "epoch": entry.get("epoch"),
+        "phase": entry.get("phase", "adv"),
+        "frozen_adversary_map_steps": entry.get("frozen_adversary_map_steps"),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "train_loss": entry.get("train_loss"),
+        "train_acc": entry.get("train_acc"),
+        "train_mse": entry.get("train_mse"),
+        "inner_loss": entry.get("inner_loss"),
+        "adversary_loss_type": adversary_loss_type,
+        "train_adv_loss": entry.get("train_adv_loss"),
+        "train_transport_cost": entry.get("train_transport_cost"),
+        "train_weighted_penalty": entry.get("train_weighted_penalty"),
+        "train_inner_objective": entry.get("train_inner_objective"),
+        "theta_l2_delta": entry.get("theta_l2_delta"),
+        "omega_l2_delta": entry.get("omega_l2_delta"),
+        "epoch_seconds": entry.get("epoch_seconds"),
+        "bn_recalibration_seconds": entry.get("bn_recalibration_seconds"),
+        "bn_recalibration_batches": entry.get("bn_recalibration_batches"),
+        "bn_recalibration_samples": entry.get("bn_recalibration_samples"),
+        "bn_online_refresh_seconds": entry.get("bn_online_refresh_seconds"),
+        "bn_online_refresh_batches": entry.get("bn_online_refresh_batches"),
+        "bn_online_refresh_samples": entry.get("bn_online_refresh_samples"),
+        "test_loss": entry.get("test_loss"),
+        "test_acc": entry.get("test_acc"),
+        "clean_loss": entry.get("clean_loss", entry.get("test_loss")),
+        "clean_acc": entry.get("clean_acc", entry.get("test_acc")),
+        "adv_loss": entry.get("adv_loss"),
+        "adv_acc": entry.get("adv_acc"),
+        "adv_penalty": entry.get("adv_penalty"),
+        "eval_transport_cost": entry.get("eval_transport_cost"),
+        "eval_transport_weighted_penalty": entry.get("eval_transport_weighted_penalty"),
+        "transport_adv_loss": entry.get("transport_adv_loss", entry.get("adv_loss")),
+        "transport_adv_acc": entry.get("transport_adv_acc", entry.get("adv_acc")),
+        "input_pgd_acc": entry.get("input_pgd_acc"),
+        "input_pgd_clean_acc": entry.get("input_pgd_clean_acc"),
+        "input_pgd_clean_correct": entry.get("input_pgd_clean_correct"),
+        "input_pgd_robust_correct": entry.get("input_pgd_robust_correct"),
+        "input_pgd_avg_l2": entry.get("input_pgd_avg_l2"),
+        "input_pgd_avg_linf": entry.get("input_pgd_avg_linf"),
+        "input_pgd_max_l2": entry.get("input_pgd_max_l2"),
+        "input_pgd_max_linf": entry.get("input_pgd_max_linf"),
+        "input_pgd_samples": entry.get("input_pgd_samples"),
+        "input_pgd_loss": entry.get("input_pgd_loss", cfg.input_pgd_loss),
+        "transport_cost": cfg.transport_cost,
+        "attack_clean_correct_only": cfg.attack_clean_correct_only,
+        "reset_parametric_bb_each_batch": cfg.reset_parametric_bb_each_batch,
+        "parametric_bb_max_grad_norm": cfg.parametric_bb_max_grad_norm,
+        "lambda_param": entry.get("lambda_param", cfg.lambda_param),
+        "lr_theta": cfg.lr_theta,
+        "batch_size": cfg.batch_size,
+        "freeze_batchnorm": cfg.freeze_batchnorm,
+        "freeze_batchnorm_affine": cfg.freeze_batchnorm_affine,
+        "online_batchnorm_refresh": cfg.online_batchnorm_refresh,
+        "batchnorm_online_refresh_momentum": cfg.batchnorm_online_refresh_momentum,
+        "seed": cfg.seed,
+        "pretrained_path": cfg.pretrained_path,
+    }
+    row.update({k: v for k, v in entry.items() if k.startswith("profile_")})
+    return row
 
 
 def main() -> None:
@@ -302,6 +418,26 @@ def main() -> None:
             print(f"[input-icnn] resumed adversary from {cfg.resume_checkpoint}")
     dist_helpers.barrier()
 
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    adversary_loss_type = "logsumexp_margin" if cfg.use_margin_loss else "cross_entropy"
+    if is_main:
+        def write_epoch_row(entry: Dict[str, Any]) -> None:
+            enriched = _enrich_history_entry(
+                entry,
+                cfg=cfg,
+                run_id=run_id,
+                adversary_loss_type=adversary_loss_type,
+            )
+            row = _csv_row_from_entry(
+                enriched,
+                cfg=cfg,
+                run_id=run_id,
+                adversary_loss_type=adversary_loss_type,
+            )
+            _append_csv(Path(cfg.log_csv), [row])
+
+        trainer.epoch_end_callback = write_epoch_row
+
     history = trainer.fit()
     trainer.save_final()
 
@@ -321,83 +457,15 @@ def main() -> None:
         dist_helpers.cleanup_distributed()
         return
 
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    adversary_loss_type = "logsumexp_margin" if cfg.use_margin_loss else "cross_entropy"
     history_epochs = [
-        {
-            **entry,
-            "run_id": run_id,
-            "adversary_loss_type": adversary_loss_type,
-            "transport_cost": cfg.transport_cost,
-            "attack_clean_correct_only": cfg.attack_clean_correct_only,
-            "reset_parametric_bb_each_batch": cfg.reset_parametric_bb_each_batch,
-            "lambda_param": entry.get("lambda_param", cfg.lambda_param),
-        }
+        _enrich_history_entry(
+            entry,
+            cfg=cfg,
+            run_id=run_id,
+            adversary_loss_type=adversary_loss_type,
+        )
         for entry in history
     ]
-    rows = []
-    for entry in history_epochs:
-        row = {
-                "run_id": run_id,
-                "algorithm": entry.get("algorithm", cfg.algorithm),
-                "epoch": entry.get("epoch"),
-                "phase": entry.get("phase", "adv"),
-                "frozen_adversary_map_steps": entry.get("frozen_adversary_map_steps"),
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "train_loss": entry.get("train_loss"),
-                "train_acc": entry.get("train_acc"),
-                "train_mse": entry.get("train_mse"),
-                "inner_loss": entry.get("inner_loss"),
-                "adversary_loss_type": adversary_loss_type,
-                "train_adv_loss": entry.get("train_adv_loss"),
-                "train_transport_cost": entry.get("train_transport_cost"),
-                "train_weighted_penalty": entry.get("train_weighted_penalty"),
-                "train_inner_objective": entry.get("train_inner_objective"),
-                "epoch_seconds": entry.get("epoch_seconds"),
-                "bn_recalibration_seconds": entry.get("bn_recalibration_seconds"),
-                "bn_recalibration_batches": entry.get("bn_recalibration_batches"),
-                "bn_recalibration_samples": entry.get("bn_recalibration_samples"),
-                "bn_online_refresh_seconds": entry.get("bn_online_refresh_seconds"),
-                "bn_online_refresh_batches": entry.get("bn_online_refresh_batches"),
-                "bn_online_refresh_samples": entry.get("bn_online_refresh_samples"),
-                "test_loss": entry.get("test_loss"),
-                "test_acc": entry.get("test_acc"),
-                "clean_loss": entry.get("clean_loss", entry.get("test_loss")),
-                "clean_acc": entry.get("clean_acc", entry.get("test_acc")),
-                "adv_loss": entry.get("adv_loss"),
-                "adv_acc": entry.get("adv_acc"),
-                "adv_penalty": entry.get("adv_penalty"),
-                "eval_transport_cost": entry.get("eval_transport_cost"),
-                "eval_transport_weighted_penalty": entry.get("eval_transport_weighted_penalty"),
-                "transport_adv_loss": entry.get("transport_adv_loss", entry.get("adv_loss")),
-                "transport_adv_acc": entry.get("transport_adv_acc", entry.get("adv_acc")),
-                "input_pgd_acc": entry.get("input_pgd_acc"),
-                "input_pgd_clean_acc": entry.get("input_pgd_clean_acc"),
-                "input_pgd_clean_correct": entry.get("input_pgd_clean_correct"),
-                "input_pgd_robust_correct": entry.get("input_pgd_robust_correct"),
-                "input_pgd_avg_l2": entry.get("input_pgd_avg_l2"),
-                "input_pgd_avg_linf": entry.get("input_pgd_avg_linf"),
-                "input_pgd_max_l2": entry.get("input_pgd_max_l2"),
-                "input_pgd_max_linf": entry.get("input_pgd_max_linf"),
-                "input_pgd_samples": entry.get("input_pgd_samples"),
-                "input_pgd_loss": entry.get("input_pgd_loss", cfg.input_pgd_loss),
-                "transport_cost": cfg.transport_cost,
-                "attack_clean_correct_only": cfg.attack_clean_correct_only,
-                "reset_parametric_bb_each_batch": cfg.reset_parametric_bb_each_batch,
-                "lambda_param": entry.get("lambda_param", cfg.lambda_param),
-                "lr_theta": cfg.lr_theta,
-                "batch_size": cfg.batch_size,
-                "freeze_batchnorm": cfg.freeze_batchnorm,
-                "freeze_batchnorm_affine": cfg.freeze_batchnorm_affine,
-                "online_batchnorm_refresh": cfg.online_batchnorm_refresh,
-                "batchnorm_online_refresh_momentum": cfg.batchnorm_online_refresh_momentum,
-                "seed": cfg.seed,
-                "pretrained_path": cfg.pretrained_path,
-            }
-        row.update({k: v for k, v in entry.items() if k.startswith("profile_")})
-        rows.append(row)
-
-    _append_csv(Path(cfg.log_csv), rows)
     metric_definitions = _metric_definitions(cfg.use_margin_loss, cfg.transport_cost)
     history_payload = {
         "run_id": run_id,

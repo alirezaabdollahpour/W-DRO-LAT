@@ -141,6 +141,10 @@ class TrainConfig:
     bb_ls_c: float = 1e-4
     bb_ls_shrink: float = 0.5
     bb_ls_max_steps: int = 15
+    # Legacy pretrained_INPUT_icnn.py clipped ICNN adversary gradients before
+    # the BB proposal and Armijo trials. Applies only to shared parametric
+    # BB adversaries (NPF / NPF-LastQuad / NN-DRO). Set 0 to disable.
+    parametric_bb_max_grad_norm: float = 1.0
 
     # --- NPF hyperparameters (LR-CIFAR10 defaults) ---
     npf_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
@@ -546,6 +550,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     bb.add_argument("--bb-ls-c", type=float, default=1e-4)
     bb.add_argument("--bb-ls-shrink", type=float, default=0.5)
     bb.add_argument("--bb-ls-max-steps", type=int, default=15)
+    bb.add_argument(
+        "--parametric-bb-max-grad-norm",
+        type=float,
+        default=1.0,
+        help=(
+            "Global norm clip applied to shared parametric adversary gradients "
+            "before BB+Armijo. Matches legacy ICNN max_norm=1.0; set 0 to "
+            "disable for ablations."
+        ),
+    )
     parser.add_argument(
         "--use-margin-loss",
         dest="use_margin_loss",
@@ -934,6 +948,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "bb_ls_c": "bb_ls_c",
         "bb_ls_shrink": "bb_ls_shrink",
         "bb_ls_max_steps": "bb_ls_max_steps",
+        "parametric_bb_max_grad_norm": "parametric_bb_max_grad_norm",
         "use_margin_loss": "use_margin_loss",
         "attack_clean_correct_only": "attack_clean_correct_only",
         "reset_parametric_bb_each_batch": "reset_parametric_bb_each_batch",

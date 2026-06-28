@@ -206,6 +206,7 @@ BB_ALPHA_MAX=${BB_ALPHA_MAX:-0.25}
 BB_LS_C=${BB_LS_C:-1e-4}
 BB_LS_SHRINK=${BB_LS_SHRINK:-0.5}
 BB_LS_MAX_STEPS=${BB_LS_MAX_STEPS:-15}
+PARAMETRIC_BB_MAX_GRAD_NORM=${PARAMETRIC_BB_MAX_GRAD_NORM:-1.0}
 BB_ARGS=(
   --bb-alpha0 "${BB_ALPHA0}"
   --bb-alpha-min "${BB_ALPHA_MIN}"
@@ -213,6 +214,7 @@ BB_ARGS=(
   --bb-ls-c "${BB_LS_C}"
   --bb-ls-shrink "${BB_LS_SHRINK}"
   --bb-ls-max-steps "${BB_LS_MAX_STEPS}"
+  --parametric-bb-max-grad-norm "${PARAMETRIC_BB_MAX_GRAD_NORM}"
 )
 
 # ---- Dual Option-D Langevin / MALA inner sampler ----
@@ -380,6 +382,7 @@ echo "  Inner profiling: ${PROFILE_INNER}  batches=${PROFILE_INNER_BATCHES}"
 echo "  NPF optimizer: ${NPF_INNER_OPTIMIZER}"
 echo "  BB+Armijo:   alpha0=${BB_ALPHA0}  alpha=[${BB_ALPHA_MIN}, ${BB_ALPHA_MAX}]"
 echo "                ls_c=${BB_LS_C}  shrink=${BB_LS_SHRINK}  ls_max=${BB_LS_MAX_STEPS}"
+echo "                parametric_grad_clip=${PARAMETRIC_BB_MAX_GRAD_NORM}"
 if [ "$NPF_INNER_OPTIMIZER" = "muon" ]; then
     echo "  Muon:        lr=${NPF_MUON_LR}  momentum=${NPF_MUON_MOMENTUM}  nesterov=${NPF_MUON_NESTEROV}"
     echo "                ns_steps=${NPF_MUON_NS_STEPS}  scale=${NPF_MUON_MATRIX_LR_SCALE}  wd=${NPF_MUON_WEIGHT_DECAY}"
@@ -600,6 +603,7 @@ run_algo() {
             printf "BB_LS_C=%q\n" "$BB_LS_C"
             printf "BB_LS_SHRINK=%q\n" "$BB_LS_SHRINK"
             printf "BB_LS_MAX_STEPS=%q\n" "$BB_LS_MAX_STEPS"
+            printf "PARAMETRIC_BB_MAX_GRAD_NORM=%q\n" "$PARAMETRIC_BB_MAX_GRAD_NORM"
             printf "RESULTS_DIR=%q\n" "$RESULTS_DIR"
             printf "OUT_DIR=%q\n" "$OUT_DIR"
             printf "FINAL_CHECKPOINT=%q\n" "$FINAL_CKPT"

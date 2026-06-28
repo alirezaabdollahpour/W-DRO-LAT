@@ -1,3 +1,4 @@
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -10,10 +11,20 @@ from torch.utils.data import DataLoader, TensorDataset
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from pretrained_input_icnn import distributed as dist_helpers
 from pretrained_input_icnn.algorithms import ALGORITHMS
+from pretrained_input_icnn.algorithms.base import BaseAdvTrainer
 from pretrained_input_icnn.config import TrainConfig, build_arg_parser, config_from_args
+from pretrained_input_icnn.distributed import DistInfo
 from pretrained_input_icnn.models.classifier import SimpleViTCIFAR, load_pretrained_classifier
-from pretrained_input_icnn.utils import normalized_mse, pixel_l2_squared, to_pixel
+from pretrained_input_icnn.models.npf import npf_T_omega
+from pretrained_input_icnn.utils import (
+    BBArmijoState,
+    bb_armijo_step_params,
+    normalized_mse,
+    pixel_l2_squared,
+    to_pixel,
+)
 from pretrained_input_icnn.utils.eval import (
     _pgd_loss_per_sample,
     evaluate_clean,
@@ -183,6 +194,140 @@ def test_warmup_epoch_does_not_update_classifier_or_batchnorm_buffers():
         assert p.grad is None or torch.count_nonzero(p.grad).item() == 0
     for b, old in zip(buffers, buffers_before):
         assert torch.allclose(b.detach(), old)
+
+
+def test_parameter_l2_deltas_track_classifier_and_npf_adversary():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    classifier = TinyClassifier().to(device)
+    cfg = replace(
+        _config("npf_lastquad"),
+        npf_lastquad_hidden=(4,),
+    )
+    loader = _loader()
+    trainer = ALGORITHMS["npf_lastquad"](
+        classifier=classifier,
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=cfg,
+    )
+
+    trainer._ensure_parameter_delta_baseline()
+    theta_param = next(trainer.classifier_module.parameters())
+    omega_param = next(trainer.adversary_delta_parameters())
+    theta_step = 0.25
+    omega_step = 0.5
+
+    with torch.no_grad():
+        theta_param.add_(theta_step)
+        omega_param.add_(omega_step)
+
+    extras = trainer._finish_parameter_delta_epoch()
+
+    assert extras["theta_l2_delta"] == pytest.approx(
+        theta_step * math.sqrt(theta_param.numel())
+    )
+    assert extras["omega_l2_delta"] == pytest.approx(
+        omega_step * math.sqrt(omega_param.numel())
+    )
+    unchanged = trainer._finish_parameter_delta_epoch()
+
+    assert unchanged["theta_l2_delta"] == pytest.approx(0.0)
+    assert unchanged["omega_l2_delta"] == pytest.approx(0.0)
+
+
+def test_npf_lastquad_init_eps_keeps_final_quadratic_trainable():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    classifier = TinyClassifier().to(device)
+    cfg = replace(
+        _config("npf_lastquad"),
+        npf_lastquad_hidden=(4,),
+        npf_lastquad_init_eps=1e-4,
+    )
+    loader = _loader()
+    trainer = ALGORITHMS["npf_lastquad"](
+        classifier=classifier,
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=cfg,
+    )
+
+    q_out_delta = trainer.psi_omega.q_out.delta.detach()
+
+    assert q_out_delta.mean().item() == pytest.approx(math.sqrt(cfg.npf_lastquad_init_eps))
+
+    x = torch.randn(2, 3, 32, 32, device=device)
+    x_adv = npf_T_omega(x, trainer.psi_omega, create_graph=True)
+    loss = x_adv.pow(2).mean()
+    grad = torch.autograd.grad(loss, trainer.psi_omega.q_out.delta_raw)[0]
+
+    assert torch.isfinite(grad).all()
+    assert grad.norm().item() > 1e-7
+
+
+def test_bb_ascent_wrong_curvature_falls_back_to_alpha_min():
+    state = BBArmijoState.create(
+        alpha0=0.1,
+        alpha_min=1e-5,
+        alpha_max=1.0,
+    )
+    state = state.update_history(
+        torch.tensor([0.0]),
+        torch.tensor([0.0]),
+        alpha=0.1,
+    )
+
+    alpha = state.propose(torch.tensor([1.0]), torch.tensor([1.0]))
+
+    assert alpha == pytest.approx(state.alpha_min)
+
+
+def test_bb_armijo_clips_parametric_gradient_before_step():
+    param = nn.Parameter(torch.tensor([0.0]))
+    state = BBArmijoState.create(
+        alpha0=1.0,
+        alpha_min=1.0,
+        alpha_max=1.0,
+        ls_c=0.0,
+        ls_max_steps=1,
+    )
+
+    def objective(create_graph: bool) -> torch.Tensor:
+        del create_graph
+        return 10.0 * param.sum()
+
+    _, _, _, grad_norm = bb_armijo_step_params(
+        [param],
+        objective,
+        state,
+        max_grad_norm=1.0,
+    )
+
+    assert grad_norm == pytest.approx(1.0)
+    assert param.detach().item() == pytest.approx(1.0)
+
+
+def test_shared_adversary_masked_mean_uses_global_count_for_ddp(monkeypatch):
+    trainer = BaseAdvTrainer.__new__(BaseAdvTrainer)
+    trainer.dist = DistInfo(world_size=2, rank=0, local_rank=0, backend="test")
+
+    values = torch.tensor([2.0, 5.0], requires_grad=True)
+    mask = torch.tensor([True, False])
+
+    def fake_global_count(x: torch.Tensor) -> torch.Tensor:
+        assert x.item() == pytest.approx(1.0)
+        return x.new_tensor(4.0)
+
+    monkeypatch.setattr(dist_helpers, "all_reduce_sum_scalar", fake_global_count)
+
+    objective = trainer._shared_adversary_masked_mean(values, mask)
+    objective.backward()
+
+    assert objective.item() == pytest.approx(1.0)
+    assert torch.allclose(values.grad, torch.tensor([0.5, 0.0]))
 
 
 def test_freeze_batchnorm_affine_keeps_bn_weight_bias_fixed():
@@ -616,9 +761,15 @@ def test_transport_cost_defaults_to_legacy_normalized_mse_and_cli_override():
     assert default_cfg.transport_cost == "normalized_mse"
     assert default_cfg.attack_clean_correct_only
     assert default_cfg.reset_parametric_bb_each_batch
+    assert default_cfg.parametric_bb_max_grad_norm == pytest.approx(1.0)
     assert pixel_cfg.transport_cost == "pixel_l2_squared"
     assert not ablation_cfg.attack_clean_correct_only
     assert not ablation_cfg.reset_parametric_bb_each_batch
+
+    unclipped_cfg = config_from_args(
+        parser.parse_args(["--parametric-bb-max-grad-norm", "0"])
+    )
+    assert unclipped_cfg.parametric_bb_max_grad_norm == pytest.approx(0.0)
 
 
 def test_disabled_frozen_adversary_allows_zero_map_steps():

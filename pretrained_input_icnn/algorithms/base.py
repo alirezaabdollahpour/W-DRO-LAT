@@ -25,7 +25,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -139,6 +139,9 @@ class BaseAdvTrainer:
         self.best_robust_acc: Optional[float] = None
         self.best_robust_epoch: Optional[int] = None
         self.last_completed_epoch: int = 0
+        self._previous_theta_snapshot: Optional[List[torch.Tensor]] = None
+        self._previous_omega_snapshot: Optional[List[torch.Tensor]] = None
+        self.epoch_end_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         self._profile_epoch_accum: Dict[str, float] = {}
         self._profile_epoch_batches: int = 0
         self._profile_current: Optional[Dict[str, float]] = None
@@ -215,6 +218,10 @@ class BaseAdvTrainer:
         """Optional extra checkpoint payload (adversary parameters)."""
         return {}
 
+    def adversary_delta_parameters(self) -> Iterator[nn.Parameter]:
+        """Parameters that define omega_t for epoch-to-epoch L2 diagnostics."""
+        return iter(())
+
     def load_adversary_state_dicts(
         self,
         payload: Dict[str, Any],
@@ -269,15 +276,51 @@ class BaseAdvTrainer:
             self._restore_classifier_training_modes(module_training)
 
     @staticmethod
-    def _masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def _masked_sum_and_count(
+        values: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if mask is None:
-            return values.mean()
+            return values.sum(), values.new_tensor(float(values.numel()))
         if values.dim() != 1:
-            raise ValueError("_masked_mean expects per-sample values.")
+            raise ValueError("_masked_sum_and_count expects per-sample values.")
         if mask.shape != values.shape:
             raise ValueError("mask shape must match per-sample values.")
         weights = mask.to(device=values.device, dtype=values.dtype)
-        return (values * weights).sum() / weights.sum().clamp_min(1.0)
+        return (values * weights).sum(), weights.sum()
+
+    @classmethod
+    def _masked_mean(
+        cls,
+        values: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        numerator, count = cls._masked_sum_and_count(values, mask)
+        return numerator / count.clamp_min(1.0)
+
+    def _shared_adversary_masked_mean(
+        self,
+        values: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Masked mean for shared parametric adversaries under DDP.
+
+        The NPF/NN-DRO adversary parameters are synchronized manually by
+        mean-reducing gradients across ranks. To make that averaged gradient
+        equal the gradient of the globally masked objective, each rank uses
+        ``world_size * local_sum / global_count`` as its local autograd scalar.
+        A subsequent mean all-reduce of gradients then produces
+        ``sum_r grad(local_sum_r) / global_count``.
+        """
+        numerator, count = self._masked_sum_and_count(values, mask)
+        if self.dist.is_distributed:
+            global_count = dist_helpers.all_reduce_sum_scalar(count.detach())
+            scale = float(self.dist.world_size)
+        else:
+            global_count = count.detach()
+            scale = 1.0
+        global_count = global_count.to(device=values.device, dtype=values.dtype)
+        return numerator * scale / global_count.clamp_min(1.0)
 
     @staticmethod
     def _keep_clean_for_unattacked(
@@ -408,6 +451,68 @@ class BaseAdvTrainer:
             weight_decay=cfg.weight_decay,
             nesterov=True,
         )
+
+    @staticmethod
+    def _parameter_snapshot(parameters: Iterable[nn.Parameter]) -> List[torch.Tensor]:
+        return [p.detach().cpu().float().clone() for p in parameters]
+
+    @staticmethod
+    def _parameter_l2_delta(
+        parameters: Iterable[nn.Parameter],
+        previous: Optional[List[torch.Tensor]],
+    ) -> Optional[float]:
+        params = list(parameters)
+        if previous is None or not params:
+            return None
+        if len(params) != len(previous):
+            raise RuntimeError(
+                "Parameter count changed while computing epoch L2 delta: "
+                f"current={len(params)} previous={len(previous)}"
+            )
+        total_sq = 0.0
+        for param, old in zip(params, previous):
+            current = param.detach().cpu().float()
+            if current.shape != old.shape:
+                raise RuntimeError(
+                    "Parameter shape changed while computing epoch L2 delta: "
+                    f"current={tuple(current.shape)} previous={tuple(old.shape)}"
+                )
+            diff = current - old
+            total_sq += float(torch.dot(diff.reshape(-1), diff.reshape(-1)).item())
+        return math.sqrt(max(0.0, total_sq))
+
+    def _ensure_parameter_delta_baseline(self) -> None:
+        if not self.is_main_rank:
+            return
+        if self._previous_theta_snapshot is None:
+            self._previous_theta_snapshot = self._parameter_snapshot(
+                self._classifier_module.parameters()
+            )
+        if self._previous_omega_snapshot is None:
+            omega_params = list(self.adversary_delta_parameters())
+            self._previous_omega_snapshot = self._parameter_snapshot(omega_params)
+
+    def _finish_parameter_delta_epoch(self) -> Dict[str, float]:
+        if not self.is_main_rank:
+            return {}
+        self._ensure_parameter_delta_baseline()
+        theta_params = list(self._classifier_module.parameters())
+        omega_params = list(self.adversary_delta_parameters())
+        theta_delta = self._parameter_l2_delta(
+            theta_params, self._previous_theta_snapshot
+        )
+        omega_delta = self._parameter_l2_delta(
+            omega_params, self._previous_omega_snapshot
+        )
+        self._previous_theta_snapshot = self._parameter_snapshot(theta_params)
+        self._previous_omega_snapshot = self._parameter_snapshot(omega_params)
+
+        extras: Dict[str, float] = {}
+        if theta_delta is not None:
+            extras["theta_l2_delta"] = float(theta_delta)
+        if omega_delta is not None:
+            extras["omega_l2_delta"] = float(omega_delta)
+        return extras
 
     def _freeze_batchnorm_layers(self) -> None:
         if not bool(getattr(self.config, "freeze_batchnorm", False)):
@@ -640,6 +745,8 @@ class BaseAdvTrainer:
             }
             history.append(entry)
             self._print_epoch_summary(entry, total_epochs)
+            if self.epoch_end_callback is not None:
+                self.epoch_end_callback(entry)
             self._save_epoch_checkpoint(
                 warmup_idx,
                 phase="warmup",
@@ -679,6 +786,8 @@ class BaseAdvTrainer:
             }
             history.append(entry)
             self._print_epoch_summary(entry, total_epochs)
+            if self.epoch_end_callback is not None:
+                self.epoch_end_callback(entry)
             self._maybe_checkpoint_best(epoch, evaluations.get("input_pgd_acc"))
             self._save_epoch_checkpoint(
                 epoch,
@@ -723,6 +832,8 @@ class BaseAdvTrainer:
             }
             history.append(entry)
             self._print_epoch_summary(entry, total_epochs)
+            if self.epoch_end_callback is not None:
+                self.epoch_end_callback(entry)
             self._maybe_checkpoint_best(epoch, evaluations.get("input_pgd_acc"))
             self._save_epoch_checkpoint(
                 epoch,
@@ -746,6 +857,7 @@ class BaseAdvTrainer:
         frozen_map_steps = max(
             1, int(getattr(cfg, "frozen_adversary_map_steps", 1) or 1)
         )
+        self._ensure_parameter_delta_baseline()
         self._reset_inner_profile_epoch()
         total_loss = 0.0
         total_acc = 0.0
@@ -868,6 +980,7 @@ class BaseAdvTrainer:
             extras["bn_online_refresh_seconds"] = float(total_bn_online_seconds)
             extras["bn_online_refresh_batches"] = float(total_bn_online_batches)
             extras["bn_online_refresh_samples"] = float(total_bn_online_samples)
+        extras.update(self._finish_parameter_delta_epoch())
         extras.update(
             self._inner_profile_epoch_extras(
                 train_batches_total=total_batches,
@@ -1043,6 +1156,10 @@ class BaseAdvTrainer:
             parts.append("pgd_robust n/a")
         if epoch_seconds is not None:
             parts.append(f"t={epoch_seconds:.2f}s")
+        if entry.get("theta_l2_delta") is not None:
+            parts.append(f"dtheta_l2 {float(entry['theta_l2_delta']):.4e}")
+        if entry.get("omega_l2_delta") is not None:
+            parts.append(f"domega_l2 {float(entry['omega_l2_delta']):.4e}")
         if entry.get("profile_batches"):
             if str(getattr(self.config, "npf_inner_optimizer", "")).lower() == "muon":
                 parts.append(

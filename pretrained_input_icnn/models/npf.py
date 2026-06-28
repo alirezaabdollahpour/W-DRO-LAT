@@ -47,6 +47,21 @@ def _npf_softplus_inverse(y: float) -> float:
     return float(math.log(math.expm1(y)))
 
 
+def _npf_quadratic_factor_init(coefficient: float) -> float:
+    """Return a factor whose square gives the requested quadratic scale.
+
+    NPFQuadraticForm stores factors δ and A but the potential uses δ² and
+    AᵀA. Treating init_eps as the factor itself makes a requested 1e-4
+    quadratic start at 1e-8 and gives q_out.delta_raw nearly zero gradient.
+    Initialising the factors at sqrt(init_eps) keeps the transport map close
+    to identity while leaving the final diagonal quadratic trainable.
+    """
+    coefficient = float(coefficient)
+    if coefficient <= 0.0:
+        return 0.0
+    return math.sqrt(coefficient)
+
+
 class NPFNonNegativeDense(nn.Module):
     """Non-negative linear layer with Hoedt & Klambauer negative bias init."""
 
@@ -97,7 +112,8 @@ class NPFQuadraticForm(nn.Module):
         self.rank = int(rank)
         self.init_eps = float(init_eps)
         if self.init_eps > 0.0:
-            delta_raw_init = _npf_softplus_inverse(self.init_eps)
+            factor_init = _npf_quadratic_factor_init(self.init_eps)
+            delta_raw_init = _npf_softplus_inverse(factor_init)
         else:
             delta_raw_init = _npf_softplus_inverse(delta_init)
         self.delta_raw = nn.Parameter(
@@ -105,7 +121,9 @@ class NPFQuadraticForm(nn.Module):
         )
         if self.rank > 0:
             if self.init_eps > 0.0:
-                std = self.init_eps / math.sqrt(max(self.rank * self.input_dim, 1))
+                std = _npf_quadratic_factor_init(self.init_eps) / math.sqrt(
+                    max(self.rank * self.input_dim, 1)
+                )
                 self.A = nn.Parameter(
                     std * torch.randn(self.num_forms, self.rank, self.input_dim)
                 )
@@ -177,7 +195,11 @@ class NPFInputConvexPotential(nn.Module):
         self.strong_convexity = float(strong_convexity)
 
         if self.trainable_outer_quadratic:
-            outer_delta_init = self.init_eps if self.strong_convexity > 0.0 else 1.0
+            outer_delta_init = (
+                _npf_quadratic_factor_init(self.init_eps)
+                if self.strong_convexity > 0.0
+                else 1.0
+            )
         else:
             outer_delta_init = 0.0
         outer_delta_raw = torch.full(
@@ -190,7 +212,9 @@ class NPFInputConvexPotential(nn.Module):
 
         if self.trainable_outer_quadratic and self.outer_rank > 0:
             if self.init_eps > 0.0:
-                std = self.init_eps / math.sqrt(max(self.outer_rank * self.input_dim, 1))
+                std = _npf_quadratic_factor_init(self.init_eps) / math.sqrt(
+                    max(self.outer_rank * self.input_dim, 1)
+                )
                 self.outer_A = nn.Parameter(std * torch.randn(self.outer_rank, self.input_dim))
             else:
                 self.outer_A = nn.Parameter(torch.zeros(self.outer_rank, self.input_dim))
@@ -241,16 +265,17 @@ class NPFInputConvexPotential(nn.Module):
     def init_as_identity(self):
         """Force ∇ψ(z) ≈ z at t=0 (live-at-init when init_eps > 0)."""
         eps = self.init_eps
-        delta_raw_init = _npf_softplus_inverse(eps) if eps > 0.0 else -1e3
+        factor_init = _npf_quadratic_factor_init(eps) if eps > 0.0 else 0.0
+        delta_raw_init = _npf_softplus_inverse(factor_init) if eps > 0.0 else -1e3
         with torch.no_grad():
             if self.trainable_outer_quadratic:
-                outer_delta_init = eps if self.strong_convexity > 0.0 else 1.0
+                outer_delta_init = factor_init if self.strong_convexity > 0.0 else 1.0
             else:
                 outer_delta_init = 0.0
             self.outer_delta_raw.fill_(_npf_softplus_inverse(outer_delta_init))
             if self.outer_A is not None:
                 if eps > 0.0:
-                    std = eps / math.sqrt(max(self.outer_rank * self.input_dim, 1))
+                    std = factor_init / math.sqrt(max(self.outer_rank * self.input_dim, 1))
                     self.outer_A.normal_(0.0, std)
                 else:
                     self.outer_A.zero_()
@@ -263,7 +288,7 @@ class NPFInputConvexPotential(nn.Module):
                 q.delta_raw.fill_(delta_raw_init)
                 if q.A is not None:
                     if eps > 0.0:
-                        std = eps / math.sqrt(max(q.rank * q.input_dim, 1))
+                        std = factor_init / math.sqrt(max(q.rank * q.input_dim, 1))
                         q.A.normal_(0.0, std)
                     else:
                         q.A.zero_()

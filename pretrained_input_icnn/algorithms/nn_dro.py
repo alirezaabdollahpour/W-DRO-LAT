@@ -88,7 +88,10 @@ class NNDROTrainer(BaseAdvTrainer):
                 logits = self._classifier_module(x_adv)
                 primary = adversary_loss_per_sample(logits, y, use_margin=use_margin)
                 cost = self._transport_cost(x_adv, x)
-                obj = self._masked_mean(primary - lam * cost, attack_mask)
+                obj = self._shared_adversary_masked_mean(
+                    primary - lam * cost,
+                    attack_mask,
+                )
                 return torch.nan_to_num(obj, nan=-1e12, posinf=-1e12, neginf=-1e12)
 
             # Same DDP reducers as NPF: ω is shared across ranks, so each
@@ -108,6 +111,7 @@ class NNDROTrainer(BaseAdvTrainer):
                     bb_state,
                     reduce_grad_fn=reduce_grad_fn,
                     reduce_scalar_fn=reduce_scalar_fn,
+                    max_grad_norm=getattr(cfg, "parametric_bb_max_grad_norm", 1.0),
                 )
         if not reset_bb_each_batch:
             self.bb_state = bb_state
