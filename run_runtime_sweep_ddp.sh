@@ -231,7 +231,7 @@ DUAL_MALA=${DUAL_MALA:-1}
 DUAL_BURN_IN=${DUAL_BURN_IN:-0}
 DUAL_SAMPLE_LEVEL=${DUAL_SAMPLE_LEVEL:-3}  # m=8 — keeps wallclock comparable
 
-# ---- NPF last-quadratic-only architecture knobs ----
+# ---- NPF architecture knobs ----
 RUN_ONLY_ALGO=${RUN_ONLY_ALGO:-}
 NPF_INNER_OPTIMIZER=${NPF_INNER_OPTIMIZER:-bb_armijo}  # bb_armijo | muon
 NPF_MUON_LR=${NPF_MUON_LR:-2e-4}
@@ -247,7 +247,15 @@ NPF_MUON_ADAM_BETA1=${NPF_MUON_ADAM_BETA1:-0.9}
 NPF_MUON_ADAM_BETA2=${NPF_MUON_ADAM_BETA2:-0.999}
 NPF_MUON_ADAM_EPS=${NPF_MUON_ADAM_EPS:-1e-8}
 NPF_MUON_MAX_GRAD_NORM=${NPF_MUON_MAX_GRAD_NORM:-0.0}
+NPF_HIDDEN=${NPF_HIDDEN:-1024 512 512 256 128 64}
+NPF_OUTER_RANK=${NPF_OUTER_RANK:-8}
+NPF_INNER_RANK=${NPF_INNER_RANK:-2}
+NPF_ACTIVATION=${NPF_ACTIVATION:-softplus}
+NPF_SOFTPLUS_BETA=${NPF_SOFTPLUS_BETA:-10.0}
+NPF_INIT_EPS=${NPF_INIT_EPS:-1e-4}
+NPF_STRONG_CONVEXITY=${NPF_STRONG_CONVEXITY:-1.0}
 NPF_LASTQUAD_HIDDEN=${NPF_LASTQUAD_HIDDEN:-1024 512 512 256 128 64}
+NPF_LASTQUAD_OUTPUT_RANK=${NPF_LASTQUAD_OUTPUT_RANK:-0}
 # NPF_LASTQUAD_HIDDEN=${NPF_LASTQUAD_HIDDEN:-128 128 128 128}
 NPF_LASTQUAD_ACTIVATION=${NPF_LASTQUAD_ACTIVATION:-softplus}
 NPF_LASTQUAD_ELU_ALPHA=${NPF_LASTQUAD_ELU_ALPHA:-1.0}
@@ -289,7 +297,7 @@ fi
 DEFAULT_ALGOS=(npf_lastquad)
 # Full runtime sweep disabled for the current NPF-LastQuad launch:
 # DEFAULT_ALGOS=(npf nn_dro madry wrm wfr dual new_ppa)
-KNOWN_ALGOS=(npf_lastquad)
+KNOWN_ALGOS=(npf npf_lastquad)
 # KNOWN_ALGOS=(npf npf_lastquad nn_dro madry wrm wfr dual new_ppa)
 
 is_known_algo() {
@@ -402,8 +410,15 @@ if [[ " ${ACTIVE_ALGOS[*]} " == *" dual "* ]]; then
 fi
 if [[ " ${ACTIVE_ALGOS[*]} " == *" npf_lastquad "* ]]; then
     echo "  NPF-LastQuad: hidden=${NPF_LASTQUAD_HIDDEN}"
+    echo "                output_rank=${NPF_LASTQUAD_OUTPUT_RANK}"
     echo "                activation=${NPF_LASTQUAD_ACTIVATION} beta=${NPF_LASTQUAD_SOFTPLUS_BETA}"
     echo "                init_eps=${NPF_LASTQUAD_INIT_EPS} strong_convexity=${NPF_LASTQUAD_STRONG_CONVEXITY}"
+fi
+if [[ " ${ACTIVE_ALGOS[*]} " == *" npf "* ]]; then
+    echo "  NPF:          hidden=${NPF_HIDDEN}"
+    echo "                outer_rank=${NPF_OUTER_RANK} inner_rank=${NPF_INNER_RANK}"
+    echo "                activation=${NPF_ACTIVATION} beta=${NPF_SOFTPLUS_BETA}"
+    echo "                init_eps=${NPF_INIT_EPS} strong_convexity=${NPF_STRONG_CONVEXITY}"
 fi
 echo "  Results: ${RESULTS_DIR}"
 echo "  Started: $(date)"
@@ -434,14 +449,15 @@ algo_args() {
     case "$algo" in
         npf)
             echo "--omega-steps-per-batch ${k} \
-                --npf-hidden 1024 512 512 256 128 64 \
-                --npf-outer-rank 8 --npf-inner-rank 2 \
-                --npf-activation softplus --npf-softplus-beta 10.0 \
-                --npf-init-eps 1e-4 --npf-strong-convexity 1.0"
+                --npf-hidden ${NPF_HIDDEN} \
+                --npf-outer-rank ${NPF_OUTER_RANK} --npf-inner-rank ${NPF_INNER_RANK} \
+                --npf-activation ${NPF_ACTIVATION} --npf-softplus-beta ${NPF_SOFTPLUS_BETA} \
+                --npf-init-eps ${NPF_INIT_EPS} --npf-strong-convexity ${NPF_STRONG_CONVEXITY}"
             ;;
         npf_lastquad)
             echo "--omega-steps-per-batch ${k} \
                 --npf-lastquad-hidden ${NPF_LASTQUAD_HIDDEN} \
+                --npf-lastquad-output-rank ${NPF_LASTQUAD_OUTPUT_RANK} \
                 --npf-lastquad-activation ${NPF_LASTQUAD_ACTIVATION} \
                 --npf-lastquad-elu-alpha ${NPF_LASTQUAD_ELU_ALPHA} \
                 --npf-lastquad-softplus-beta ${NPF_LASTQUAD_SOFTPLUS_BETA} \
@@ -592,7 +608,15 @@ run_algo() {
             printf "NPF_MUON_FALLBACK_LR=%q\n" "$NPF_MUON_FALLBACK_LR"
             printf "NPF_MUON_FALLBACK_WEIGHT_DECAY=%q\n" "$NPF_MUON_FALLBACK_WEIGHT_DECAY"
             printf "NPF_MUON_MAX_GRAD_NORM=%q\n" "$NPF_MUON_MAX_GRAD_NORM"
+            printf "NPF_HIDDEN=%q\n" "$NPF_HIDDEN"
+            printf "NPF_OUTER_RANK=%q\n" "$NPF_OUTER_RANK"
+            printf "NPF_INNER_RANK=%q\n" "$NPF_INNER_RANK"
+            printf "NPF_ACTIVATION=%q\n" "$NPF_ACTIVATION"
+            printf "NPF_SOFTPLUS_BETA=%q\n" "$NPF_SOFTPLUS_BETA"
+            printf "NPF_INIT_EPS=%q\n" "$NPF_INIT_EPS"
+            printf "NPF_STRONG_CONVEXITY=%q\n" "$NPF_STRONG_CONVEXITY"
             printf "NPF_LASTQUAD_HIDDEN=%q\n" "$NPF_LASTQUAD_HIDDEN"
+            printf "NPF_LASTQUAD_OUTPUT_RANK=%q\n" "$NPF_LASTQUAD_OUTPUT_RANK"
             printf "NPF_LASTQUAD_ACTIVATION=%q\n" "$NPF_LASTQUAD_ACTIVATION"
             printf "NPF_LASTQUAD_SOFTPLUS_BETA=%q\n" "$NPF_LASTQUAD_SOFTPLUS_BETA"
             printf "NPF_LASTQUAD_INIT_EPS=%q\n" "$NPF_LASTQUAD_INIT_EPS"

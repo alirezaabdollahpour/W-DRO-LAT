@@ -77,6 +77,8 @@ PROFILE_INNER_BATCHES="${PROFILE_INNER_BATCHES:-0}"
 SKIP_PGD_DURING_TRAIN="${SKIP_PGD_DURING_TRAIN:-0}"
 BENCHMARK_MODE="${BENCHMARK_MODE:-0}"
 EPOCHS_ICNN_PRETRAIN="${EPOCHS_ICNN_PRETRAIN:-0}"
+NPF_HIDDEN="${NPF_HIDDEN:-1024 512 512 256 128 64}"
+read -r -a NPF_HIDDEN_ARGS <<< "${NPF_HIDDEN}"
 NPF_LASTQUAD_HIDDEN="${NPF_LASTQUAD_HIDDEN:-1024 512 512 256 128 64}"
 read -r -a NPF_LASTQUAD_HIDDEN_ARGS <<< "${NPF_LASTQUAD_HIDDEN}"
 
@@ -184,7 +186,7 @@ case "${ALGORITHM}" in
   npf)
     EXTRA_ARGS=(
       --omega-steps-per-batch "${OMEGA_STEPS}"
-      --npf-hidden 1024 512 512 256 128 64
+      --npf-hidden "${NPF_HIDDEN_ARGS[@]}"
       --npf-outer-rank "${NPF_OUTER_RANK:-8}"
       --npf-inner-rank "${NPF_INNER_RANK:-2}"
       --npf-activation "${NPF_ACTIVATION:-softplus}"
@@ -203,6 +205,7 @@ case "${ALGORITHM}" in
     EXTRA_ARGS=(
       --omega-steps-per-batch "${OMEGA_STEPS}"
       --npf-lastquad-hidden "${NPF_LASTQUAD_HIDDEN_ARGS[@]}"
+      --npf-lastquad-output-rank "${NPF_LASTQUAD_OUTPUT_RANK:-0}"
       --npf-lastquad-activation "${NPF_LASTQUAD_ACTIVATION:-${NPF_ACTIVATION:-softplus}}"
       --npf-lastquad-elu-alpha "${NPF_LASTQUAD_ELU_ALPHA:-1.0}"
       --npf-lastquad-softplus-beta "${NPF_LASTQUAD_SOFTPLUS_BETA:-${NPF_SOFTPLUS_BETA:-10.0}}"

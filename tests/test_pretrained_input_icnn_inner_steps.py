@@ -17,7 +17,7 @@ from pretrained_input_icnn.algorithms.base import BaseAdvTrainer
 from pretrained_input_icnn.config import TrainConfig, build_arg_parser, config_from_args
 from pretrained_input_icnn.distributed import DistInfo
 from pretrained_input_icnn.models.classifier import SimpleViTCIFAR, load_pretrained_classifier
-from pretrained_input_icnn.models.npf import npf_T_omega
+from pretrained_input_icnn.models.npf import NPFInputConvexPotential, npf_T_omega
 from pretrained_input_icnn.utils import (
     BBArmijoState,
     bb_armijo_step_params,
@@ -268,6 +268,70 @@ def test_npf_lastquad_init_eps_keeps_final_quadratic_trainable():
     assert grad.norm().item() > 1e-7
 
 
+def test_npf_lastquad_can_use_learnable_low_rank_output_quadratic():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    classifier = TinyClassifier().to(device)
+    cfg = replace(
+        _config("npf_lastquad"),
+        npf_lastquad_hidden=(4,),
+        npf_lastquad_output_rank=2,
+        npf_lastquad_init_eps=1e-4,
+    )
+    loader = _loader()
+    trainer = ALGORITHMS["npf_lastquad"](
+        classifier=classifier,
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=cfg,
+    )
+
+    assert not trainer.psi_omega.use_hidden_quadratics
+    assert len(trainer.psi_omega.q_blocks) == 0
+    assert trainer.psi_omega.q_out.A is not None
+    assert trainer.psi_omega.q_out.A.shape == (1, 2, trainer.input_dim)
+
+    x = torch.randn(2, 3, 32, 32, device=device)
+    x_adv = npf_T_omega(x, trainer.psi_omega, create_graph=True)
+    loss = x_adv.pow(2).mean()
+    grad = torch.autograd.grad(loss, trainer.psi_omega.q_out.A)[0]
+
+    assert torch.isfinite(grad).all()
+    assert grad.norm().item() > 0.0
+
+
+def test_full_npf_output_low_rank_init_uses_quadratic_factor_scale():
+    torch.manual_seed(123)
+    init_eps = 1e-4
+    model = NPFInputConvexPotential(
+        input_dim=8,
+        hidden_sizes=(4,),
+        outer_rank=2,
+        inner_rank=2,
+        quadratic_mode="all_layers",
+        trainable_outer_quadratic=True,
+        init_eps=init_eps,
+    )
+    model.init_as_identity()
+
+    expected_std = math.sqrt(init_eps) / math.sqrt(2 * 8)
+    actual_std = model.q_out.A.detach().float().std().item()
+
+    assert actual_std == pytest.approx(expected_std, rel=0.75)
+    assert actual_std > 10.0 * init_eps / math.sqrt(2 * 8)
+
+
+def test_npf_lastquad_output_rank_cli_is_forwarded_to_config():
+    parser = build_arg_parser()
+
+    cfg = config_from_args(
+        parser.parse_args(["--npf-lastquad-output-rank", "4"])
+    )
+
+    assert cfg.npf_lastquad_output_rank == 4
+
+
 def test_bb_ascent_wrong_curvature_falls_back_to_alpha_min():
     state = BBArmijoState.create(
         alpha0=0.1,
@@ -308,6 +372,31 @@ def test_bb_armijo_clips_parametric_gradient_before_step():
 
     assert grad_norm == pytest.approx(1.0)
     assert param.detach().item() == pytest.approx(1.0)
+
+
+def test_bb_armijo_rejection_refreshes_history_like_legacy_icnn():
+    param = nn.Parameter(torch.tensor([0.0]))
+    state = BBArmijoState.create(
+        alpha0=1.0,
+        alpha_min=1.0,
+        alpha_max=1.0,
+        ls_c=0.1,
+        ls_max_steps=1,
+        reject_on_armijo_failure=True,
+    )
+
+    def objective(create_graph: bool) -> torch.Tensor:
+        del create_graph
+        return -param.pow(2).sum() + param.sum()
+
+    _, new_state, _, grad_norm = bb_armijo_step_params([param], objective, state)
+
+    assert param.detach().item() == pytest.approx(0.0)
+    assert grad_norm == pytest.approx(1.0)
+    assert new_state.prev_params_vec is not None
+    assert new_state.prev_grad_vec is not None
+    assert torch.allclose(new_state.prev_params_vec, torch.tensor([0.0]))
+    assert torch.allclose(new_state.prev_grad_vec, torch.tensor([1.0]))
 
 
 def test_shared_adversary_masked_mean_uses_global_count_for_ddp(monkeypatch):

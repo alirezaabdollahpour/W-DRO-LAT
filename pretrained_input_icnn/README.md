@@ -36,11 +36,16 @@ The current refactored NPF path includes the following fixes relative to the ear
 | Area | Fix | Why it matters |
 | --- | --- | --- |
 | NPF LastQuad initialization | `NPF_LASTQUAD_INIT_EPS` now represents the quadratic coefficient scale; the trainable quadratic factor is initialized at `sqrt(init_eps)`. | The old factor initialization made the final quadratic contribution scale like `init_eps^2`; with `1e-4`, the actual coefficient was `1e-8` and `q_out.delta_raw` barely moved. |
+| Full NPF output low-rank initialization | The full-NPF `q_out.A` factor now uses `sqrt(init_eps)` inside identity initialization. | The output low-rank quadratic now starts at the same intended coefficient scale as the diagonal and hidden quadratic factors. |
+| LastQuad output rank | `NPF_LASTQUAD_OUTPUT_RANK` / `--npf-lastquad-output-rank` controls a learnable low-rank factor in the final LastQuad quadratic. | Rank `0` keeps the old diagonal-only LastQuad; rank `>0` keeps hidden quadratics disabled but lets the final output block learn correlated transport directions. |
 | BB wrong-curvature fallback | When the ascent BB secant has the wrong curvature sign, the step proposal falls back to `BB_ALPHA_MIN` instead of reusing a stale `alpha_prev`. | Reusing a stale large step can keep forcing unstable adversary updates after the stochastic local objective becomes noisy or locally convex. |
+| BB rejection history | Rejected BB+Armijo trials restore parameters but still refresh BB history with the current parameters and gradient. | This matches the legacy ICNN loop and avoids repeatedly proposing from stale secant information after a rejected trial. |
 | BB adversary gradient clipping | Shared parametric BB adversaries use `PARAMETRIC_BB_MAX_GRAD_NORM=1.0` by default. | This restores the legacy ICNN behavior (`clip_grad_norm_(icnn.parameters(), max_norm=1.0)`) before the BB/Armijo update. |
 | Clean-correct mask under DDP | NPF and NN-DRO now optimize the globally masked objective by reducing the clean-correct count across ranks. | The old DDP path averaged each rank's masked mean equally, biasing the adversary gradient when ranks had different numbers of clean-correct samples. |
 | Epoch diagnostics | `theta_l2_delta` and `omega_l2_delta` are printed each epoch and written to `epoch_log.csv`. | Tracks `||theta_t - theta_{t-1}||_2` for the classifier and `||omega_t - omega_{t-1}||_2` for the NPF adversary. |
 | Interrupted jobs | Epoch CSV rows are appended at epoch end, not only after `fit()` returns. | Completed epochs remain analyzable even if the cluster job is interrupted later. |
+
+For full NPF runs through `run_runtime_sweep_ddp.sh`, use `RUN_ONLY_ALGO=npf`. The DDP launcher forwards the full-NPF architecture knobs `NPF_HIDDEN`, `NPF_OUTER_RANK`, `NPF_INNER_RANK`, `NPF_ACTIVATION`, `NPF_SOFTPLUS_BETA`, `NPF_INIT_EPS`, and `NPF_STRONG_CONVEXITY`.
 
 The ResNet loader unwraps `R2.pth` using the shared checkpoint priority in `utils.unwrap_state_dict`. For the current `R2.pth`, whose top-level keys are `last`, `best`, `swa_last`, and `swa_best`, the loaded classifier branch is `last`.
 
@@ -222,6 +227,61 @@ python csub.py -n lastquad-lam30-logsum-bb-k10-lr0p01-fix -g 2 -t 1d --train --l
     FROZEN_ADVERSARY_MAP_STEPS=1 \
     OUTPUT_FOLDER_NAME=BB_lam30_legacyfix_logsum_lr0p01_K10_clip1_pgdce_seed1 \
     bash run_runtime_sweep_ddp.sh 0 1 2 10 50"
+```
+
+## Full NPF K40 low-LR fixed-lambda command
+
+Use this command for full `npf`, not `npf_lastquad`. `RUN_ONLY_ALGO=npf` is required because the DDP runtime script otherwise defaults to the LastQuad-only active algorithm list. The rank knobs are explicit:
+
+| Setting | Value | Meaning |
+| --- | --- | --- |
+| `NPF_OUTER_RANK` | `8` | Rank of the trainable global PSD quadratic term. |
+| `NPF_INNER_RANK` | `2` | Rank of the hidden/output quadratic injections. |
+
+```bash
+python csub.py -n npf-lam30-logsum-bb-k40-lr0p01-512-r8-r2 -g 2 -t 1d --train --large-shm --node-type a100-40g \
+  --command "cd /mloscratch/homes/aabdolla/LAT && \
+    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
+    RUN_ONLY_ALGO=npf \
+    RUN_NAME=npf_lam30_logsum_lr0p01_K40_bb_legacyfix_clip1_pgdce_seed1_512_r8_r2 \
+    LR_THETA=0.01 \
+    PENALTY_LAMBDA=30 \
+    TRANSPORT_COST=normalized_mse \
+    EPOCHS_ICNN_PRETRAIN=0 \
+    LAMBDA_SCHEDULE='' \
+    LAMBDA_STAGE_EPOCHS=0 \
+    ATTACK_CLEAN_CORRECT_ONLY=1 \
+    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
+    FREEZE_BATCHNORM=0 \
+    FREEZE_BATCHNORM_AFFINE=0 \
+    BATCHNORM_ONLINE_REFRESH=0 \
+    RECALIBRATE_BATCHNORM=0 \
+    USE_MARGIN_LOSS=1 \
+    COMMON_BATCH=512 \
+    NPF_HIDDEN='512 512 256' \
+    NPF_OUTER_RANK=8 \
+    NPF_INNER_RANK=2 \
+    NPF_ACTIVATION=softplus \
+    NPF_SOFTPLUS_BETA=20.0 \
+    NPF_INIT_EPS=1e-4 \
+    NPF_STRONG_CONVEXITY=1.0 \
+    NPF_INNER_OPTIMIZER=bb_armijo \
+    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
+    BB_ALPHA0=5e-4 \
+    BB_ALPHA_MIN=1e-6 \
+    BB_ALPHA_MAX=1.0 \
+    BB_LS_C=0.1 \
+    BB_LS_SHRINK=0.5 \
+    BB_LS_MAX_STEPS=10 \
+    EVAL_PGD_SAMPLES=2000 \
+    INPUT_PGD_LOSS=ce \
+    INP_STEPS=20 \
+    INP_RESTARTS=5 \
+    OMEGA_STEPS=40 \
+    FROZEN_ADVERSARY_EPOCHS=0 \
+    FROZEN_ADVERSARY_MAP_STEPS=1 \
+    OUTPUT_FOLDER_NAME=NPF_lam30_legacyfix_logsum_lr0p01_K40_clip1_pgdce_seed1_512_r8_r2 \
+    bash run_runtime_sweep_ddp.sh 0 1 2 40 50"
 ```
 
 ### Exact legacy-script comparison knobs

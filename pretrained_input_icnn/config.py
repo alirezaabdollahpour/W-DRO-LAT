@@ -178,9 +178,11 @@ class TrainConfig:
     # --- NPF last-quadratic-only variant ---
     # This shares the NPF trainer, selectable NPF inner optimizer, LogNormal
     # non-negative layers, and identity initialization. Its potential removes
-    # all hidden quadratic injections and keeps only q_out with rank 0
-    # (diagonal).
+    # all hidden quadratic injections and keeps q_out as the only trainable
+    # quadratic block. The default output rank 0 is diagonal-only; setting
+    # npf_lastquad_output_rank > 0 adds a learnable low-rank factor to q_out.
     npf_lastquad_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
+    npf_lastquad_output_rank: int = 0
     npf_lastquad_activation: str = "softplus"
     npf_lastquad_elu_alpha: float = 1.0
     npf_lastquad_softplus_beta: float = 10.0
@@ -710,6 +712,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["elu", "softplus", "relu"],
     )
     npf_lq.add_argument("--npf-lastquad-elu-alpha", type=float, default=1.0)
+    npf_lq.add_argument(
+        "--npf-lastquad-output-rank",
+        type=int,
+        default=0,
+        help=(
+            "Rank of the learnable low-rank quadratic factor in the final "
+            "LastQuad output block. 0 keeps the legacy diagonal-only LastQuad."
+        ),
+    )
     npf_lq.add_argument("--npf-lastquad-softplus-beta", type=float, default=10.0)
     npf_lq.add_argument("--npf-lastquad-init-eps", type=float, default=1e-2)
     npf_lq.add_argument("--npf-lastquad-strong-convexity", type=float, default=1.0)
@@ -982,6 +993,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "npf_muon_adam_eps": "npf_muon_adam_eps",
         "npf_muon_max_grad_norm": "npf_muon_max_grad_norm",
         "npf_lastquad_hidden": "npf_lastquad_hidden",
+        "npf_lastquad_output_rank": "npf_lastquad_output_rank",
         "npf_lastquad_activation": "npf_lastquad_activation",
         "npf_lastquad_elu_alpha": "npf_lastquad_elu_alpha",
         "npf_lastquad_softplus_beta": "npf_lastquad_softplus_beta",

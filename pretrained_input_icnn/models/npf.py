@@ -15,7 +15,7 @@ gradients with the same shape as the original input.
 from __future__ import annotations
 
 import math
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -161,6 +161,7 @@ class NPFInputConvexPotential(nn.Module):
         hidden_sizes: Sequence[int],
         outer_rank: int = 4,
         inner_rank: int = 1,
+        output_rank: Optional[int] = None,
         quadratic_mode: str = "all_layers",
         trainable_outer_quadratic: bool = True,
         activation: str = "elu",
@@ -184,9 +185,13 @@ class NPFInputConvexPotential(nn.Module):
                 f"Use one of {sorted(valid_modes)}."
             )
         self.use_hidden_quadratics = self.quadratic_mode == "all_layers"
-        self.output_rank = (
-            0 if self.quadratic_mode == "last_layer_diagonal" else self.inner_rank
-        )
+        if output_rank is None:
+            output_rank = (
+                0 if self.quadratic_mode == "last_layer_diagonal" else self.inner_rank
+            )
+        self.output_rank = int(output_rank)
+        if self.output_rank < 0:
+            raise ValueError(f"output_rank must be non-negative; got {output_rank}.")
         self.trainable_outer_quadratic = bool(trainable_outer_quadratic)
         self.activation = activation.lower()
         self.elu_alpha = float(elu_alpha)
@@ -295,7 +300,9 @@ class NPFInputConvexPotential(nn.Module):
             self.q_out.delta_raw.fill_(delta_raw_init)
             if self.q_out.A is not None:
                 if eps > 0.0:
-                    std = eps / math.sqrt(max(self.q_out.rank * self.q_out.input_dim, 1))
+                    std = factor_init / math.sqrt(
+                        max(self.q_out.rank * self.q_out.input_dim, 1)
+                    )
                     self.q_out.A.normal_(0.0, std)
                 else:
                     self.q_out.A.zero_()

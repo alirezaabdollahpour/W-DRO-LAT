@@ -255,7 +255,10 @@ def bb_armijo_step_params(
         with _profile_time(profile, "bb_apply_s"):
             with torch.no_grad():
                 nn_utils.vector_to_parameters(params_vec, params)
-            new_state = bb_state
+            # Legacy ICNN BB+Armijo refreshed the secant history even when a
+            # trial was rejected. Keeping stale history can repeatedly propose
+            # the same bad step on noisy minibatch objectives.
+            new_state = bb_state.update_history(params_vec, grad_vec, bb_state.alpha_prev)
     return params, new_state, f_val_float, grad_norm
 
 
