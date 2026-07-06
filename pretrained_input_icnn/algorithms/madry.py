@@ -104,7 +104,10 @@ class MadryTrainer(BaseAdvTrainer):
         return to_normalized(best_adv_pix).detach()
 
     def step(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        with frozen_module(self._classifier_module):
+        with frozen_module(
+            self._classifier_module,
+            eval_mode=self._adversary_classifier_eval_mode(),
+        ):
             x_adv = self._pgd_attack(x, y)
             with torch.no_grad():
                 ce = F.cross_entropy(self._classifier_module(x_adv), y).item()

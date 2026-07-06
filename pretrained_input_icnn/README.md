@@ -1,434 +1,251 @@
-# pretrained_input_icnn
+# pretrained_input_icnn — Wasserstein-DRO adversarial training with an NPF-ICNN transport adversary
 
-Input-space adversarial training for CIFAR-10 using a pretrained classifier and a learned input transport adversary.
+Input-space adversarial training for CIFAR-10: a pretrained PreActResNet-18
+(`ResNet_checkpoints/R2.pth`, 87.3% clean accuracy) is made robust to
+pixel-space L2 PGD by solving a Wasserstein-DRO minimax problem whose inner
+maximizer is a **learned input-convex transport map** rather than per-sample
+PGD. The adversary is an OTT-style NPF ICNN potential ψ_ω; the transport is
+its gradient map
 
-## Critical semantic defaults
-
-For runs that should preserve the legacy `pretrained_INPUT_icnn.py` training semantics, keep these controls enabled:
-
-```bash
-TRANSPORT_COST=normalized_mse
-ATTACK_CLEAN_CORRECT_ONLY=1
-RESET_PARAMETRIC_BB_EACH_BATCH=1
-PARAMETRIC_BB_MAX_GRAD_NORM=1.0
+```
+T_ω(x) = ∇_x ψ_ω(x)
 ```
 
-These are now package defaults, and `run_runtime_sweep_ddp.sh` forwards `TRANSPORT_COST=normalized_mse` as `--transport-cost normalized_mse`. The stable-policy diagnostic command below separately sets `LR_THETA=0.1`; newer low-LR ablations should encode their own learning rate in `RUN_NAME` and `OUTPUT_FOLDER_NAME`.
+trained by BB+Armijo ascent on the penalized objective
 
-`TRANSPORT_COST=normalized_mse` computes the per-sample mean squared distance in normalized CIFAR coordinates:
-
-```python
-((x_adv_norm - x_norm) ** 2).reshape(batch, -1).mean(dim=1)
+```
+max_ω  E[ margin(f_θ(T_ω(x)), y) − λ · cost(T_ω(x), x) ],    λ = 30,
+cost(x', x) = mean((x'_norm − x_norm)²)      (normalized-MSE, legacy convention)
 ```
 
-Do not use `TRANSPORT_COST=pixel_l2_squared` unless you intentionally want the newer pixel-space squared-L2 ablation. With the same `PENALTY_LAMBDA`, that changes the scale of the inner DRO penalty substantially.
+with one classifier SGD step per batch on the transported samples.
 
-`ATTACK_CLEAN_CORRECT_ONLY=1` matches the legacy outer loop: the learned transport is trained and applied only on examples that the clean classifier currently gets right; clean-misclassified examples stay at the clean input for the classifier update.
+The package supersedes the single-file `pretrained_INPUT_icnn_stable_version.py`
+(the "legacy golden run", 57% robust accuracy at pixel-L2 ε=0.5 under its own
+evaluation convention) and, as of 2026-07-06, **matches and approaches that
+benchmark under a strictly harsher evaluator** (see *Results* and *Evaluation
+conventions* below).
 
-`RESET_PARAMETRIC_BB_EACH_BATCH=1` matches the legacy BB+Armijo loop: the BB secant history is reset at every batch. Carrying BB history across batches is an ablation because the stochastic objective changes with both the batch and the classifier.
+---
 
-`PARAMETRIC_BB_MAX_GRAD_NORM=1.0` matches the legacy ICNN ascent loop: the shared parametric adversary gradient is clipped to global norm 1.0 before the BB step proposal and before Armijo trial steps. Set it to `0` only for a clipping ablation.
+## 1. Results of record (λ=30 normalized-MSE, PGD ε=0.5 / 20 steps / 5 restarts / 1024 test samples, seed 1)
 
-## NPF / BB+Armijo fixes
+| run | adversary | key deltas | PGD@0.5 (strict) | PGD@0.5 (legacy conv., best ckpt) | clean |
+|---|---|---|---|---|---|
+| pre-fix era (all runs) | LastQuad, `output_rank=2` | — | **5–16% plateau** | — | 87–91% |
+| `ablC` | LastQuad, `output_rank=64` | rank only, old code, LR 0.1, 30 ep | 47.4% final / 48.4% best | 48.34% | 89.3% |
+| `flagship` | LastQuad, rank 64 | + all code fixes, LR 0.05, 50 ep | 49.7% final / 49.8% best | 49.80% | 89.2% |
+| **`flagshipC`** | **LastQuad, rank 128** | flagship + rank 128 | **52.5% final / 54.2% best** | **54.10%** | **90.1%** |
+| legacy golden run | legacy ICNN | single-file implementation | — | 57% (its own convention) | ~87–89% |
 
-The current refactored NPF path includes the following fixes relative to the earlier `pretrained_input_icnn` implementation:
+The strict evaluator counts `clean-correct AND adv-correct` over all samples
+and keeps the best adversarial iterate across **every** PGD step and restart;
+the legacy benchmark counted `adv-correct / total`, scoring only each
+restart's endpoint. Empirically the two conventions coincide within ~0.1 pt
+on these checkpoints, so the remaining gap to 57% is real but small (~3 pts
+at rank 128, still shrinking along the rank axis).
 
-| Area | Fix | Why it matters |
-| --- | --- | --- |
-| NPF LastQuad initialization | `NPF_LASTQUAD_INIT_EPS` now represents the quadratic coefficient scale; the trainable quadratic factor is initialized at `sqrt(init_eps)`. | The old factor initialization made the final quadratic contribution scale like `init_eps^2`; with `1e-4`, the actual coefficient was `1e-8` and `q_out.delta_raw` barely moved. |
-| Full NPF output low-rank initialization | The full-NPF `q_out.A` factor now uses `sqrt(init_eps)` inside identity initialization. | The output low-rank quadratic now starts at the same intended coefficient scale as the diagonal and hidden quadratic factors. |
-| LastQuad output rank | `NPF_LASTQUAD_OUTPUT_RANK` / `--npf-lastquad-output-rank` controls a learnable low-rank factor in the final LastQuad quadratic. | Rank `0` keeps the old diagonal-only LastQuad; rank `>0` keeps hidden quadratics disabled but lets the final output block learn correlated transport directions. |
-| BB wrong-curvature fallback | When the ascent BB secant has the wrong curvature sign, the step proposal falls back to `BB_ALPHA_MIN` instead of reusing a stale `alpha_prev`. | Reusing a stale large step can keep forcing unstable adversary updates after the stochastic local objective becomes noisy or locally convex. |
-| BB rejection history | Rejected BB+Armijo trials restore parameters but still refresh BB history with the current parameters and gradient. | This matches the legacy ICNN loop and avoids repeatedly proposing from stale secant information after a rejected trial. |
-| BB adversary gradient clipping | Shared parametric BB adversaries use `PARAMETRIC_BB_MAX_GRAD_NORM=1.0` by default. | This restores the legacy ICNN behavior (`clip_grad_norm_(icnn.parameters(), max_norm=1.0)`) before the BB/Armijo update. |
-| Clean-correct mask under DDP | NPF and NN-DRO now optimize the globally masked objective by reducing the clean-correct count across ranks. | The old DDP path averaged each rank's masked mean equally, biasing the adversary gradient when ranks had different numbers of clean-correct samples. |
-| Epoch diagnostics | `theta_l2_delta` and `omega_l2_delta` are printed each epoch and written to `epoch_log.csv`. | Tracks `||theta_t - theta_{t-1}||_2` for the classifier and `||omega_t - omega_{t-1}||_2` for the NPF adversary. |
-| Interrupted jobs | Epoch CSV rows are appended at epoch end, not only after `fit()` returns. | Completed epochs remain analyzable even if the cluster job is interrupted later. |
+---
 
-For full NPF runs through `run_runtime_sweep_ddp.sh`, use `RUN_ONLY_ALGO=npf`. The DDP launcher forwards the full-NPF architecture knobs `NPF_HIDDEN`, `NPF_OUTER_RANK`, `NPF_INNER_RANK`, `NPF_ACTIVATION`, `NPF_SOFTPLUS_BETA`, `NPF_INIT_EPS`, and `NPF_STRONG_CONVEXITY`.
+## 2. Root cause of the historical failure (measured, 2026-07-06 audit)
 
-The ResNet loader unwraps `R2.pth` using the shared checkpoint priority in `utils.unwrap_state_dict`. For the current `R2.pth`, whose top-level keys are `last`, `best`, `swa_last`, and `swa_best`, the loaded classifier branch is `last`.
+Every pre-fix run showed the same signature: the adversary devastates the
+frozen classifier during warmup (transported accuracy 10–30%), then θ
+neutralizes it within one adversarial epoch (transported ≈ clean accuracy)
+and PGD robustness plateaus at 5–16%.
 
-## PGD evaluation loss
+**The bottleneck was `output_rank=2`, not BatchNorm and not missing
+capacity.** LastQuad carries the same 7.67M trainable per-layer affine input
+skips as the legacy ICNN. But each rank-r quadratic direction `a` contributes
+`(aᵀx)·a` to T(x) — a *shared* direction whose only sample-dependence is the
+scalar coefficient `aᵀx`. Gradient-decomposition measurements on the exact
+training configuration (64 clean-correct samples, R2 eval-mode, K=10
+BB+Armijo):
 
-`INPUT_PGD_LOSS` controls only the evaluation PGD attack objective.
+| measurement | rank 2 | rank 64 |
+|---|---|---|
+| ω-gradient energy into final quad + lin + diag (far-field groups) | **>51%** | spread over 64 sample-adaptive directions |
+| ω-gradient energy into the deep ladder (`w_zs`) | 1e-4 | 4e-6 |
+| `lin_kernel` induced-delta rank-1 energy | 95% (pure translation) | — |
+| transported accuracy after the same K=10 ascent | 98% → 64% | 98% → **17%** |
+| top-1 SVD energy of learned deltas (PGD reference: ~2%) | 46% | 26% |
+
+At rank 2 the steepest ascent coordinates are literally one or two shared
+far-field directions: the ascent grows the objective by dragging every image
+along the same low-frequency pattern (measured: pixel-L2 ≈ 3 at 61–67% top-1
+SVD energy, cos ≈ 0 to PGD; projecting the delta to ε=0.5 restores ~90%
+accuracy). Training θ on such samples teaches it to ignore one global noise
+direction — one SGD step suffices — and confers no robustness inside the PGD
+ball. BB+Armijo itself was **not** at fault; it faithfully climbed the
+objective the parametrization gave it.
+
+A corollary that matters for reading training curves: in *every* successful
+run, transported accuracy still hovers near clean accuracy. Robustness does
+not come from the adversary "winning" the transported-accuracy race; it comes
+from the transports' sample-dependent component overlapping the PGD ball.
+
+## 3. Code fixes applied on top of the rank fix
+
+All verified by a 72-agent audit + adversarial verification and covered by
+`tests/test_pretrained_input_icnn_inner_steps.py` (51 tests):
+
+| fix | file | why |
+|---|---|---|
+| PosDef diag rectifier `relu` → **`exp`** (never-dead), `diag_init` is now effective-valued for every rectifier | `models/npf.py` | the λ-cost gradient pushes raw diag entries negative; `relu` there has exactly zero value **and** gradient forever — a one-way dead zone that killed the elementwise sample-dependent transport path |
+| LastQuad output-block diag init 0.1269 → **0.01** | `models/npf.py` | 0.1269 planted a deterministic `T(x) ≈ 1.127x` global-rescale artifact at init (measured 1.54 pixel-L2 = 94% of the init delta, 3× the eval radius): a sample-independent nuisance θ neutralizes in one step |
+| PosDef forward via matmul instead of broadcast-and-sum | `models/npf.py` | the broadcast materialized a (B, 3072, width) intermediate — multi-GB per hidden layer in `all_layers` mode, retained for double backward; this is what killed full-NPF runs |
+| trainable outer quadratic no longer initialized at exact zeros (constructor **and** identity-init path) | `models/npf.py` | ∂(0.5‖Aᵀx‖²)/∂A ≡ 0 at A=0: an exact saddle, so a zeros-initialized trainable outer quadratic can never train |
+| convex-init bias shift sign flipped to **+|bias_mean|** (legacy convention) | `models/npf.py` | the Hoedt–Klambauer derivation gives −0.739; the legacy golden run used +0.739. Sign decides the operating regime: negative leaves 49–68% of deep units active under β=20 softplus, positive runs them 88–100% active — the "hot" regime whose hidden-chain gradients carry sample-dependent attack capacity |
+| **ω weight decay 1e-4** restored inside the ascent objective (`--npf-omega-weight-decay`) | `algorithms/npf.py` | legacy applied exactly this to the free (unconstrained) kernels — the affine input skips and PosDef lin/quad — taxing the unbounded growth of the far-field translation/rescale kernels over ~30k persistent-ω ascent steps. Biases, diagonals, the positive `w_zs` ladder, and the frozen outer identity are excluded |
+| non-finite batch skip is all-reduced across ranks | `algorithms/base.py` | a rank-local `continue` desynchronizes the DDP gradient all-reduce (hang/corruption) when only one rank overflows |
+
+**Checkpoint-compatibility warning:** ψ_ω checkpoints written before the
+`exp`-diag change are not semantically loadable by the new code (raw diag
+values now mean `exp(raw)`, previously `relu(raw)`). Classifier checkpoints
+are unaffected. Do not `RESUME_CHECKPOINT` a pre-fix adversary.
+
+---
+
+## 4. Reference recipe (= the package defaults)
+
+The flagship recipe below is encoded as the **default at every layer** —
+`TrainConfig`, the `argparse` CLI, `run_runtime_sweep_ddp.sh`, and
+`run_local_npf_lastquad.sh` are verified field-by-field identical, so a bare
+`bash run_local_npf_lastquad.sh` (or even a bare
+`python -m pretrained_input_icnn.main`) runs exactly this:
+
+| group | setting | value |
+|---|---|---|
+| algorithm | `--algorithm` | `npf_lastquad` |
+| schedule | adversarial epochs / warmup | **50** / **2** (adversary-only warmup, θ frozen; cosine `T_max` tracks `epochs_adv` automatically) |
+| outer (θ) | optimizer | SGD, nesterov 0.9, wd 5e-4, grad-clip 10, **LR 0.05**, global batch **512** |
+| DRO objective | λ / cost | **30** on `normalized_mse` (per-sample mean squared difference over the 3072 normalized coordinates; pixel-space equivalent: `pixel_l2_squared` with λ=0.242) |
+| adversary loss | `USE_MARGIN_LOSS=1` | logsumexp margin `logsumexp_{j≠y}(logit_j − logit_y)`; CE saturates on clean-correct samples of a confident classifier and stalls the ascent |
+| masking | `ATTACK_CLEAN_CORRECT_ONLY=1` | transport trained/applied only on clean-correct samples; clean-incorrect stay clean in the θ update (legacy semantics) |
+| inner loop | K (`OMEGA_STEPS`) | **10** BB+Armijo ascent steps per batch, **persistent ω** across batches and epochs (`NPF_RESET_OMEGA_EACH_BATCH=0`), BB secant state reset per batch |
+| BB+Armijo | α₀ / α_min / α_max / c / shrink / trials | 5e-4 / 1e-6 / 1.0 / 0.1 / 0.5 / 10; global ω-grad clip **1.0** before the BB proposal (legacy order) |
+| ω regularization | `NPF_OMEGA_WEIGHT_DECAY` | **1e-4** on the free kernels (see §3) |
+| LastQuad architecture | hidden / activation / rank | `1024 512 512 256 128 64` affine input skips, softplus β=20, **`output_rank=64`** (rank 128 measured better still — see §1), `exp` rectifiers everywhere, output diag init 0.01, strong convexity 1.0 (frozen identity base potential), principled log-normal random init |
+| BatchNorm | `FREEZE_BATCHNORM=0`, `ADVERSARY_CLASSIFIER_EVAL=1` | BN participates in the θ update; the adversary attacks the eval-mode (running-stat) classifier — the measured-best policy. `ADVERSARY_CLASSIFIER_EVAL=0` (train-mode attack, exact legacy parity) is a supported ablation arm. Warmup always attacks eval-mode, which **is** legacy parity |
+| evaluation | PGD | raw pixel-L2 **ε=0.5**, 20 steps (step 2ε/K), 5 restarts, CE loss, 1024 test samples, eval-mode BN, per-epoch |
+| full-NPF arm | `RUN_ONLY_ALGO=npf` | legacy widths, softplus, outer rank 8 / inner rank 2, **identity-adjacent init** (`NPF_IDENTITY_INIT=1`, `NPF_INIT_EPS=1e-2`); the non-identity all-layers init starts 12.9 pixel-L2 from identity at objective −40 and never recovers |
+
+### Single-variable ablation axes (override on top of the defaults)
 
 ```bash
-INPUT_PGD_LOSS=ce      # cross-entropy PGD evaluation
-INPUT_PGD_LOSS=margin  # logsumexp-margin PGD evaluation
+LOCAL_NPF_LASTQUAD_OUTPUT_RANK=128   # capacity axis — best measured value so far
+LOCAL_K=15                            # inner-iteration axis (also 20)
+LOCAL_ADVERSARY_CLASSIFIER_EVAL=0     # train-mode-BN adversary (legacy parity axis)
+LOCAL_NPF_LASTQUAD_HIDDEN='128 128 128 128'   # width axis (5× cheaper adversary)
+LOCAL_RUN_ONLY_ALGO=npf               # all-layers quadratics architecture family
 ```
 
-`USE_MARGIN_LOSS=1` controls the training adversary objective. A run can train with the logsumexp-margin adversary objective while evaluating PGD with CE:
+---
+
+## 5. How to run
+
+### Local, single GPU
 
 ```bash
-USE_MARGIN_LOSS=1
-INPUT_PGD_LOSS=ce
+RUN_TAG=my_run_name bash run_local_npf_lastquad.sh
 ```
 
-## BatchNorm controls
+All knobs are `LOCAL_*` environment variables (see the launcher header).
+Launch long runs detached (`setsid nohup ... &`) — interactive-session runs
+die with the session. Do **not** edit the launcher or sweep scripts while a
+launched run is mid-flight: bash reads scripts incrementally, and an in-place
+rewrite corrupts the running interpreter's continuation.
 
-The stable-policy diagnostic run mirrors the old single-file training policy by letting BatchNorm participate in classifier training:
-
-```bash
-FREEZE_BATCHNORM=0
-FREEZE_BATCHNORM_AFFINE=0
-BATCHNORM_ONLINE_REFRESH=0
-RECALIBRATE_BATCHNORM=0
-```
-
-Treat frozen BatchNorm as a separate ablation, not as the stable-policy reproduction:
+### Cluster, multi-GPU DDP (verified semantics-preserving)
 
 ```bash
-FREEZE_BATCHNORM=1
-FREEZE_BATCHNORM_AFFINE=1
-BATCHNORM_ONLINE_REFRESH=0
-RECALIBRATE_BATCHNORM=0
-```
-
-Only enable online BN refresh for an explicit BatchNorm-statistics ablation:
-
-```bash
-BATCHNORM_ONLINE_REFRESH=1
-BATCHNORM_ONLINE_REFRESH_MOMENTUM=0.001
-```
-
-## Stable-policy DDP reproducibility run
-
-This command records the current stable-policy NPF-LastQuad diagnostic run. It uses the corrected refactored code path, legacy normalized-MSE transport cost, clean-correct attack masking, per-batch BB reset, no BatchNorm freezing, and CE-based input PGD evaluation.
-
-The run name and output folder use `lr0p1` because `LR_THETA=0.1`. Avoid naming this run `lr0p003`; that makes later artifact analysis ambiguous.
-
-| Group | Setting | Value | Notes |
-| --- | --- | --- | --- |
-| Launcher | `SPLIT` | `0` | Runs `npf_lastquad`. |
-| Launcher | `SEED` | `1` | Passed as positional arg 2. |
-| Launcher | `NPROC` | `2` | Two GPUs via DDP. |
-| Launcher | `K` / `OMEGA_STEPS` | `7` | Seven NPF adversary updates per batch. |
-| Launcher | adversarial epochs | `50` | Positional arg 5 to `run_runtime_sweep_ddp.sh`. |
-| Classifier | `LR_THETA` | `0.1` | SGD learning rate for ResNet-18. |
-| Classifier | `COMMON_BATCH` | `512` | Global batch, split across ranks. |
-| DRO | `PENALTY_LAMBDA` | `30` | Inner penalty multiplier. |
-| DRO | `TRANSPORT_COST` | `normalized_mse` | Legacy normalized-coordinate mean squared transport cost. |
-| DRO | `USE_MARGIN_LOSS` | `1` | Training adversary uses logsumexp-margin primary loss. |
-| DRO | `LAMBDA_SCHEDULE` | empty | Fixed lambda. |
-| DRO | `LAMBDA_STAGE_EPOCHS` | `0` | No staged schedule. |
-| Legacy semantics | `ATTACK_CLEAN_CORRECT_ONLY` | `1` | Attack only clean-correct samples; clean-incorrect samples stay clean. |
-| Legacy semantics | `RESET_PARAMETRIC_BB_EACH_BATCH` | `1` | Reset BB secant history each batch. |
-| Legacy semantics | `PARAMETRIC_BB_MAX_GRAD_NORM` | `1.0` | Clip shared parametric BB adversary gradients before BB/Armijo. |
-| Warmup | `EPOCHS_ICNN_PRETRAIN` | `0` | No adversary-only warmup in this run. |
-| BatchNorm | `FREEZE_BATCHNORM` | `0` | BatchNorm running stats update during classifier training. |
-| BatchNorm | `FREEZE_BATCHNORM_AFFINE` | `0` | BN affine parameters remain trainable. |
-| BatchNorm | `BATCHNORM_ONLINE_REFRESH` | `0` | No clean BN refresh pass. |
-| BatchNorm | `RECALIBRATE_BATCHNORM` | `0` | No post-epoch BN recalibration. |
-| NPF architecture | `NPF_LASTQUAD_HIDDEN` | `1024 512 512 256` | LastQuad hidden widths. |
-| NPF architecture | `NPF_LASTQUAD_ACTIVATION` | `softplus` | Convex nonlinearity. |
-| NPF architecture | `NPF_LASTQUAD_SOFTPLUS_BETA` | `20.0` | Matches the legacy ICNN softplus beta. |
-| NPF architecture | `NPF_LASTQUAD_INIT_EPS` | `1e-4` | Identity-adjacent init scale. |
-| NPF architecture | `NPF_LASTQUAD_STRONG_CONVEXITY` | `1.0` | Fixed strong-convexity term. |
-| NPF optimizer | `NPF_INNER_OPTIMIZER` | `bb_armijo` | Custom BB+Armijo gradient ascent on NPF weights. |
-| NPF optimizer | `BB_ALPHA0` | `5e-4` | Initial BB/Armijo step size. |
-| NPF optimizer | `BB_ALPHA_MIN` | `1e-6` | Minimum step size. |
-| NPF optimizer | `BB_ALPHA_MAX` | `1.0` | Maximum step size. |
-| NPF optimizer | `BB_LS_C` | `0.1` | Armijo sufficient-increase constant. |
-| NPF optimizer | `BB_LS_SHRINK` | `0.5` | Backtracking shrink factor. |
-| NPF optimizer | `BB_LS_MAX_STEPS` | `10` | Maximum line-search trials. |
-| PGD eval | `EVAL_PGD_SAMPLES` | `2000` | Test samples used for per-epoch input PGD. |
-| PGD eval | `INPUT_PGD_LOSS` | `ce` | Cross-entropy PGD evaluation. |
-| PGD eval | `INP_STEPS` | `20` | PGD steps per restart. |
-| PGD eval | `INP_RESTARTS` | `5` | PGD random restarts. |
-| Frozen map | `FROZEN_ADVERSARY_EPOCHS` | `0` | Disabled. |
-| Frozen map | `FROZEN_ADVERSARY_MAP_STEPS` | `1` | Explicit safe default; unused when frozen epochs are zero. |
-
-```bash
-python csub.py -n lastquad-lam30-logsum-bb-k7-lr0p1-stablepolicy -g 2 -t 1d --train --large-shm --node-type h100 \
+python csub.py -n lam30-rank128-k20-ddp2 -g 2 -t 1d --train --large-shm --node-type a100-40g \
   --command "cd /mloscratch/homes/aabdolla/LAT && \
-    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
-    RUN_NAME=npf_lq_lam30_logsum_lr0p1_K7_bb_stablepolicy_pgdce_seed1 \
-    LR_THETA=0.1 \
-    PENALTY_LAMBDA=30 \
-    TRANSPORT_COST=normalized_mse \
-    EPOCHS_ICNN_PRETRAIN=0 \
-    LAMBDA_SCHEDULE='' \
-    LAMBDA_STAGE_EPOCHS=0 \
-    ATTACK_CLEAN_CORRECT_ONLY=1 \
-    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
-    FREEZE_BATCHNORM=0 \
-    FREEZE_BATCHNORM_AFFINE=0 \
-    BATCHNORM_ONLINE_REFRESH=0 \
-    RECALIBRATE_BATCHNORM=0 \
-    USE_MARGIN_LOSS=1 \
-    COMMON_BATCH=512 \
-    NPF_LASTQUAD_HIDDEN='1024 512 512 256' \
-    NPF_LASTQUAD_ACTIVATION=softplus \
-    NPF_LASTQUAD_SOFTPLUS_BETA=20.0 \
-    NPF_LASTQUAD_INIT_EPS=1e-4 \
-    NPF_LASTQUAD_STRONG_CONVEXITY=1.0 \
-    NPF_INNER_OPTIMIZER=bb_armijo \
-    BB_ALPHA0=5e-4 \
-    BB_ALPHA_MIN=1e-6 \
-    BB_ALPHA_MAX=1.0 \
-    BB_LS_C=0.1 \
-    BB_LS_SHRINK=0.5 \
-    BB_LS_MAX_STEPS=10 \
-    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
-    EVAL_PGD_SAMPLES=2000 \
-    INPUT_PGD_LOSS=ce \
-    INP_STEPS=20 \
-    INP_RESTARTS=5 \
-    OMEGA_STEPS=7 \
-    FROZEN_ADVERSARY_EPOCHS=0 \
-    FROZEN_ADVERSARY_MAP_STEPS=1 \
-    OUTPUT_FOLDER_NAME=BB_lam30_legacyfix_logsum_lr0p1_K7_pgdce_seed1 \
-    bash run_runtime_sweep_ddp.sh 0 1 2 7 50"
+    LOCAL_NPROC=2 \
+    LOCAL_CUDA_VISIBLE_DEVICES=0,1 \
+    LOCAL_K=20 \
+    LOCAL_NPF_LASTQUAD_OUTPUT_RANK=128 \
+    RUN_TAG=flagshipF_rank128_K20_ddp2_lam30nmse_lr0p05_ep50 \
+    bash run_local_npf_lastquad.sh"
 ```
 
-## Corrected K10 low-LR fixed-lambda command
+DDP guarantees (verified in code):
 
-Use this command for the low-learning-rate K10 diagnostic after the NPF/BB fixes above. The run names encode `lr0p01`, `K10`, the legacy BB fixes, and gradient clipping.
+- the train loader shards with `DistributedSampler` at per-rank batch
+  `512 / world_size`, so the **global** batch, step count, and LR schedule are
+  identical to single-GPU;
+- the ω ascent all-reduces both gradients and objective scalars, so every
+  rank proposes the same Armijo step and ω stays in lockstep
+  (`_shared_adversary_masked_mean` makes the reduced gradient equal the
+  gradient of the *globally* masked objective);
+- K is per-**global**-batch: GPU count changes wall-clock only, not the
+  inner-ascent budget;
+- **evaluation runs on rank 0 over the full, unsharded test set** — reported
+  robustness numbers mean the same thing at any `NPROC`;
+- a non-finite transport on any rank skips the batch on **all** ranks.
+
+Known cosmetic artifact: train-phase CSV columns (`train_loss`, `train_acc`)
+log rank-0's shard only. All eval columns are full-set.
+
+### Standalone sweep script
+
+`run_runtime_sweep_ddp.sh` now carries the same defaults as the launcher, but
+prefer the launcher: it computes provenance-rich run tags and pins everything
+explicitly. Positional contract: `bash run_runtime_sweep_ddp.sh SPLIT SEED
+NPROC K ADV_EPOCHS [RUN_TAG]`.
+
+---
+
+## 6. Monitoring and the 10-epoch kill rule
+
+Per-epoch metrics land in `<run>/npf_lastquad/seed_<s>/epoch_log.csv`:
+
+- `input_pgd_acc` (col 44) — the headline robustness number;
+- `transport_adv_acc` (col 43) — classifier accuracy **on the NPF transports**.
+  Expect this to sit near `clean_acc` after the first adversarial epochs even
+  in successful runs (§2); a *decreasing* value late in training means the
+  persistent adversary is out-pacing the decaying-LR classifier (healthy);
+- `eval_transport_avg_l2` (col 35) — pixel-L2 of the transport deltas;
+- `theta_l2_delta` / `omega_l2_delta` — is either player frozen?
+
+**Kill rule:** if `input_pgd_acc` has not risen after 10 adversarial epochs,
+terminate the run. (The queue runner in the 2026-07-06 experiments enforces
+this automatically: best PGD ≤ first-adv-epoch PGD + 2 pts at adv-epoch ≥ 10
+kills the process group.)
+
+## 7. Evaluation conventions
+
+`INPUT_PGD_LOSS` controls only the evaluation attack (`ce` default = the
+legacy benchmark convention; `margin` is the stronger local evaluator).
+Training-side margin loss is controlled independently by `USE_MARGIN_LOSS`.
+
+When comparing against the legacy 57% figure, remember the two protocol
+differences (both make the current numbers *conservative*): the current
+evaluator (a) intersects with clean-correctness and (b) keeps the best
+adversarial iterate over all steps and restarts, while the legacy evaluator
+scored only restart endpoints against `adv-correct/total`.
+`scratchpad/legacy_convention_eval.py`-style rescoring of best checkpoints
+showed the conventions agree within ~0.1 pt on these models.
+
+## 8. Diagnostics
+
+`ICNN_vs_NPFICNN.ipynb` contains the full
+evidence chain: the isolated legacy-vs-NPF adversary comparison, the
+"why T(x) fools the model without being adversarial" visual analysis
+(delta SVD spectra, batch-mean energy, radial FFT, image grids), the
+gradient-decomposition panels (from `debug_outputs/probe_compact.json`), a
+live rank-2 vs rank-64 A/B cell, and the training-evidence plot across all
+runs of record. `icnn_vs_npficnn_diagnostic.py` provides the underlying
+harness.
+
+## 9. Validation
 
 ```bash
-python csub.py -n lastquad-lam30-logsum-bb-k10-lr0p01-fix -g 2 -t 1d --train --large-shm --node-type h100 \
-  --command "cd /mloscratch/homes/aabdolla/LAT && \
-    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
-    RUN_NAME=npf_lq_lam30_logsum_lr0p01_K10_bb_legacyfix_clip1_pgdce_seed1 \
-    LR_THETA=0.01 \
-    PENALTY_LAMBDA=30 \
-    TRANSPORT_COST=normalized_mse \
-    EPOCHS_ICNN_PRETRAIN=0 \
-    LAMBDA_SCHEDULE='' \
-    LAMBDA_STAGE_EPOCHS=0 \
-    ATTACK_CLEAN_CORRECT_ONLY=1 \
-    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
-    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
-    FREEZE_BATCHNORM=0 \
-    FREEZE_BATCHNORM_AFFINE=0 \
-    BATCHNORM_ONLINE_REFRESH=0 \
-    RECALIBRATE_BATCHNORM=0 \
-    USE_MARGIN_LOSS=1 \
-    COMMON_BATCH=512 \
-    NPF_LASTQUAD_HIDDEN='1024 512 512 256 128 64' \
-    NPF_LASTQUAD_ACTIVATION=softplus \
-    NPF_LASTQUAD_SOFTPLUS_BETA=20.0 \
-    NPF_LASTQUAD_INIT_EPS=1e-4 \
-    NPF_LASTQUAD_STRONG_CONVEXITY=1.0 \
-    NPF_INNER_OPTIMIZER=bb_armijo \
-    BB_ALPHA0=5e-4 \
-    BB_ALPHA_MIN=1e-6 \
-    BB_ALPHA_MAX=1.0 \
-    BB_LS_C=0.1 \
-    BB_LS_SHRINK=0.5 \
-    BB_LS_MAX_STEPS=10 \
-    EVAL_PGD_SAMPLES=2000 \
-    INPUT_PGD_LOSS=ce \
-    INP_STEPS=20 \
-    INP_RESTARTS=5 \
-    OMEGA_STEPS=10 \
-    FROZEN_ADVERSARY_EPOCHS=0 \
-    FROZEN_ADVERSARY_MAP_STEPS=1 \
-    OUTPUT_FOLDER_NAME=BB_lam30_legacyfix_logsum_lr0p01_K10_clip1_pgdce_seed1 \
-    bash run_runtime_sweep_ddp.sh 0 1 2 10 50"
+python -m pytest tests/test_pretrained_input_icnn_inner_steps.py   # 51 tests
+bash -n run_local_npf_lastquad.sh run_runtime_sweep_ddp.sh
 ```
 
-## Full NPF K40 low-LR fixed-lambda command
-
-Use this command for full `npf`, not `npf_lastquad`. `RUN_ONLY_ALGO=npf` is required because the DDP runtime script otherwise defaults to the LastQuad-only active algorithm list. The rank knobs are explicit:
-
-| Setting | Value | Meaning |
-| --- | --- | --- |
-| `NPF_OUTER_RANK` | `8` | Rank of the trainable global PSD quadratic term. |
-| `NPF_INNER_RANK` | `2` | Rank of the hidden/output quadratic injections. |
-
-```bash
-python csub.py -n npf-lam30-logsum-bb-k40-lr0p01-512-r8-r2 -g 2 -t 1d --train --large-shm --node-type a100-40g \
-  --command "cd /mloscratch/homes/aabdolla/LAT && \
-    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
-    RUN_ONLY_ALGO=npf \
-    RUN_NAME=npf_lam30_logsum_lr0p01_K40_bb_legacyfix_clip1_pgdce_seed1_512_r8_r2 \
-    LR_THETA=0.01 \
-    PENALTY_LAMBDA=30 \
-    TRANSPORT_COST=normalized_mse \
-    EPOCHS_ICNN_PRETRAIN=0 \
-    LAMBDA_SCHEDULE='' \
-    LAMBDA_STAGE_EPOCHS=0 \
-    ATTACK_CLEAN_CORRECT_ONLY=1 \
-    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
-    FREEZE_BATCHNORM=0 \
-    FREEZE_BATCHNORM_AFFINE=0 \
-    BATCHNORM_ONLINE_REFRESH=0 \
-    RECALIBRATE_BATCHNORM=0 \
-    USE_MARGIN_LOSS=1 \
-    COMMON_BATCH=512 \
-    NPF_HIDDEN='512 512 256' \
-    NPF_OUTER_RANK=8 \
-    NPF_INNER_RANK=2 \
-    NPF_ACTIVATION=softplus \
-    NPF_SOFTPLUS_BETA=20.0 \
-    NPF_INIT_EPS=1e-4 \
-    NPF_STRONG_CONVEXITY=1.0 \
-    NPF_INNER_OPTIMIZER=bb_armijo \
-    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
-    BB_ALPHA0=5e-4 \
-    BB_ALPHA_MIN=1e-6 \
-    BB_ALPHA_MAX=1.0 \
-    BB_LS_C=0.1 \
-    BB_LS_SHRINK=0.5 \
-    BB_LS_MAX_STEPS=10 \
-    EVAL_PGD_SAMPLES=2000 \
-    INPUT_PGD_LOSS=ce \
-    INP_STEPS=20 \
-    INP_RESTARTS=5 \
-    OMEGA_STEPS=40 \
-    FROZEN_ADVERSARY_EPOCHS=0 \
-    FROZEN_ADVERSARY_MAP_STEPS=1 \
-    OUTPUT_FOLDER_NAME=NPF_lam30_legacyfix_logsum_lr0p01_K40_clip1_pgdce_seed1_512_r8_r2 \
-    bash run_runtime_sweep_ddp.sh 0 1 2 40 50"
-```
-
-### Exact legacy-script comparison knobs
-
-For a closer comparison to the `26036bb` shell script, change only these fields after the above baseline is reproducible:
-
-```bash
-EPOCHS_ICNN_PRETRAIN=2
-OUTPUT_FOLDER_NAME=BB_lam30_legacyfix_logsum_lr0p1_K7_warm2_pgdce_seed1
-RUN_NAME=npf_lq_lam30_logsum_lr0p1_K7_bb_stablepolicy_warm2_pgdce_seed1
-bash run_runtime_sweep_ddp.sh 0 1 2 7 30
-```
-
-## Lambda-schedule ablation: descending lambda, K=20
-
-This ablation uses the stable-policy run settings, but replaces the fixed `lambda=30` objective with a descending schedule. The training process is continuous: `pretrained_input_icnn` updates the active `lambda_param` at epoch boundaries while keeping the ResNet-18 classifier weights, the NPF adversary weights, and the NPF optimizer/adversary state alive.
-
-The effective inner budget is `K=20`, because both `OMEGA_STEPS=20` and the final launcher call `bash run_runtime_sweep_ddp.sh 0 1 2 20 50` set the NPF adversary updates per batch to 20.
-
-| Group | Setting | Value | Notes |
-| --- | --- | --- | --- |
-| Lambda schedule | `LAMBDA_SCHEDULE` | `30 20 15 10 5` | Active lambda values in order. |
-| Lambda schedule | `LAMBDA_STAGE_EPOCHS` | `10` | Each lambda is used for 10 adversarial epochs. |
-| Lambda schedule | epoch 1-10 | `30` | Starts from the stable fixed-lambda value. |
-| Lambda schedule | epoch 11-20 | `20` | Same adversary and classifier continue training. |
-| Lambda schedule | epoch 21-30 | `15` | No restart between stages. |
-| Lambda schedule | epoch 31-40 | `10` | NPF weights are retained and adapted. |
-| Lambda schedule | epoch 41-50 | `5` | Final low-penalty stage. |
-| Launcher | `K` / `OMEGA_STEPS` | `20` | Twenty NPF adversary updates per batch. |
-| Launcher | adversarial epochs | `50` | Must equal `len(schedule) * stage_epochs`. |
-| Classifier | `LR_THETA` | `0.1` | Stable-policy classifier learning rate. |
-| DRO | `PENALTY_LAMBDA` | `30` | Initial/print value; Python uses `LAMBDA_SCHEDULE` once provided. |
-| DRO | `TRANSPORT_COST` | `normalized_mse` | Legacy normalized-coordinate mean squared transport cost. |
-| Legacy semantics | `ATTACK_CLEAN_CORRECT_ONLY` | `1` | Attack only clean-correct samples. |
-| Legacy semantics | `RESET_PARAMETRIC_BB_EACH_BATCH` | `1` | Reset BB secant history each batch. |
-| Legacy semantics | `PARAMETRIC_BB_MAX_GRAD_NORM` | `1.0` | Clip shared parametric BB adversary gradients before BB/Armijo. |
-| BatchNorm | `FREEZE_BATCHNORM` | `0` | Stable-policy BatchNorm behavior. |
-| BatchNorm | `FREEZE_BATCHNORM_AFFINE` | `0` | BN affine parameters remain trainable. |
-| BatchNorm | `BATCHNORM_ONLINE_REFRESH` | `0` | No clean BN refresh pass. |
-| BatchNorm | `RECALIBRATE_BATCHNORM` | `0` | No post-epoch BN recalibration. |
-| NPF architecture | `NPF_LASTQUAD_HIDDEN` | `1024 512 512 256` | Same LastQuad width as stable-policy run. |
-| NPF architecture | `NPF_LASTQUAD_SOFTPLUS_BETA` | `20.0` | Same softplus beta as stable-policy run. |
-| NPF optimizer | `NPF_INNER_OPTIMIZER` | `bb_armijo` | Custom BB+Armijo gradient ascent on NPF weights. |
-| NPF optimizer | `BB_ALPHA0`, `BB_ALPHA_MIN`, `BB_ALPHA_MAX` | `5e-4`, `1e-6`, `1.0` | BB step-size controls. |
-| NPF optimizer | `BB_LS_C`, `BB_LS_SHRINK`, `BB_LS_MAX_STEPS` | `0.1`, `0.5`, `10` | Armijo line-search controls. |
-| PGD eval | `INPUT_PGD_LOSS` | `ce` | Cross-entropy PGD evaluation. |
-| PGD eval | `EVAL_PGD_SAMPLES` | `2000` | Test samples used per epoch. |
-
-Use this cleanly named command for reproducible reruns:
-
-```bash
-python csub.py -n lastquad-lamsched-30-20-15-10-5-k20-lr0p1 -g 2 -t 1d --train --large-shm --node-type h100 \
-  --command "cd /mloscratch/homes/aabdolla/LAT && \
-    source /mloscratch/homes/aabdolla/optiselect/.venv/bin/activate && \
-    RUN_NAME=npf_lq_lamsched_30_20_15_10_5_stage10_logsum_lr0p1_K20_bb_stablepolicy_pgdce_seed1 \
-    LR_THETA=0.1 \
-    PENALTY_LAMBDA=30 \
-    TRANSPORT_COST=normalized_mse \
-    EPOCHS_ICNN_PRETRAIN=0 \
-    LAMBDA_SCHEDULE='30 20 15 10 5' \
-    LAMBDA_STAGE_EPOCHS=10 \
-    ATTACK_CLEAN_CORRECT_ONLY=1 \
-    RESET_PARAMETRIC_BB_EACH_BATCH=1 \
-    FREEZE_BATCHNORM=0 \
-    FREEZE_BATCHNORM_AFFINE=0 \
-    BATCHNORM_ONLINE_REFRESH=0 \
-    RECALIBRATE_BATCHNORM=0 \
-    USE_MARGIN_LOSS=1 \
-    COMMON_BATCH=512 \
-    NPF_LASTQUAD_HIDDEN='1024 512 512 256' \
-    NPF_LASTQUAD_ACTIVATION=softplus \
-    NPF_LASTQUAD_SOFTPLUS_BETA=20.0 \
-    NPF_LASTQUAD_INIT_EPS=1e-4 \
-    NPF_LASTQUAD_STRONG_CONVEXITY=1.0 \
-    NPF_INNER_OPTIMIZER=bb_armijo \
-    BB_ALPHA0=5e-4 \
-    BB_ALPHA_MIN=1e-6 \
-    BB_ALPHA_MAX=1.0 \
-    BB_LS_C=0.1 \
-    BB_LS_SHRINK=0.5 \
-    BB_LS_MAX_STEPS=10 \
-    PARAMETRIC_BB_MAX_GRAD_NORM=1.0 \
-    EVAL_PGD_SAMPLES=2000 \
-    INPUT_PGD_LOSS=ce \
-    INP_STEPS=20 \
-    INP_RESTARTS=5 \
-    OMEGA_STEPS=20 \
-    FROZEN_ADVERSARY_EPOCHS=0 \
-    FROZEN_ADVERSARY_MAP_STEPS=1 \
-    OUTPUT_FOLDER_NAME=BB_lamsched_30_20_15_10_5_stage10_logsum_lr0p1_K20_pgdce_seed1 \
-    bash run_runtime_sweep_ddp.sh 0 1 2 20 50"
-```
-
-Artifact note: the originally submitted command used names containing `5_10_15_20_30` and `K7`, but the actual executed hyperparameters were `LAMBDA_SCHEDULE='30 20 15 10 5'`, `OMEGA_STEPS=20`, and launcher `K=20`.
-
-## Margin-PGD ablation
-
-To rerun the same training but evaluate PGD with the margin objective, change only these fields:
-
-```bash
-INPUT_PGD_LOSS=margin
-RUN_NAME=npf_lq_lam30_logsum_lr0p1_K7_bb_stablepolicy_pgdmargin_seed1
-OUTPUT_FOLDER_NAME=BB_lam30_legacyfix_logsum_lr0p1_K7_pgdmargin_seed1
-```
-
-## Local smoke test
-
-Before launching a long job, this one-batch smoke run verifies that the entrypoint, checkpoint loader, transport-cost flag, and PGD evaluator all parse correctly:
-
-```bash
-SMOKE_MAX_TRAIN_BATCHES=1 /mloscratch/homes/aabdolla/optiselect/.venv/bin/python -m pretrained_input_icnn.main \
-  --algorithm npf_lastquad \
-  --pretrained-path ResNet_checkpoints/R2.pth \
-  --data-dir ./data \
-  --epochs-adv 1 \
-  --batch-size 4 \
-  --num-workers 0 \
-  --lr-theta 0.003 \
-  --penalty-lambda 30 \
-  --transport-cost normalized_mse \
-  --attack-clean-correct-only \
-  --reset-parametric-bb-each-batch \
-  --parametric-bb-max-grad-norm 1.0 \
-  --omega-steps-per-batch 0 \
-  --npf-lastquad-hidden 4 \
-  --eval-input-pgd \
-  --eval-input-pgd-samples 8 \
-  --input-pgd-loss ce \
-  --inp-p 2 \
-  --inp-eps 0.5 \
-  --inp-steps 1 \
-  --inp-restarts 1 \
-  --no-freeze-batchnorm \
-  --no-freeze-batchnorm-affine \
-  --no-online-batchnorm-refresh \
-  --no-recalibrate-batchnorm \
-  --save /tmp/input_icnn_smoke.pth \
-  --log-csv /tmp/input_icnn_smoke.csv
-```
-
-## Validation commands
-
-Run these before pushing changes:
-
-```bash
-python -m py_compile pretrained_input_icnn/config.py pretrained_input_icnn/main.py pretrained_input_icnn/utils/eval.py pretrained_input_icnn/utils/projections.py pretrained_input_icnn/algorithms/base.py pretrained_input_icnn/algorithms/npf.py pretrained_input_icnn/algorithms/nn_dro.py pretrained_input_icnn/algorithms/wrm.py pretrained_input_icnn/algorithms/wfr.py pretrained_input_icnn/algorithms/dual.py pretrained_input_icnn/algorithms/new_ppa.py
-bash -n run_pretrained_input_icnn.sh run_runtime_sweep_ddp.sh
-python -m pytest tests/test_pretrained_input_icnn_inner_steps.py
-python -m pytest tests
-```
+The test suite pins the load-bearing invariants: rank-64 default, `exp` diag
+with effective-valued init 0.01, saddle-free trainable outer quadratic,
+positive bias shift, BB convex-region proposal, CE eval default, and the
+frozen outer identity potential for LastQuad.

@@ -135,7 +135,10 @@ class WFRTrainer(BaseAdvTrainer):
         return z.detach(), weights.detach(), y_rep
 
     def step(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        with frozen_module(self._classifier_module):
+        with frozen_module(
+            self._classifier_module,
+            eval_mode=self._adversary_classifier_eval_mode(),
+        ):
             z, weights, y_rep = self._sampler(x, y)
             # Stash for the WFR-specific outer update below.
             self._wfr_z = z

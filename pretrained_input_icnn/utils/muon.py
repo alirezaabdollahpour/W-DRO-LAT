@@ -323,7 +323,18 @@ def muon_step_params(
     with torch.no_grad():
         with _profile_time(profile, "muon_update_s"):
             for idx, (param, grad) in enumerate(zip(params, grad_tensors)):
-                if grad.ndim >= 2 and param.ndim >= 2:
+                # Degenerate (n,1)/(1,n) "matrices" (diag/linear kernels of the
+                # quadratic potentials) must not take the Newton-Schulz path:
+                # orthogonalizing a rank-1 column returns the normalized
+                # gradient, which combined with the sqrt(max(n,m)) lr scale
+                # amplifies these sample-independent modes ~55x. Route them to
+                # the elementwise fallback instead.
+                is_true_matrix = (
+                    grad.ndim >= 2
+                    and param.ndim >= 2
+                    and min(param.shape[0], max(1, param.numel() // param.shape[0])) > 1
+                )
+                if is_true_matrix:
                     _profile_add(profile, "muon_matrix_params", 1.0)
                     buf = muon_state.momentum_buffers[idx]
                     if buf is None or buf.shape != param.shape:

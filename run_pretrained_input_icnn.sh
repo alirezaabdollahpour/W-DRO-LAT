@@ -23,6 +23,8 @@ set -euo pipefail
 #   NPF_LASTQUAD_HIDDEN   "1024 512 512 256 128 64"
 #   INP_P                 2
 #   INP_EPS               0.5
+#   INPUT_PGD_GEOMETRY    pixel_l2_squared (standard PGD; use normalized_mse
+#                                    only for legacy normalized-coordinate diagnostics)
 #   USE_MARGIN_LOSS       0         (set to 1 to use logsumexp margin objective
 #                                    for the adversary on NPF/NN-DRO/WRM/Madry/PPA)
 #   FREEZE_BATCHNORM      1         (keep BN running stats fixed during adversarial updates)
@@ -41,10 +43,9 @@ set -euo pipefail
 #                                    for this many epochs before the regular minimax
 #                                    schedule kicks in; classifier stays frozen)
 #
-# The script forwards algorithm-specific defaults from
-# Logistic_Regression_CIFAR10/config.py and Runtime-LR-CIFAR10/run_runtime_lr_cifar10.sh,
-# so e.g. NPF uses npf_outer_rank=8, npf_inner_rank=2, init_eps=1e-4.
-# The default npf_lastquad run uses only the final diagonal quadratic term.
+# The script forwards OTT-style NPF defaults: PosDef input skips, activated
+# scalar residual layer, final identity positive-definite potential, and
+# projected nonnegative hidden-to-hidden weights unless explicitly disabled.
 
 ALGORITHM="${ALGORITHM:-npf_lastquad}"
 PRETRAINED_PATH="${PRETRAINED_PATH:-/mloscratch/homes/aabdolla/LAT/ResNet_checkpoints/R2.pth}"
@@ -62,6 +63,7 @@ INP_STEPS="${INP_STEPS:-20}"
 INP_RESTARTS="${INP_RESTARTS:-5}"
 EVAL_PGD_SAMPLES="${EVAL_PGD_SAMPLES:-1000}"
 INPUT_PGD_LOSS="${INPUT_PGD_LOSS:-margin}"
+INPUT_PGD_GEOMETRY="${INPUT_PGD_GEOMETRY:-pixel_l2_squared}"
 SEED="${SEED:-1}"
 USE_MARGIN_LOSS="${USE_MARGIN_LOSS:-0}"
 FREEZE_BATCHNORM="${FREEZE_BATCHNORM:-1}"
@@ -81,6 +83,13 @@ NPF_HIDDEN="${NPF_HIDDEN:-1024 512 512 256 128 64}"
 read -r -a NPF_HIDDEN_ARGS <<< "${NPF_HIDDEN}"
 NPF_LASTQUAD_HIDDEN="${NPF_LASTQUAD_HIDDEN:-1024 512 512 256 128 64}"
 read -r -a NPF_LASTQUAD_HIDDEN_ARGS <<< "${NPF_LASTQUAD_HIDDEN}"
+
+NPF_IDENTITY_INIT="${NPF_IDENTITY_INIT:-0}"
+NPF_POS_WEIGHTS="${NPF_POS_WEIGHTS:-1}"
+NPF_POSITIVE_WEIGHT_RECTIFIER="${NPF_POSITIVE_WEIGHT_RECTIFIER:-relu}"
+NPF_LASTQUAD_IDENTITY_INIT="${NPF_LASTQUAD_IDENTITY_INIT:-${NPF_IDENTITY_INIT}}"
+NPF_LASTQUAD_POS_WEIGHTS="${NPF_LASTQUAD_POS_WEIGHTS:-${NPF_POS_WEIGHTS}}"
+NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER="${NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER:-${NPF_POSITIVE_WEIGHT_RECTIFIER}}"
 
 # Per-algorithm save tag.
 SAVE_PATH="${SAVE_PATH:-results/${ALGORITHM}_lambda${PENALTY_LAMBDA}_${EPOCHS_ADV}ep.pth}"
@@ -102,6 +111,7 @@ COMMON_ARGS=(
   --eval-input-pgd
   --eval-input-pgd-samples "${EVAL_PGD_SAMPLES}"
   --input-pgd-loss "${INPUT_PGD_LOSS}"
+  --input-pgd-geometry "${INPUT_PGD_GEOMETRY}"
   --seed "${SEED}"
   --save "${SAVE_PATH}"
   --log-csv "${LOG_CSV}"
@@ -182,17 +192,45 @@ if [[ "${BENCHMARK_MODE}" == "1" ]]; then
   COMMON_ARGS+=(--benchmark-mode)
 fi
 
+npf_identity_arg="--no-npf-identity-init"
+case "${NPF_IDENTITY_INIT}" in
+  1|true|True|TRUE|yes|Yes|YES)
+    npf_identity_arg="--npf-identity-init"
+    ;;
+esac
+npf_pos_weights_arg="--npf-pos-weights"
+case "${NPF_POS_WEIGHTS}" in
+  0|false|False|FALSE|no|No|NO)
+    npf_pos_weights_arg="--no-npf-pos-weights"
+    ;;
+esac
+npf_lastquad_identity_arg="--no-npf-lastquad-identity-init"
+case "${NPF_LASTQUAD_IDENTITY_INIT}" in
+  1|true|True|TRUE|yes|Yes|YES)
+    npf_lastquad_identity_arg="--npf-lastquad-identity-init"
+    ;;
+esac
+npf_lastquad_pos_weights_arg="--npf-lastquad-pos-weights"
+case "${NPF_LASTQUAD_POS_WEIGHTS}" in
+  0|false|False|FALSE|no|No|NO)
+    npf_lastquad_pos_weights_arg="--no-npf-lastquad-pos-weights"
+    ;;
+esac
+
 case "${ALGORITHM}" in
   npf)
     EXTRA_ARGS=(
       --omega-steps-per-batch "${OMEGA_STEPS}"
       --npf-hidden "${NPF_HIDDEN_ARGS[@]}"
-      --npf-outer-rank "${NPF_OUTER_RANK:-8}"
-      --npf-inner-rank "${NPF_INNER_RANK:-2}"
-      --npf-activation "${NPF_ACTIVATION:-softplus}"
-      --npf-softplus-beta "${NPF_SOFTPLUS_BETA:-10.0}"
-      --npf-init-eps "${NPF_INIT_EPS:-1e-4}"
+      --npf-outer-rank "${NPF_OUTER_RANK:-1}"
+      --npf-inner-rank "${NPF_INNER_RANK:-1}"
+      --npf-activation "${NPF_ACTIVATION:-relu}"
+      --npf-softplus-beta "${NPF_SOFTPLUS_BETA:-20.0}"
+      --npf-init-eps "${NPF_INIT_EPS:-0.0}"
+      "${npf_identity_arg}"
       --npf-strong-convexity "${NPF_STRONG_CONVEXITY:-1.0}"
+      "${npf_pos_weights_arg}"
+      --npf-positive-weight-rectifier "${NPF_POSITIVE_WEIGHT_RECTIFIER}"
       --bb-alpha0 "${NPF_BB_ALPHA0:-2e-4}"
       --bb-alpha-min "${NPF_BB_ALPHA_MIN:-1e-7}"
       --bb-alpha-max "${NPF_BB_ALPHA_MAX:-0.25}"
@@ -206,11 +244,14 @@ case "${ALGORITHM}" in
       --omega-steps-per-batch "${OMEGA_STEPS}"
       --npf-lastquad-hidden "${NPF_LASTQUAD_HIDDEN_ARGS[@]}"
       --npf-lastquad-output-rank "${NPF_LASTQUAD_OUTPUT_RANK:-0}"
-      --npf-lastquad-activation "${NPF_LASTQUAD_ACTIVATION:-${NPF_ACTIVATION:-softplus}}"
+      --npf-lastquad-activation "${NPF_LASTQUAD_ACTIVATION:-${NPF_ACTIVATION:-relu}}"
       --npf-lastquad-elu-alpha "${NPF_LASTQUAD_ELU_ALPHA:-1.0}"
-      --npf-lastquad-softplus-beta "${NPF_LASTQUAD_SOFTPLUS_BETA:-${NPF_SOFTPLUS_BETA:-10.0}}"
-      --npf-lastquad-init-eps "${NPF_LASTQUAD_INIT_EPS:-${NPF_INIT_EPS:-1e-4}}"
+      --npf-lastquad-softplus-beta "${NPF_LASTQUAD_SOFTPLUS_BETA:-${NPF_SOFTPLUS_BETA:-20.0}}"
+      --npf-lastquad-init-eps "${NPF_LASTQUAD_INIT_EPS:-${NPF_INIT_EPS:-0.0}}"
+      "${npf_lastquad_identity_arg}"
       --npf-lastquad-strong-convexity "${NPF_LASTQUAD_STRONG_CONVEXITY:-${NPF_STRONG_CONVEXITY:-1.0}}"
+      "${npf_lastquad_pos_weights_arg}"
+      --npf-lastquad-positive-weight-rectifier "${NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER}"
       --bb-alpha0 "${NPF_LASTQUAD_BB_ALPHA0:-${NPF_BB_ALPHA0:-2e-4}}"
       --bb-alpha-min "${NPF_LASTQUAD_BB_ALPHA_MIN:-${NPF_BB_ALPHA_MIN:-1e-7}}"
       --bb-alpha-max "${NPF_LASTQUAD_BB_ALPHA_MAX:-${NPF_BB_ALPHA_MAX:-0.25}}"

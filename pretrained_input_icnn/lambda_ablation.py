@@ -240,13 +240,18 @@ def _build_potential_from_config(config: Mapping[str, Any], algorithm: str) -> N
             hidden_sizes=_as_tuple(config.get("npf_lastquad_hidden"), (512, 512, 256, 128, 64)),
             outer_rank=0,
             inner_rank=0,
+            output_rank=int(config.get("npf_lastquad_output_rank", 0)),
             quadratic_mode="last_layer_diagonal",
             trainable_outer_quadratic=False,
             activation=str(config.get("npf_lastquad_activation", "softplus")),
             elu_alpha=float(config.get("npf_lastquad_elu_alpha", 1.0)),
             softplus_beta=float(config.get("npf_lastquad_softplus_beta", 10.0)),
-            init_eps=float(config.get("npf_lastquad_init_eps", 1e-4)),
+            init_eps=float(config.get("npf_lastquad_init_eps", 1e-2)),
             strong_convexity=float(config.get("npf_lastquad_strong_convexity", 1.0)),
+            pos_weights=bool(config.get("npf_lastquad_pos_weights", True)),
+            positive_weight_rectifier=str(
+                config.get("npf_lastquad_positive_weight_rectifier", "relu")
+            ),
         )
     if algorithm == "npf":
         return NPFInputConvexPotential(
@@ -261,6 +266,10 @@ def _build_potential_from_config(config: Mapping[str, Any], algorithm: str) -> N
             softplus_beta=float(config.get("npf_softplus_beta", 10.0)),
             init_eps=float(config.get("npf_init_eps", 1e-4)),
             strong_convexity=float(config.get("npf_strong_convexity", 1.0)),
+            pos_weights=bool(config.get("npf_pos_weights", True)),
+            positive_weight_rectifier=str(
+                config.get("npf_positive_weight_rectifier", "relu")
+            ),
         )
     raise ValueError(f"Unsupported checkpoint algorithm {algorithm!r}; expected npf or npf_lastquad.")
 

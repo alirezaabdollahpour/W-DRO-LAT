@@ -47,7 +47,10 @@ class WRMTrainer(BaseAdvTrainer):
     ) -> torch.Tensor:
         cfg = self.config
 
-        with frozen_module(self._classifier_module):
+        with frozen_module(
+            self._classifier_module,
+            eval_mode=self._adversary_classifier_eval_mode(),
+        ):
             def f_obj(z_var: torch.Tensor, create_graph: bool) -> torch.Tensor:
                 self.profile_add("objective_calls", 1.0)
                 self.profile_add(

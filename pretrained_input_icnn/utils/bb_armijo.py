@@ -73,14 +73,22 @@ class BBArmijoState:
             denom = torch.dot(s, y)
             if bool(torch.isfinite(denom).item()):
                 denom_float = float(denom.item())
-                if denom_float < -1e-12:
-                    num = torch.dot(s, s)
+                # Scale-aware curvature test: an absolute 1e-12 threshold
+                # treats tiny noisy secants as real curvature and pins alpha
+                # at alpha_min for the rest of the inner loop.
+                tol = max(
+                    1e-12,
+                    1e-6 * float(s.norm().item()) * float(y.norm().item()),
+                )
+                num = torch.dot(s, s)
+                if denom_float < -tol:
                     alpha = float((-num / denom).item())
-                elif abs(denom_float) > 1e-12:
-                    # Wrong curvature for ascent. Reusing a stale alpha_prev
-                    # can keep taking large steps after the local objective has
-                    # become convex/noisy; fall back to the conservative bound.
-                    alpha = self.alpha_min
+                elif denom_float > tol:
+                    # Locally convex along the step. The legacy golden-run BB
+                    # proposed <s,s>/<s,y> (positive, often large) here and
+                    # let the Armijo line search shrink it; that is what let
+                    # the legacy adversary climb fast out of flat starts.
+                    alpha = float((num / denom).item())
                 else:
                     alpha = self.alpha_prev
             else:
@@ -174,7 +182,7 @@ def bb_armijo_step_params(
     """
     _profile_add(profile, "bb_steps", 1.0)
     with _profile_time(profile, "bb_params_prepare_s"):
-        params = list(params)
+        params = [p for p in list(params) if p.requires_grad]
         if len(params) == 0:
             raise ValueError("bb_armijo_step_params received an empty parameter list.")
         params_vec = nn_utils.parameters_to_vector(params).detach()

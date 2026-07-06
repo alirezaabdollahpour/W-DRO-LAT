@@ -48,21 +48,27 @@ class TrainConfig:
     # ``pretrained_INPUT_icnn.py``. For stateless attacks (Madry / WRM /
     # WFR / Dual / New_PPA) warmup is a no-op since they don't have
     # persistent adversary state to carry across batches.
-    epochs_icnn_pretrain: int = 0
+    epochs_icnn_pretrain: int = 2
     # Optional post phase: after ordinary adversarial training, freeze the
     # learned parametric adversary and continue updating only the classifier on
     # T_omega^m(x). This is useful for testing whether the learned NPF map can
     # be reused as a fixed data transform.
     frozen_adversary_epochs: int = 0
     frozen_adversary_map_steps: int = 1
-    batch_size: int = 256
+    batch_size: int = 512
     num_workers: int = 2
     augment_train: bool = True
-    lr_theta: float = 0.1
+    lr_theta: float = 0.05
     momentum: float = 0.9
     weight_decay: float = 5e-4
-    freeze_batchnorm: bool = True
+    freeze_batchnorm: bool = False
     freeze_batchnorm_affine: bool = False
+    # Stable legacy input-ICNN behavior keeps the classifier in train mode
+    # during adversary-side forwards in minimax epochs, while freezing only
+    # parameter gradients. That lets BatchNorm running stats adapt online.
+    # The default here is the safer eval-mode adversary objective used by the
+    # newer runtime code; pass --adversary-classifier-train to match legacy.
+    adversary_classifier_eval: bool = True
     online_batchnorm_refresh: bool = False
     batchnorm_online_refresh_momentum: Optional[float] = None
     recalibrate_batchnorm: bool = False
@@ -110,13 +116,38 @@ class TrainConfig:
     transport_cost: str = "normalized_mse"
 
     # --- Inner-loop budget shared by NPF / NN-DRO ---
-    omega_steps_per_batch: int = 20
+    omega_steps_per_batch: int = 10
 
     # --- NPF inner optimizer selection ---
     # ``bb_armijo`` preserves the existing line-searched ascent. ``muon`` uses
     # momentum plus Newton-Schulz orthogonalized matrix updates for the NPF ICNN
     # parameters, with an AdamW/SGD fallback for vector parameters.
     npf_inner_optimizer: str = "bb_armijo"
+    # Reset the NPF potential to its identity-adjacent initialization before
+    # every batch's inner maximization. This is useful when the classifier
+    # quickly overfits a persistent learned map and the inner loop needs fresh
+    # restarts, closer in spirit to per-batch PGD.
+    npf_reset_omega_each_batch: bool = False
+    # Project the learned NPF transport output into the configured input-PGD
+    # threat set before scoring the inner objective and before classifier
+    # updates. This is off by default for unconstrained WDRO experiments, but
+    # useful when directly targeting PGD robustness at cfg.inp_eps.
+    npf_project_to_input_ball: bool = False
+    # Optional amortization/anchor term for PGD-targeted NPF training:
+    # the inner objective additionally encourages T_omega(x) to match a small
+    # per-batch PGD adversary. Weight 0 keeps the pure NPF objective.
+    npf_pgd_anchor_weight: float = 0.0
+    npf_pgd_anchor_steps: int = 5
+    npf_pgd_anchor_restarts: int = 1
+    npf_pgd_anchor_loss: str = "margin"
+    # L2 decay applied inside the omega ascent objective to the FREE
+    # (unconstrained) input-side kernels only: hidden affine input skips and
+    # the PosDef lin/quad kernels. Legacy pretrained_INPUT_icnn folded exactly
+    # this (1e-4) into every accepted BB step; over ~30k persistent-omega
+    # steps it is the slow force that taxes unbounded growth of the far-field
+    # translation/rescale kernels while leaving the positive-reparametrized
+    # ladder and biases untouched.
+    npf_omega_weight_decay: float = 1e-4
 
     # --- Shared BB+Armijo step rule ---
     # Applied UNIFORMLY across all adversaries that have an inner ascent:
@@ -135,26 +166,34 @@ class TrainConfig:
     # Defaults mirror NPF's settings from the LR-CIFAR10 reference so a
     # cross-method runtime comparison reflects only the per-method
     # objective cost, not the step rule.
-    bb_alpha0: float = 2e-4
-    bb_alpha_min: float = 1e-7
-    bb_alpha_max: float = 0.25
-    bb_ls_c: float = 1e-4
+    bb_alpha0: float = 5e-4
+    bb_alpha_min: float = 1e-6
+    bb_alpha_max: float = 1.0
+    bb_ls_c: float = 0.1
     bb_ls_shrink: float = 0.5
-    bb_ls_max_steps: int = 15
+    bb_ls_max_steps: int = 10
     # Legacy pretrained_INPUT_icnn.py clipped ICNN adversary gradients before
     # the BB proposal and Armijo trials. Applies only to shared parametric
     # BB adversaries (NPF / NPF-LastQuad / NN-DRO). Set 0 to disable.
     parametric_bb_max_grad_norm: float = 1.0
 
-    # --- NPF hyperparameters (LR-CIFAR10 defaults) ---
-    npf_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
-    npf_outer_rank: int = 8
-    npf_inner_rank: int = 2
+    # --- NPF hyperparameters (OTT-style ICNN defaults) ---
+    npf_hidden: Tuple[int, ...] = (1024, 512, 512, 256, 128, 64)
+    npf_outer_rank: int = 1
+    npf_inner_rank: int = 1
     npf_activation: str = "softplus"
     npf_elu_alpha: float = 1.0
-    npf_softplus_beta: float = 10.0
-    npf_init_eps: float = 1e-4
+    npf_softplus_beta: float = 20.0
+    # Retained for checkpoint/config compatibility. The faithful OTT
+    # constructor does not use this scale unless exact identity init is enabled.
+    npf_init_eps: float = 1e-2
+    npf_identity_init: bool = True
     npf_strong_convexity: float = 1.0
+    # OTT exposes pos_weights=False, assuming a separate clipping/regularizing
+    # path. This trainer has no such projection pass, so keep projection on by
+    # default to preserve ICNN convexity.
+    npf_pos_weights: bool = True
+    npf_positive_weight_rectifier: str = "exp"
     npf_bb_alpha0: float = 2e-4
     npf_bb_alpha_min: float = 1e-7
     npf_bb_alpha_max: float = 0.25
@@ -176,18 +215,26 @@ class TrainConfig:
     npf_muon_max_grad_norm: float = 0.0
 
     # --- NPF last-quadratic-only variant ---
-    # This shares the NPF trainer, selectable NPF inner optimizer, LogNormal
-    # non-negative layers, and identity initialization. Its potential removes
-    # all hidden quadratic injections and keeps q_out as the only trainable
-    # quadratic block. The default output rank 0 is diagonal-only; setting
-    # npf_lastquad_output_rank > 0 adds a learnable low-rank factor to q_out.
-    npf_lastquad_hidden: Tuple[int, ...] = (512, 512, 256, 128, 64)
-    npf_lastquad_output_rank: int = 0
+    # This shares the OTT-style NPF trainer. Hidden input skips are affine, and
+    # the final activated scalar input skip is the only learned quadratic block.
+    # The separate final identity positive-definite potential remains present.
+    npf_lastquad_hidden: Tuple[int, ...] = (1024, 512, 512, 256, 128, 64)
+    # Rank of the final trainable input quadratic. The 2026-07-06 probe and
+    # the ablC training run proved this is the decisive capacity knob: rank 2
+    # confines the ascent to 1-2 shared far-field directions (top-1 SVD ~46%
+    # of delta energy, transported acc barely moves), while rank 64 makes the
+    # same K=10 ascent drive transported acc 94%->17% with far more
+    # sample-dependent deltas (top-1 SVD ~26%) and lifted PGD@0.5 from ~10%
+    # to 45%+ in full training.
+    npf_lastquad_output_rank: int = 64
     npf_lastquad_activation: str = "softplus"
     npf_lastquad_elu_alpha: float = 1.0
-    npf_lastquad_softplus_beta: float = 10.0
-    npf_lastquad_init_eps: float = 1e-4
+    npf_lastquad_softplus_beta: float = 20.0
+    npf_lastquad_init_eps: float = 1e-2
+    npf_lastquad_identity_init: bool = False
     npf_lastquad_strong_convexity: float = 1.0
+    npf_lastquad_pos_weights: bool = True
+    npf_lastquad_positive_weight_rectifier: str = "exp"
 
     # --- NN-DRO hyperparameters ---
     nn_dro_hidden: Tuple[int, ...] = (512, 512, 256, 256, 128)
@@ -273,13 +320,22 @@ class TrainConfig:
 
     # --- Evaluation (input-space PGD) ---
     eval_input_pgd: bool = True
-    eval_input_pgd_samples: int = 1000
-    input_pgd_loss: str = "margin"
+    eval_input_pgd_samples: int = 1024
+    eval_transport_pgd_alignment: bool = False
+    eval_transport_pgd_alignment_samples: int = 256
+    input_pgd_loss: str = "ce"
+    input_pgd_geometry: str = "pixel_l2_squared"
     inp_p: str = "2"
     inp_eps: float = 0.5
     inp_steps: int = 20
     inp_step_size: float = 0.0
     inp_restarts: int = 5
+    wrm_normalized_radius_protocol: str = ""
+    wrm_pgd_eps_mode: str = ""
+    wrm_normalized_radius_requested: Optional[float] = None
+    wrm_normalized_radius: Optional[float] = None
+    wrm_cp: Optional[float] = None
+    wrm_effective_inp_eps: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -339,17 +395,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--algorithm",
         type=str,
-        default="npf",
+        default="npf_lastquad",
         choices=list(ALL_ALGORITHMS),
         help="Which adversarial training algorithm to run.",
     )
 
     # Outer optimisation
-    parser.add_argument("--epochs-adv", type=int, default=30)
+    parser.add_argument("--epochs-adv", type=int, default=50)
     parser.add_argument(
         "--epochs-icnn-pretrain",
         type=int,
-        default=0,
+        default=2,
         help=(
             "Warmup epochs spent training only the adversary (e.g. NPF ω) "
             "before the standard adversarial training kicks in. The "
@@ -375,11 +431,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "during --frozen-adversary-epochs, e.g. 2 means T_omega(T_omega(x))."
         ),
     )
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--no-augment", dest="augment_train", action="store_false")
     parser.set_defaults(augment_train=True)
-    parser.add_argument("--lr-theta", type=float, default=0.1)
+    parser.add_argument("--lr-theta", type=float, default=0.05)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument(
@@ -397,7 +453,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Allow BatchNorm running statistics to update during classifier training.",
     )
-    parser.set_defaults(freeze_batchnorm=True)
+    parser.set_defaults(freeze_batchnorm=False)
     parser.add_argument(
         "--freeze-batchnorm-affine",
         dest="freeze_batchnorm_affine",
@@ -415,6 +471,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Allow BatchNorm affine weight/bias parameters to train.",
     )
     parser.set_defaults(freeze_batchnorm_affine=False)
+    parser.add_argument(
+        "--adversary-classifier-eval",
+        dest="adversary_classifier_eval",
+        action="store_true",
+        help=(
+            "Put the classifier in eval mode for adversary-side forwards "
+            "(clean-correct mask and inner maximization). This preserves "
+            "BatchNorm running statistics during the adversary objective."
+        ),
+    )
+    parser.add_argument(
+        "--adversary-classifier-train",
+        dest="adversary_classifier_eval",
+        action="store_false",
+        help=(
+            "Legacy stable input-ICNN behavior: freeze classifier parameter "
+            "gradients during adversary-side forwards but preserve train/eval "
+            "mode, allowing BatchNorm running statistics to update in "
+            "adversarial epochs. Warmup still forces eval mode."
+        ),
+    )
+    parser.set_defaults(adversary_classifier_eval=True)
     parser.add_argument(
         "--online-batchnorm-refresh",
         dest="online_batchnorm_refresh",
@@ -500,7 +578,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--penalty-lambda",
         type=float,
-        default=None,
+        default=30.0,
         help="DRO penalty λ multiplying ||T(x) - x||^2.",
     )
     parser.add_argument(
@@ -544,14 +622,88 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "configured fallback for vector parameters."
         ),
     )
+    parser.add_argument(
+        "--npf-reset-omega-each-batch",
+        dest="npf_reset_omega_each_batch",
+        action="store_true",
+        help=(
+            "Reset NPF/NPF-LastQuad omega to its identity-adjacent "
+            "initialization before each batch inner maximization. This makes "
+            "the learned transport attack behave like a fresh per-batch "
+            "inner optimizer instead of a persistent global map."
+        ),
+    )
+    parser.add_argument(
+        "--no-npf-reset-omega-each-batch",
+        dest="npf_reset_omega_each_batch",
+        action="store_false",
+        help="Keep NPF/NPF-LastQuad omega persistent across batches.",
+    )
+    parser.set_defaults(npf_reset_omega_each_batch=False)
+    parser.add_argument(
+        "--npf-project-to-input-ball",
+        dest="npf_project_to_input_ball",
+        action="store_true",
+        help=(
+            "Project NPF/NPF-LastQuad transports into the configured input-PGD "
+            "threat set before the inner objective and classifier update. "
+            "For pixel_l2_squared PGD this enforces pixel-space ||delta||_p <= inp_eps."
+        ),
+    )
+    parser.add_argument(
+        "--no-npf-project-to-input-ball",
+        dest="npf_project_to_input_ball",
+        action="store_false",
+        help="Leave NPF/NPF-LastQuad transports unconstrained except for image box clamping.",
+    )
+    parser.set_defaults(npf_project_to_input_ball=False)
+    parser.add_argument(
+        "--npf-omega-weight-decay",
+        type=float,
+        default=1e-4,
+        help=(
+            "L2 decay on the FREE omega kernels (affine input skips, PosDef "
+            "lin/quad) inside the ascent objective. Legacy golden-run parity "
+            "is 1e-4; 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--npf-pgd-anchor-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for an optional per-batch PGD anchor term in the NPF "
+            "omega objective. 0 disables it. A positive value encourages "
+            "T_omega(x) to align with a local PGD maximizer."
+        ),
+    )
+    parser.add_argument(
+        "--npf-pgd-anchor-steps",
+        type=int,
+        default=5,
+        help="PGD steps used for the optional NPF anchor target.",
+    )
+    parser.add_argument(
+        "--npf-pgd-anchor-restarts",
+        type=int,
+        default=1,
+        help="PGD restarts used for the optional NPF anchor target.",
+    )
+    parser.add_argument(
+        "--npf-pgd-anchor-loss",
+        type=str,
+        default="margin",
+        choices=["margin", "ce"],
+        help="Loss maximized by the optional NPF PGD anchor target.",
+    )
     # Shared BB+Armijo step rule (DRO inner ascent only; Madry/RO uses PGD).
     bb = parser.add_argument_group("bb_armijo (shared step rule)")
-    bb.add_argument("--bb-alpha0", type=float, default=2e-4)
-    bb.add_argument("--bb-alpha-min", type=float, default=1e-7)
-    bb.add_argument("--bb-alpha-max", type=float, default=0.25)
-    bb.add_argument("--bb-ls-c", type=float, default=1e-4)
+    bb.add_argument("--bb-alpha0", type=float, default=5e-4)
+    bb.add_argument("--bb-alpha-min", type=float, default=1e-6)
+    bb.add_argument("--bb-alpha-max", type=float, default=1.0)
+    bb.add_argument("--bb-ls-c", type=float, default=0.1)
     bb.add_argument("--bb-ls-shrink", type=float, default=0.5)
-    bb.add_argument("--bb-ls-max-steps", type=int, default=15)
+    bb.add_argument("--bb-ls-max-steps", type=int, default=10)
     bb.add_argument(
         "--parametric-bb-max-grad-norm",
         type=float,
@@ -577,7 +729,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="use_margin_loss",
         action="store_false",
     )
-    parser.set_defaults(use_margin_loss=False)
+    parser.set_defaults(use_margin_loss=True)
     parser.add_argument(
         "--attack-clean-correct-only",
         dest="attack_clean_correct_only",
@@ -625,17 +777,76 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # NPF
     npf = parser.add_argument_group("npf")
-    npf.add_argument("--npf-hidden", type=int, nargs="+", default=[512, 512, 256, 128, 64])
-    npf.add_argument("--npf-outer-rank", type=int, default=8)
-    npf.add_argument("--npf-inner-rank", type=int, default=2)
+    npf.add_argument("--npf-hidden", type=int, nargs="+", default=[1024, 512, 512, 256, 128, 64])
+    npf.add_argument("--npf-outer-rank", type=int, default=1)
+    npf.add_argument("--npf-inner-rank", type=int, default=1)
     npf.add_argument(
         "--npf-activation", type=str, default="softplus",
         choices=["elu", "softplus", "relu"],
     )
     npf.add_argument("--npf-elu-alpha", type=float, default=1.0)
-    npf.add_argument("--npf-softplus-beta", type=float, default=10.0)
-    npf.add_argument("--npf-init-eps", type=float, default=1e-4)
+    npf.add_argument("--npf-softplus-beta", type=float, default=20.0)
+    npf.add_argument(
+        "--npf-init-eps",
+        type=float,
+        default=1e-2,
+        help=(
+            "Backward-compatible metadata for older NPF configs. The faithful "
+            "OTT initializer does not use this value unless identity init is enabled."
+        ),
+    )
+    npf.add_argument(
+        "--npf-identity-init",
+        dest="npf_identity_init",
+        action="store_true",
+        help=(
+            "Apply exact identity initialization after constructing the OTT-style "
+            "potential: zero the residual ICNN and keep only the final "
+            "0.5 * strong_convexity * ||x||^2 potential."
+        ),
+    )
+    npf.add_argument(
+        "--no-npf-identity-init",
+        dest="npf_identity_init",
+        action="store_false",
+        help=(
+            "Use the faithful OTT constructor initialization instead of zeroing "
+            "the residual ICNN."
+        ),
+    )
+    parser.set_defaults(npf_identity_init=True)
     npf.add_argument("--npf-strong-convexity", type=float, default=1.0)
+    npf.add_argument(
+        "--npf-pos-weights",
+        dest="npf_pos_weights",
+        action="store_true",
+        help=(
+            "Project hidden-to-hidden NPF weights through a nonnegative "
+            "rectifier. This is the safe default because the trainer has no "
+            "separate weight-clipping pass."
+        ),
+    )
+    npf.add_argument(
+        "--no-npf-pos-weights",
+        dest="npf_pos_weights",
+        action="store_false",
+        help=(
+            "Match OTT's unprojected Dense option. Use only with an external "
+            "nonnegative-weight clipping/regularization path."
+        ),
+    )
+    parser.set_defaults(npf_pos_weights=True)
+    npf.add_argument(
+        "--npf-positive-weight-rectifier",
+        type=str,
+        default="exp",
+        choices=["relu", "softplus", "exp"],
+        help=(
+            "Reparametrization for nonnegative hidden weights. 'exp' matches "
+            "the legacy pretrained_INPUT_icnn NonNegativeLinear exactly "
+            "(strictly positive, never-dead gradients)."
+        ),
+    )
     npf.add_argument("--npf-bb-alpha0", type=float, default=2e-4)
     npf.add_argument("--npf-bb-alpha-min", type=float, default=1e-7)
     npf.add_argument("--npf-bb-alpha-max", type=float, default=0.25)
@@ -703,27 +914,83 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--npf-lastquad-hidden",
         type=int,
         nargs="+",
-        default=[512, 512, 256, 128, 64],
+        default=[1024, 512, 512, 256, 128, 64],
     )
     npf_lq.add_argument(
         "--npf-lastquad-activation",
         type=str,
-        default="elu",
+        default="softplus",
         choices=["elu", "softplus", "relu"],
     )
     npf_lq.add_argument("--npf-lastquad-elu-alpha", type=float, default=1.0)
     npf_lq.add_argument(
         "--npf-lastquad-output-rank",
         type=int,
-        default=0,
+        default=64,
         help=(
             "Rank of the learnable low-rank quadratic factor in the final "
-            "LastQuad output block. 0 keeps the legacy diagonal-only LastQuad."
+            "LastQuad output block. 0 keeps the diagonal-only LastQuad; the "
+            "measured default 64 is what gives the ascent enough "
+            "sample-dependent directions (rank 2 collapses to shared "
+            "far-field deltas and the classifier neutralizes them)."
         ),
     )
-    npf_lq.add_argument("--npf-lastquad-softplus-beta", type=float, default=10.0)
-    npf_lq.add_argument("--npf-lastquad-init-eps", type=float, default=1e-2)
+    npf_lq.add_argument("--npf-lastquad-softplus-beta", type=float, default=20.0)
+    npf_lq.add_argument(
+        "--npf-lastquad-init-eps",
+        type=float,
+        default=1e-2,
+        help=(
+            "Residual ICNN scale used when --npf-lastquad-identity-init is "
+            "enabled. Values that are too small, especially with a softplus "
+            "positive-weight rectifier, can saturate the residual path and "
+            "leave LastQuad almost exactly at T(x)=x."
+        ),
+    )
+    npf_lq.add_argument(
+        "--npf-lastquad-identity-init",
+        dest="npf_lastquad_identity_init",
+        action="store_true",
+        help=(
+            "Apply exact identity initialization after constructing LastQuad: "
+            "zero the residual ICNN and keep only the final identity "
+            "positive-definite potential."
+        ),
+    )
+    npf_lq.add_argument(
+        "--no-npf-lastquad-identity-init",
+        dest="npf_lastquad_identity_init",
+        action="store_false",
+        help=(
+            "Use the faithful OTT-style constructor initialization for LastQuad."
+        ),
+    )
+    parser.set_defaults(npf_lastquad_identity_init=False)
     npf_lq.add_argument("--npf-lastquad-strong-convexity", type=float, default=1.0)
+    npf_lq.add_argument(
+        "--npf-lastquad-pos-weights",
+        dest="npf_lastquad_pos_weights",
+        action="store_true",
+        help="Project LastQuad hidden-to-hidden weights through a nonnegative rectifier.",
+    )
+    npf_lq.add_argument(
+        "--no-npf-lastquad-pos-weights",
+        dest="npf_lastquad_pos_weights",
+        action="store_false",
+        help="Use unprojected hidden-to-hidden Dense layers in LastQuad.",
+    )
+    parser.set_defaults(npf_lastquad_pos_weights=True)
+    npf_lq.add_argument(
+        "--npf-lastquad-positive-weight-rectifier",
+        type=str,
+        default="exp",
+        choices=["relu", "softplus", "exp"],
+        help=(
+            "Reparametrization for nonnegative hidden weights. 'exp' matches "
+            "the legacy pretrained_INPUT_icnn NonNegativeLinear exactly "
+            "(strictly positive, never-dead gradients)."
+        ),
+    )
 
     # NN-DRO
     nn_dro = parser.add_argument_group("nn_dro")
@@ -827,11 +1094,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-input-pgd", dest="eval_input_pgd", action="store_true")
     parser.add_argument("--no-eval-input-pgd", dest="eval_input_pgd", action="store_false")
     parser.set_defaults(eval_input_pgd=True)
-    parser.add_argument("--eval-input-pgd-samples", type=int, default=1000)
+    parser.add_argument("--eval-input-pgd-samples", type=int, default=1024)
+    parser.add_argument(
+        "--eval-transport-pgd-alignment",
+        dest="eval_transport_pgd_alignment",
+        action="store_true",
+        help=(
+            "Run a small diagnostic PGD attack and log cosine alignment between "
+            "the learned transport delta and PGD delta."
+        ),
+    )
+    parser.add_argument(
+        "--no-eval-transport-pgd-alignment",
+        dest="eval_transport_pgd_alignment",
+        action="store_false",
+        help="Disable the transport-vs-PGD direction alignment diagnostic.",
+    )
+    parser.set_defaults(eval_transport_pgd_alignment=False)
+    parser.add_argument("--eval-transport-pgd-alignment-samples", type=int, default=256)
     parser.add_argument(
         "--input-pgd-loss",
         type=str,
-        default="margin",
+        default="ce",
         choices=["margin", "ce"],
         help=(
             "Loss maximized by input-space PGD evaluation. The default "
@@ -839,11 +1123,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "for legacy comparisons."
         ),
     )
+    parser.add_argument(
+        "--input-pgd-geometry",
+        type=str,
+        default="pixel_l2_squared",
+        choices=["pixel_l2_squared", "normalized_mse"],
+        help=(
+            "Geometry used by input-space PGD evaluation. pixel_l2_squared "
+            "is the standard CIFAR pixel-space L2/Linf threat model where "
+            "--inp-eps is a norm radius. normalized_mse runs L2 PGD in "
+            "normalized CIFAR coordinates and interprets --inp-eps as the "
+            "budget on mean((x_adv_norm - x_norm)^2)."
+        ),
+    )
     parser.add_argument("--inp-p", type=str, default="2", choices=["2", "inf"])
     parser.add_argument("--inp-eps", type=float, default=0.5)
     parser.add_argument("--inp-steps", type=int, default=20)
     parser.add_argument("--inp-step-size", type=float, default=0.0)
     parser.add_argument("--inp-restarts", type=int, default=5)
+    parser.add_argument(
+        "--wrm-normalized-radius-protocol",
+        type=str,
+        default="",
+        help=(
+            "Metadata for WRM-style PGD reporting. When set by a launcher, "
+            "--inp-eps is the raw PGD radius obtained from rho*C_p."
+        ),
+    )
+    parser.add_argument("--wrm-pgd-eps-mode", type=str, default="")
+    parser.add_argument("--wrm-normalized-radius-requested", type=float, default=None)
+    parser.add_argument("--wrm-normalized-radius", type=float, default=None)
+    parser.add_argument("--wrm-cp", type=float, default=None)
+    parser.add_argument("--wrm-effective-inp-eps", type=float, default=None)
 
     return parser
 
@@ -889,6 +1200,10 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
             raise ValueError(
                 "--batchnorm-online-refresh-momentum must be finite and in [0, 1]."
             )
+    if args.input_pgd_geometry == "normalized_mse" and args.inp_p != "2":
+        raise ValueError("--input-pgd-geometry normalized_mse requires --inp-p 2.")
+    if not math.isfinite(float(args.inp_eps)) or float(args.inp_eps) < 0.0:
+        raise ValueError("--inp-eps must be non-negative and finite.")
     if not math.isfinite(lambda_param) or lambda_param <= 0.0:
         raise ValueError(f"lambda_param must be positive and finite, got {lambda_param}.")
     if lambda_schedule:
@@ -944,6 +1259,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "weight_decay": "weight_decay",
         "freeze_batchnorm": "freeze_batchnorm",
         "freeze_batchnorm_affine": "freeze_batchnorm_affine",
+        "adversary_classifier_eval": "adversary_classifier_eval",
         "online_batchnorm_refresh": "online_batchnorm_refresh",
         "batchnorm_online_refresh_momentum": "batchnorm_online_refresh_momentum",
         "recalibrate_batchnorm": "recalibrate_batchnorm",
@@ -953,6 +1269,13 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "seed": "seed",
         "omega_steps_per_batch": "omega_steps_per_batch",
         "npf_inner_optimizer": "npf_inner_optimizer",
+        "npf_reset_omega_each_batch": "npf_reset_omega_each_batch",
+        "npf_project_to_input_ball": "npf_project_to_input_ball",
+        "npf_omega_weight_decay": "npf_omega_weight_decay",
+        "npf_pgd_anchor_weight": "npf_pgd_anchor_weight",
+        "npf_pgd_anchor_steps": "npf_pgd_anchor_steps",
+        "npf_pgd_anchor_restarts": "npf_pgd_anchor_restarts",
+        "npf_pgd_anchor_loss": "npf_pgd_anchor_loss",
         "bb_alpha0": "bb_alpha0",
         "bb_alpha_min": "bb_alpha_min",
         "bb_alpha_max": "bb_alpha_max",
@@ -972,7 +1295,10 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "npf_elu_alpha": "npf_elu_alpha",
         "npf_softplus_beta": "npf_softplus_beta",
         "npf_init_eps": "npf_init_eps",
+        "npf_identity_init": "npf_identity_init",
         "npf_strong_convexity": "npf_strong_convexity",
+        "npf_pos_weights": "npf_pos_weights",
+        "npf_positive_weight_rectifier": "npf_positive_weight_rectifier",
         "npf_bb_alpha0": "npf_bb_alpha0",
         "npf_bb_alpha_min": "npf_bb_alpha_min",
         "npf_bb_alpha_max": "npf_bb_alpha_max",
@@ -998,7 +1324,10 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "npf_lastquad_elu_alpha": "npf_lastquad_elu_alpha",
         "npf_lastquad_softplus_beta": "npf_lastquad_softplus_beta",
         "npf_lastquad_init_eps": "npf_lastquad_init_eps",
+        "npf_lastquad_identity_init": "npf_lastquad_identity_init",
         "npf_lastquad_strong_convexity": "npf_lastquad_strong_convexity",
+        "npf_lastquad_pos_weights": "npf_lastquad_pos_weights",
+        "npf_lastquad_positive_weight_rectifier": "npf_lastquad_positive_weight_rectifier",
         "nn_dro_hidden": "nn_dro_hidden",
         "nn_dro_activation": "nn_dro_activation",
         "nn_dro_softplus_beta": "nn_dro_softplus_beta",
@@ -1030,12 +1359,21 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "ppa_gain_rtol": "ppa_gain_rtol",
         "eval_input_pgd": "eval_input_pgd",
         "eval_input_pgd_samples": "eval_input_pgd_samples",
+        "eval_transport_pgd_alignment": "eval_transport_pgd_alignment",
+        "eval_transport_pgd_alignment_samples": "eval_transport_pgd_alignment_samples",
         "input_pgd_loss": "input_pgd_loss",
+        "input_pgd_geometry": "input_pgd_geometry",
         "inp_p": "inp_p",
         "inp_eps": "inp_eps",
         "inp_steps": "inp_steps",
         "inp_step_size": "inp_step_size",
         "inp_restarts": "inp_restarts",
+        "wrm_normalized_radius_protocol": "wrm_normalized_radius_protocol",
+        "wrm_pgd_eps_mode": "wrm_pgd_eps_mode",
+        "wrm_normalized_radius_requested": "wrm_normalized_radius_requested",
+        "wrm_normalized_radius": "wrm_normalized_radius",
+        "wrm_cp": "wrm_cp",
+        "wrm_effective_inp_eps": "wrm_effective_inp_eps",
     }
     for cli, dest in cli_to_field.items():
         if not hasattr(args, cli):

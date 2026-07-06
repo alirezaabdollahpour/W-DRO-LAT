@@ -17,7 +17,13 @@ from pretrained_input_icnn.algorithms.base import BaseAdvTrainer
 from pretrained_input_icnn.config import TrainConfig, build_arg_parser, config_from_args
 from pretrained_input_icnn.distributed import DistInfo
 from pretrained_input_icnn.models.classifier import SimpleViTCIFAR, load_pretrained_classifier
-from pretrained_input_icnn.models.npf import NPFInputConvexPotential, npf_T_omega
+from pretrained_input_icnn.models.npf import (
+    NPFInputConvexPotential,
+    NPFDense,
+    NPFPosDefPotentials,
+    convex_init_parameters,
+    npf_T_omega,
+)
 from pretrained_input_icnn.utils import (
     BBArmijoState,
     bb_armijo_step_params,
@@ -28,6 +34,7 @@ from pretrained_input_icnn.utils import (
 from pretrained_input_icnn.utils.eval import (
     _pgd_loss_per_sample,
     evaluate_clean,
+    evaluate_transport_pgd_alignment,
     evaluate_under_input_pgd,
 )
 
@@ -91,6 +98,7 @@ def _config(algorithm: str) -> TrainConfig:
         lambda_param=3.0,
         use_margin_loss=True,
         npf_hidden=(4,),
+        npf_lastquad_hidden=(4,),
         nn_dro_hidden=(4,),
         omega_steps_per_batch=1,
         bb_alpha0=1e-4,
@@ -115,6 +123,84 @@ def _config(algorithm: str) -> TrainConfig:
         ppa_min_rounds=1,
         ppa_round0_steps=1,
         ppa_refine_steps=1,
+    )
+
+
+def test_npf_positive_dense_uses_principled_lognormal_moments():
+    torch.manual_seed(123)
+    fan_in = 64
+    layer = NPFDense(
+        fan_in,
+        4096,
+        pos_weights=True,
+        rectifier="relu",
+    )
+    projected = layer.projected_weight().detach()
+    weight_mean_sq, weight_var, _bias_mean, _bias_var = convex_init_parameters(fan_in)
+
+    assert torch.all(projected > 0.0)
+    assert projected.mean().item() == pytest.approx(
+        math.sqrt(weight_mean_sq),
+        rel=0.08,
+    )
+    assert projected.var(unbiased=False).item() == pytest.approx(
+        weight_var,
+        rel=0.15,
+    )
+
+
+def test_npf_unprojected_dense_identity_helpers_zero_raw_weights():
+    torch.manual_seed(123)
+    layer = NPFDense(
+        8,
+        4,
+        pos_weights=False,
+        rectifier="softplus",
+    )
+
+    layer.zero_()
+    assert torch.count_nonzero(layer.weight.detach()).item() == 0
+
+    layer.near_zero_(1e-3)
+    assert layer.weight.detach().abs().max().item() < 2e-3
+
+
+def test_npf_principled_bias_shift_is_applied_to_preactivation_biases():
+    torch.manual_seed(123)
+    hidden_sizes = (16, 12)
+    model = NPFInputConvexPotential(
+        input_dim=8,
+        hidden_sizes=hidden_sizes,
+        outer_rank=0,
+        inner_rank=1,
+        output_rank=0,
+        quadratic_mode="last_layer_diagonal",
+        activation="relu",
+        pos_weights=True,
+        positive_weight_rectifier="relu",
+    )
+    first_hidden_skip = model.w_xs[0]
+    second_hidden_skip = model.w_xs[1]
+    output_skip = model.residual_output_potential
+    # Legacy golden-run parity: the bias shift is +|bias_mean| (the
+    # Hoedt-Klambauer derivation gives the negative value; the legacy 57%
+    # run used its exact positive mirror, which keeps the deep stack
+    # near-fully active and its sample-dependent gradients hot).
+    _, _, second_bias_mean, _ = convex_init_parameters(hidden_sizes[0])
+    _, _, output_bias_mean, _ = convex_init_parameters(hidden_sizes[1])
+    second_bias_mean = abs(second_bias_mean)
+    output_bias_mean = abs(output_bias_mean)
+
+    assert isinstance(first_hidden_skip, nn.Linear)
+    assert torch.count_nonzero(first_hidden_skip.bias.detach()).item() == 0
+    assert isinstance(second_hidden_skip, nn.Linear)
+    assert torch.allclose(
+        second_hidden_skip.bias.detach(),
+        torch.full_like(second_hidden_skip.bias.detach(), second_bias_mean),
+    )
+    assert torch.allclose(
+        output_skip.bias.detach(),
+        torch.full_like(output_skip.bias.detach(), output_bias_mean),
     )
 
 
@@ -237,14 +323,14 @@ def test_parameter_l2_deltas_track_classifier_and_npf_adversary():
     assert unchanged["omega_l2_delta"] == pytest.approx(0.0)
 
 
-def test_npf_lastquad_init_eps_keeps_final_quadratic_trainable():
+def test_npf_lastquad_final_posdef_potential_is_ott_scaled_and_trainable():
     torch.manual_seed(123)
     device = torch.device("cpu")
     classifier = TinyClassifier().to(device)
     cfg = replace(
         _config("npf_lastquad"),
         npf_lastquad_hidden=(4,),
-        npf_lastquad_init_eps=1e-4,
+        npf_lastquad_activation="softplus",
     )
     loader = _loader()
     trainer = ALGORITHMS["npf_lastquad"](
@@ -255,14 +341,22 @@ def test_npf_lastquad_init_eps_keeps_final_quadratic_trainable():
         config=cfg,
     )
 
-    q_out_delta = trainer.psi_omega.q_out.delta.detach()
+    q_out = trainer.psi_omega.residual_output_potential
+    # Output block starts at effective diag 0.01 (near-identity transport at
+    # init; the old softplus(-2)=0.1269 planted a measured 1.5-pixel-L2
+    # global-rescale artifact) with the never-dead 'exp' diag rectifier
+    # (relu had a permanent zero-gradient dead zone once the cost gradient
+    # pushed raw entries negative).
+    expected_diag = 0.01
 
-    assert q_out_delta.mean().item() == pytest.approx(math.sqrt(cfg.npf_lastquad_init_eps))
+    assert isinstance(q_out, NPFPosDefPotentials)
+    assert q_out.diag_rectifier == "exp"
+    assert q_out.diag.mean().item() == pytest.approx(expected_diag)
 
     x = torch.randn(2, 3, 32, 32, device=device)
     x_adv = npf_T_omega(x, trainer.psi_omega, create_graph=True)
     loss = x_adv.pow(2).mean()
-    grad = torch.autograd.grad(loss, trainer.psi_omega.q_out.delta_raw)[0]
+    grad = torch.autograd.grad(loss, q_out.diag_kernel)[0]
 
     assert torch.isfinite(grad).all()
     assert grad.norm().item() > 1e-7
@@ -276,7 +370,7 @@ def test_npf_lastquad_can_use_learnable_low_rank_output_quadratic():
         _config("npf_lastquad"),
         npf_lastquad_hidden=(4,),
         npf_lastquad_output_rank=2,
-        npf_lastquad_init_eps=1e-4,
+        npf_lastquad_activation="softplus",
     )
     loader = _loader()
     trainer = ALGORITHMS["npf_lastquad"](
@@ -288,22 +382,74 @@ def test_npf_lastquad_can_use_learnable_low_rank_output_quadratic():
     )
 
     assert not trainer.psi_omega.use_hidden_quadratics
-    assert len(trainer.psi_omega.q_blocks) == 0
-    assert trainer.psi_omega.q_out.A is not None
-    assert trainer.psi_omega.q_out.A.shape == (1, 2, trainer.input_dim)
+    assert all(isinstance(module, nn.Linear) for module in trainer.psi_omega.w_xs[:-1])
+    q_out = trainer.psi_omega.residual_output_potential
+    assert q_out.quad_kernel is not None
+    assert q_out.quad_kernel.shape == (1, trainer.input_dim, 2)
 
     x = torch.randn(2, 3, 32, 32, device=device)
     x_adv = npf_T_omega(x, trainer.psi_omega, create_graph=True)
     loss = x_adv.pow(2).mean()
-    grad = torch.autograd.grad(loss, trainer.psi_omega.q_out.A)[0]
+    grad = torch.autograd.grad(loss, q_out.quad_kernel)[0]
 
     assert torch.isfinite(grad).all()
     assert grad.norm().item() > 0.0
 
 
-def test_full_npf_output_low_rank_init_uses_quadratic_factor_scale():
+def test_npf_lastquad_honors_frozen_outer_identity_potential():
     torch.manual_seed(123)
-    init_eps = 1e-4
+    model = NPFInputConvexPotential(
+        input_dim=8,
+        hidden_sizes=(4,),
+        outer_rank=0,
+        inner_rank=0,
+        output_rank=2,
+        quadratic_mode="last_layer_diagonal",
+        trainable_outer_quadratic=False,
+        activation="softplus",
+    )
+
+    assert all(not p.requires_grad for p in model.pos_def_potential.parameters())
+    assert any(p.requires_grad for p in model.residual_output_potential.parameters())
+    assert any(p.requires_grad for p in model.w_zs.parameters())
+
+    x = torch.randn(3, 8)
+    x_adv = npf_T_omega(x, model, create_graph=True)
+    loss = x_adv.pow(2).mean()
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    grads = torch.autograd.grad(loss, trainable_params, allow_unused=True)
+
+    assert all(g is None or torch.isfinite(g).all() for g in grads)
+
+
+def test_npf_lastquad_trainer_keeps_outer_identity_frozen_during_step():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    classifier = TinyClassifier().to(device)
+    cfg = replace(
+        _config("npf_lastquad"),
+        npf_lastquad_hidden=(4,),
+        npf_lastquad_output_rank=2,
+        npf_lastquad_identity_init=True,
+        attack_clean_correct_only=False,
+    )
+    loader = _loader()
+    trainer = ALGORITHMS["npf_lastquad"](
+        classifier=classifier,
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=cfg,
+    )
+
+    assert all(not p.requires_grad for p in trainer.psi_omega.pos_def_potential.parameters())
+    x, y = next(iter(loader))
+    trainer.step(x.to(device), y.to(device))
+    assert all(not p.requires_grad for p in trainer.psi_omega.pos_def_potential.parameters())
+
+
+def test_full_npf_uses_ott_posdef_blocks_and_identity_base_potential():
+    torch.manual_seed(123)
     model = NPFInputConvexPotential(
         input_dim=8,
         hidden_sizes=(4,),
@@ -311,15 +457,60 @@ def test_full_npf_output_low_rank_init_uses_quadratic_factor_scale():
         inner_rank=2,
         quadratic_mode="all_layers",
         trainable_outer_quadratic=True,
-        init_eps=init_eps,
+        activation="softplus",
     )
-    model.init_as_identity()
 
-    expected_std = math.sqrt(init_eps) / math.sqrt(2 * 8)
-    actual_std = model.q_out.A.detach().float().std().item()
+    assert all(isinstance(module, NPFPosDefPotentials) for module in model.w_xs)
+    assert isinstance(model.residual_output_potential, NPFPosDefPotentials)
+    assert model.residual_output_potential.quad_kernel.shape == (1, 8, 2)
+    assert model.pos_def_potential.diag.mean().item() == pytest.approx(1.0)
+    # Trainable outer quadratic must NOT start at exact zeros: grad of
+    # 0.5*||A^T x||^2 w.r.t. A vanishes identically at A=0 (exact saddle), so
+    # a zeros init would freeze it forever. The base potential stays
+    # near-identity via a small draw instead.
+    assert torch.count_nonzero(model.pos_def_potential.quad_kernel).item() > 0
+    assert model.pos_def_potential.quad_kernel.abs().max().item() < 0.05
+    assert torch.count_nonzero(model.pos_def_potential.lin_kernel).item() == 0
 
-    assert actual_std == pytest.approx(expected_std, rel=0.75)
-    assert actual_std > 10.0 * init_eps / math.sqrt(2 * 8)
+    frozen = NPFInputConvexPotential(
+        input_dim=8,
+        hidden_sizes=(4,),
+        outer_rank=2,
+        inner_rank=2,
+        quadratic_mode="all_layers",
+        trainable_outer_quadratic=False,
+        activation="softplus",
+    )
+    assert torch.count_nonzero(frozen.pos_def_potential.quad_kernel).item() == 0
+
+    x = torch.randn(3, 8)
+    y = torch.randn(3, 8)
+    t = torch.rand(3, 1)
+    lhs = model(t * x + (1.0 - t) * y)
+    rhs = t.squeeze(1) * model(x) + (1.0 - t.squeeze(1)) * model(y)
+
+    assert torch.all(lhs <= rhs + 1e-5)
+
+
+def test_bb_armijo_ignores_frozen_parameters():
+    p_train = nn.Parameter(torch.tensor([1.0]))
+    p_frozen = nn.Parameter(torch.tensor([7.0]), requires_grad=False)
+    state = BBArmijoState.create(alpha0=0.1, alpha_min=1e-6, alpha_max=1.0)
+
+    def objective(create_graph: bool):
+        del create_graph
+        return -((p_train - 2.0) ** 2).sum()
+
+    _, _, f_val, grad_norm = bb_armijo_step_params(
+        [p_train, p_frozen],
+        objective,
+        state,
+    )
+
+    assert math.isfinite(f_val)
+    assert grad_norm > 0.0
+    assert p_train.item() > 1.0
+    assert p_frozen.item() == pytest.approx(7.0)
 
 
 def test_npf_lastquad_output_rank_cli_is_forwarded_to_config():
@@ -332,7 +523,117 @@ def test_npf_lastquad_output_rank_cli_is_forwarded_to_config():
     assert cfg.npf_lastquad_output_rank == 4
 
 
-def test_bb_ascent_wrong_curvature_falls_back_to_alpha_min():
+def test_npf_identity_init_cli_switches_are_forwarded_to_config():
+    parser = build_arg_parser()
+
+    default_cfg = config_from_args(parser.parse_args([]))
+    disabled_cfg = config_from_args(
+        parser.parse_args(
+            [
+                "--no-npf-identity-init",
+                "--no-npf-lastquad-identity-init",
+            ]
+        )
+    )
+    enabled_cfg = config_from_args(
+        parser.parse_args(
+            [
+                "--npf-identity-init",
+                "--npf-lastquad-identity-init",
+            ]
+        )
+    )
+
+    # Full-NPF default is the identity-adjacent start (the non-identity
+    # all-layers init was measured 12.9 pixel-L2 off identity at objective
+    # -40); LastQuad default stays random (its random init is benign and the
+    # legacy golden run started random).
+    assert default_cfg.npf_identity_init
+    assert not default_cfg.npf_lastquad_identity_init
+    assert not disabled_cfg.npf_identity_init
+    assert not disabled_cfg.npf_lastquad_identity_init
+    assert enabled_cfg.npf_identity_init
+    assert enabled_cfg.npf_lastquad_identity_init
+
+
+def test_npf_lastquad_identity_init_switch_controls_initial_map():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    loader = _loader()
+
+    identity_cfg = replace(
+        _config("npf_lastquad"),
+        npf_lastquad_hidden=(4,),
+        npf_lastquad_identity_init=True,
+        npf_lastquad_init_eps=0.0,
+    )
+    identity_trainer = ALGORITHMS["npf_lastquad"](
+        classifier=TinyClassifier().to(device),
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=identity_cfg,
+    )
+
+    hidden_skip = identity_trainer.psi_omega.w_xs[0]
+    output_skip = identity_trainer.psi_omega.residual_output_potential
+    assert isinstance(hidden_skip, nn.Linear)
+    assert hidden_skip.weight.detach().abs().sum().item() == pytest.approx(0.0)
+    assert output_skip.diag.detach().abs().sum().item() == pytest.approx(0.0)
+    assert output_skip.lin_kernel.detach().abs().sum().item() == pytest.approx(0.0)
+
+    x = torch.randn(2, 3, 32, 32, device=device)
+    x_adv = npf_T_omega(x, identity_trainer.psi_omega, create_graph=False)
+    relative_error = (x_adv - x).norm() / x.norm().clamp_min(1e-12)
+
+    assert relative_error.item() < 1e-6
+
+    torch.manual_seed(123)
+    raw_cfg = replace(identity_cfg, npf_lastquad_identity_init=False)
+    raw_trainer = ALGORITHMS["npf_lastquad"](
+        classifier=TinyClassifier().to(device),
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=raw_cfg,
+    )
+
+    raw_hidden_skip = raw_trainer.psi_omega.w_xs[0]
+    raw_output_skip = raw_trainer.psi_omega.residual_output_potential
+    assert isinstance(raw_hidden_skip, nn.Linear)
+    assert raw_hidden_skip.weight.detach().abs().sum().item() > 0.0
+    assert raw_output_skip.lin_kernel.detach().abs().sum().item() > 0.0
+
+
+def test_npf_lastquad_identity_init_default_is_not_dead_zero():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    loader = _loader()
+    cfg = replace(
+        _config("npf_lastquad"),
+        npf_lastquad_hidden=(4,),
+        npf_lastquad_identity_init=True,
+    )
+    trainer = ALGORITHMS["npf_lastquad"](
+        classifier=TinyClassifier().to(device),
+        train_loader=loader,
+        test_loader=loader,
+        device=device,
+        config=cfg,
+    )
+
+    hidden_skip = trainer.psi_omega.w_xs[0]
+    output_skip = trainer.psi_omega.residual_output_potential
+    assert isinstance(hidden_skip, nn.Linear)
+    assert hidden_skip.weight.detach().abs().sum().item() > 0.0
+    assert output_skip.lin_kernel.detach().abs().sum().item() > 0.0
+
+
+def test_bb_ascent_convex_region_proposes_legacy_positive_step():
+    # Legacy golden-run BB semantics: in a locally CONVEX region along the
+    # ascent path (<s, y> > 0) the proposal is +<s,s>/<s,y> (often large,
+    # Armijo shrinks it), NOT a fallback to alpha_min — the old alpha_min
+    # pin deadlocked the inner ascent out of flat starts.
     state = BBArmijoState.create(
         alpha0=0.1,
         alpha_min=1e-5,
@@ -346,7 +647,23 @@ def test_bb_ascent_wrong_curvature_falls_back_to_alpha_min():
 
     alpha = state.propose(torch.tensor([1.0]), torch.tensor([1.0]))
 
-    assert alpha == pytest.approx(state.alpha_min)
+    # s = 1, y = 1 -> <s,s>/<s,y> = 1.0 (clamped to alpha_max).
+    assert alpha == pytest.approx(1.0)
+
+
+def test_bb_ascent_tiny_noisy_secant_keeps_previous_alpha():
+    # Near-zero curvature within the scale-aware tolerance must not be
+    # treated as real curvature; the proposal falls back to alpha_prev.
+    state = BBArmijoState.create(alpha0=0.1, alpha_min=1e-5, alpha_max=1.0)
+    state = state.update_history(
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+        alpha=0.1,
+    )
+
+    alpha = state.propose(torch.tensor([1e-9]), torch.tensor([1.0 + 1e-16]))
+
+    assert alpha == pytest.approx(0.1)
 
 
 def test_bb_armijo_clips_parametric_gradient_before_step():
@@ -696,7 +1013,9 @@ def test_online_batchnorm_refresh_is_noop_for_classifier_without_batchnorm():
 
 def test_online_batchnorm_refresh_cli_allows_frozen_batchnorm():
     parser = build_arg_parser()
-    args = parser.parse_args(["--online-batchnorm-refresh"])
+    # freeze_batchnorm now defaults to False (legacy/flagship: BN
+    # participates); the combination under test needs the explicit flag.
+    args = parser.parse_args(["--freeze-batchnorm", "--online-batchnorm-refresh"])
 
     cfg = config_from_args(args)
 
@@ -952,14 +1271,64 @@ def test_npf_legacy_attack_mask_keeps_clean_incorrect_samples_clean():
     assert torch.allclose(x_adv, x)
 
 
-def test_input_pgd_loss_cli_defaults_to_margin_and_allows_ce():
+def test_input_pgd_loss_cli_defaults_to_ce_and_allows_margin():
     parser = build_arg_parser()
 
     default_cfg = config_from_args(parser.parse_args([]))
+    margin_cfg = config_from_args(parser.parse_args(["--input-pgd-loss", "margin"]))
     ce_cfg = config_from_args(parser.parse_args(["--input-pgd-loss", "ce"]))
+    normalized_cfg = config_from_args(
+        parser.parse_args(["--input-pgd-geometry", "normalized_mse"])
+    )
+    align_cfg = config_from_args(
+        parser.parse_args(
+            [
+                "--eval-transport-pgd-alignment",
+                "--eval-transport-pgd-alignment-samples",
+                "3",
+            ]
+        )
+    )
+    anchor_cfg = config_from_args(
+        parser.parse_args(
+            [
+                "--npf-pgd-anchor-weight",
+                "1000",
+                "--npf-pgd-anchor-steps",
+                "4",
+                "--npf-pgd-anchor-restarts",
+                "2",
+                "--npf-pgd-anchor-loss",
+                "ce",
+            ]
+        )
+    )
 
-    assert default_cfg.input_pgd_loss == "margin"
+    # ce is the legacy 57%-benchmark eval convention and every number of
+    # record was measured with it; margin stays available for the stronger
+    # local evaluator.
+    assert default_cfg.input_pgd_loss == "ce"
+    assert margin_cfg.input_pgd_loss == "margin"
+    assert default_cfg.input_pgd_geometry == "pixel_l2_squared"
+    assert default_cfg.eval_transport_pgd_alignment is False
+    assert default_cfg.eval_transport_pgd_alignment_samples == 256
+    assert default_cfg.npf_pgd_anchor_weight == 0.0
+    assert default_cfg.npf_pgd_anchor_steps == 5
+    assert default_cfg.npf_pgd_anchor_restarts == 1
+    assert default_cfg.npf_pgd_anchor_loss == "margin"
     assert ce_cfg.input_pgd_loss == "ce"
+    assert normalized_cfg.input_pgd_geometry == "normalized_mse"
+    assert align_cfg.eval_transport_pgd_alignment is True
+    assert align_cfg.eval_transport_pgd_alignment_samples == 3
+    assert anchor_cfg.npf_pgd_anchor_weight == 1000
+    assert anchor_cfg.npf_pgd_anchor_steps == 4
+    assert anchor_cfg.npf_pgd_anchor_restarts == 2
+    assert anchor_cfg.npf_pgd_anchor_loss == "ce"
+
+    with pytest.raises(ValueError, match="normalized_mse"):
+        config_from_args(
+            parser.parse_args(["--input-pgd-geometry", "normalized_mse", "--inp-p", "inf"])
+        )
 
 
 def test_logsumexp_margin_pgd_loss_avoids_ce_saturation():
@@ -991,7 +1360,7 @@ def test_eval_helpers_restore_classifier_training_modes():
     assert classifier.training
     assert all(not module.training for module in _batchnorm_modules(classifier))
 
-    evaluate_under_input_pgd(
+    _, pixel_info = evaluate_under_input_pgd(
         classifier,
         loader,
         device,
@@ -1003,11 +1372,88 @@ def test_eval_helpers_restore_classifier_training_modes():
         max_samples=2,
         loss="margin",
     )
+    assert pixel_info["geometry"] == "pixel_l2_squared"
 
     assert classifier.training
     assert all(not module.training for module in _batchnorm_modules(classifier))
 
 
+def test_transport_pgd_alignment_reports_direction_stats():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    classifier = TinyClassifier().to(device)
+    loader = _loader()
+
+    classifier.train()
+    for module in _batchnorm_modules(classifier):
+        module.eval()
+
+    def transport_fn(x):
+        return x + 0.01
+
+    info = evaluate_transport_pgd_alignment(
+        classifier,
+        transport_fn,
+        loader,
+        device,
+        p=2,
+        eps=0.1,
+        steps=1,
+        step_size=0.1,
+        restarts=1,
+        max_samples=2,
+        loss="margin",
+    )
+
+    assert info["samples"] == 2
+    assert info["valid_cos_samples"] == 2
+    assert -1.0 <= info["cos_mean"] <= 1.0
+    assert "transport_projected_acc" in info
+    assert "pgd_acc" in info
+    assert classifier.training
+    assert all(not module.training for module in _batchnorm_modules(classifier))
+
+
+def test_input_pgd_normalized_mse_geometry_respects_budget():
+    torch.manual_seed(123)
+    device = torch.device("cpu")
+    classifier = TinyClassifier().to(device)
+    loader = _loader()
+
+    _acc, info = evaluate_under_input_pgd(
+        classifier,
+        loader,
+        device,
+        p=2,
+        eps=1e-4,
+        steps=2,
+        step_size=0.5,
+        restarts=1,
+        max_samples=2,
+        loss="margin",
+        geometry="normalized_mse",
+    )
+
+    assert info["geometry"] == "normalized_mse"
+    assert info["max_normalized_mse"] <= 1e-4 + 1e-7
+
+
 def test_input_pgd_rejects_unknown_loss():
     with pytest.raises(ValueError, match="input PGD loss"):
         _pgd_loss_per_sample(torch.zeros(1, 3), torch.tensor([0]), "bad")
+
+
+def test_input_pgd_rejects_unknown_geometry():
+    with pytest.raises(ValueError, match="input PGD geometry"):
+        evaluate_under_input_pgd(
+            TinyClassifier(),
+            _loader(),
+            torch.device("cpu"),
+            p=2,
+            eps=0.1,
+            steps=1,
+            step_size=0.1,
+            restarts=1,
+            max_samples=2,
+            geometry="bad",
+        )

@@ -163,11 +163,12 @@ PENALTY_LAMBDA=${PENALTY_LAMBDA:-30}
 TRANSPORT_COST=${TRANSPORT_COST:-normalized_mse}
 LAMBDA_SCHEDULE=${LAMBDA_SCHEDULE:-}
 LAMBDA_STAGE_EPOCHS=${LAMBDA_STAGE_EPOCHS:-0}
-LR_THETA=${LR_THETA:-0.003}
+LR_THETA=${LR_THETA:-0.05}  # flagship recipe
 ATTACK_CLEAN_CORRECT_ONLY=${ATTACK_CLEAN_CORRECT_ONLY:-1}
 RESET_PARAMETRIC_BB_EACH_BATCH=${RESET_PARAMETRIC_BB_EACH_BATCH:-1}
-FREEZE_BATCHNORM=${FREEZE_BATCHNORM:-1}
+FREEZE_BATCHNORM=${FREEZE_BATCHNORM:-0}  # legacy/flagship: BN participates
 FREEZE_BATCHNORM_AFFINE=${FREEZE_BATCHNORM_AFFINE:-${FREEZE_BN_AFFINE:-$FREEZE_BATCHNORM}}
+ADVERSARY_CLASSIFIER_EVAL=${ADVERSARY_CLASSIFIER_EVAL:-1}
 BATCHNORM_ONLINE_REFRESH=${BATCHNORM_ONLINE_REFRESH:-${ONLINE_BATCHNORM_REFRESH:-0}}
 BATCHNORM_ONLINE_REFRESH_MOMENTUM=${BATCHNORM_ONLINE_REFRESH_MOMENTUM:-${ONLINE_BATCHNORM_REFRESH_MOMENTUM:-}}
 RECALIBRATE_BATCHNORM=${RECALIBRATE_BATCHNORM:-0}
@@ -178,8 +179,11 @@ INP_P=${INP_P:-2}
 INP_EPS=${INP_EPS:-0.5}
 INP_STEPS=${INP_STEPS:-20}
 INP_RESTARTS=${INP_RESTARTS:-5}
-EVAL_PGD_SAMPLES=${EVAL_PGD_SAMPLES:-1000}
-INPUT_PGD_LOSS=${INPUT_PGD_LOSS:-margin}
+EVAL_PGD_SAMPLES=${EVAL_PGD_SAMPLES:-1024}
+EVAL_TRANSPORT_PGD_ALIGNMENT=${EVAL_TRANSPORT_PGD_ALIGNMENT:-0}
+EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES=${EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES:-256}
+INPUT_PGD_LOSS=${INPUT_PGD_LOSS:-ce}  # legacy 57% benchmark convention
+INPUT_PGD_GEOMETRY=${INPUT_PGD_GEOMETRY:-pixel_l2_squared}
 MADRY_PGD_STEP_SIZE=${MADRY_PGD_STEP_SIZE:-0}  # 0 => trainer default 2*epsilon/K
 USE_MARGIN_LOSS=${USE_MARGIN_LOSS:-1}
 SKIP_PGD_DURING_TRAIN=${SKIP_PGD_DURING_TRAIN:-0}
@@ -195,17 +199,17 @@ CHECKPOINT_EPOCH_OFFSET=${CHECKPOINT_EPOCH_OFFSET:-0}
 # GPU adversary work dominates wallclock, so 2 workers/rank is plenty.
 # Set NUM_WORKERS=0 if you still hit "No space left on device".
 NUM_WORKERS=${NUM_WORKERS:-2}
-EPOCHS_ICNN_PRETRAIN=${EPOCHS_ICNN_PRETRAIN:-${WARMUP_EPOCHS:-0}}
+EPOCHS_ICNN_PRETRAIN=${EPOCHS_ICNN_PRETRAIN:-${WARMUP_EPOCHS:-2}}
 FROZEN_ADVERSARY_EPOCHS=${FROZEN_ADVERSARY_EPOCHS:-${FROZEN_MAP_EPOCHS:-${POST_MAP_EPOCHS:-0}}}
 FROZEN_ADVERSARY_MAP_STEPS=${FROZEN_ADVERSARY_MAP_STEPS:-${FROZEN_MAP_STEPS:-${POST_MAP_STEPS:-1}}}
 
 # ---- Shared BB+Armijo step rule (overridable; defaults match NPF's) ----
-BB_ALPHA0=${BB_ALPHA0:-2e-4}
-BB_ALPHA_MIN=${BB_ALPHA_MIN:-1e-7}
-BB_ALPHA_MAX=${BB_ALPHA_MAX:-0.25}
-BB_LS_C=${BB_LS_C:-1e-4}
+BB_ALPHA0=${BB_ALPHA0:-5e-4}
+BB_ALPHA_MIN=${BB_ALPHA_MIN:-1e-6}
+BB_ALPHA_MAX=${BB_ALPHA_MAX:-1.0}
+BB_LS_C=${BB_LS_C:-0.1}
 BB_LS_SHRINK=${BB_LS_SHRINK:-0.5}
-BB_LS_MAX_STEPS=${BB_LS_MAX_STEPS:-15}
+BB_LS_MAX_STEPS=${BB_LS_MAX_STEPS:-10}
 PARAMETRIC_BB_MAX_GRAD_NORM=${PARAMETRIC_BB_MAX_GRAD_NORM:-1.0}
 BB_ARGS=(
   --bb-alpha0 "${BB_ALPHA0}"
@@ -233,7 +237,14 @@ DUAL_SAMPLE_LEVEL=${DUAL_SAMPLE_LEVEL:-3}  # m=8 — keeps wallclock comparable
 
 # ---- NPF architecture knobs ----
 RUN_ONLY_ALGO=${RUN_ONLY_ALGO:-}
-NPF_INNER_OPTIMIZER=${NPF_INNER_OPTIMIZER:-bb_armijo}  # bb_armijo | muon
+NPF_INNER_OPTIMIZER=${NPF_INNER_OPTIMIZER:-bb_armijo}  # bb_armijo | muon (flagship: bb_armijo)
+NPF_RESET_OMEGA_EACH_BATCH=${NPF_RESET_OMEGA_EACH_BATCH:-0}
+NPF_PROJECT_TO_INPUT_BALL=${NPF_PROJECT_TO_INPUT_BALL:-0}
+NPF_OMEGA_WEIGHT_DECAY=${NPF_OMEGA_WEIGHT_DECAY:-1e-4}  # legacy golden-run parity: L2 on free omega kernels
+NPF_PGD_ANCHOR_WEIGHT=${NPF_PGD_ANCHOR_WEIGHT:-0.0}
+NPF_PGD_ANCHOR_STEPS=${NPF_PGD_ANCHOR_STEPS:-5}
+NPF_PGD_ANCHOR_RESTARTS=${NPF_PGD_ANCHOR_RESTARTS:-1}
+NPF_PGD_ANCHOR_LOSS=${NPF_PGD_ANCHOR_LOSS:-margin}
 NPF_MUON_LR=${NPF_MUON_LR:-2e-4}
 NPF_MUON_MOMENTUM=${NPF_MUON_MOMENTUM:-0.95}
 NPF_MUON_NESTEROV=${NPF_MUON_NESTEROV:-1}
@@ -248,20 +259,27 @@ NPF_MUON_ADAM_BETA2=${NPF_MUON_ADAM_BETA2:-0.999}
 NPF_MUON_ADAM_EPS=${NPF_MUON_ADAM_EPS:-1e-8}
 NPF_MUON_MAX_GRAD_NORM=${NPF_MUON_MAX_GRAD_NORM:-0.0}
 NPF_HIDDEN=${NPF_HIDDEN:-1024 512 512 256 128 64}
-NPF_OUTER_RANK=${NPF_OUTER_RANK:-8}
-NPF_INNER_RANK=${NPF_INNER_RANK:-2}
+NPF_OUTER_RANK=${NPF_OUTER_RANK:-1}
+NPF_INNER_RANK=${NPF_INNER_RANK:-1}
 NPF_ACTIVATION=${NPF_ACTIVATION:-softplus}
-NPF_SOFTPLUS_BETA=${NPF_SOFTPLUS_BETA:-10.0}
-NPF_INIT_EPS=${NPF_INIT_EPS:-1e-4}
+NPF_ELU_ALPHA=${NPF_ELU_ALPHA:-1.0}
+NPF_SOFTPLUS_BETA=${NPF_SOFTPLUS_BETA:-20.0}
+NPF_INIT_EPS=${NPF_INIT_EPS:-1e-2}
+NPF_IDENTITY_INIT=${NPF_IDENTITY_INIT:-1}  # identity-adjacent start (non-identity all-layers init measured 12.9 pixel-L2 off)
 NPF_STRONG_CONVEXITY=${NPF_STRONG_CONVEXITY:-1.0}
+NPF_POS_WEIGHTS=${NPF_POS_WEIGHTS:-1}
+NPF_POSITIVE_WEIGHT_RECTIFIER=${NPF_POSITIVE_WEIGHT_RECTIFIER:-exp}
 NPF_LASTQUAD_HIDDEN=${NPF_LASTQUAD_HIDDEN:-1024 512 512 256 128 64}
-NPF_LASTQUAD_OUTPUT_RANK=${NPF_LASTQUAD_OUTPUT_RANK:-0}
+NPF_LASTQUAD_OUTPUT_RANK=${NPF_LASTQUAD_OUTPUT_RANK:-64}  # decisive capacity knob (2026-07-06)
 # NPF_LASTQUAD_HIDDEN=${NPF_LASTQUAD_HIDDEN:-128 128 128 128}
 NPF_LASTQUAD_ACTIVATION=${NPF_LASTQUAD_ACTIVATION:-softplus}
 NPF_LASTQUAD_ELU_ALPHA=${NPF_LASTQUAD_ELU_ALPHA:-1.0}
-NPF_LASTQUAD_SOFTPLUS_BETA=${NPF_LASTQUAD_SOFTPLUS_BETA:-10.0}
-NPF_LASTQUAD_INIT_EPS=${NPF_LASTQUAD_INIT_EPS:-1e-4}
+NPF_LASTQUAD_SOFTPLUS_BETA=${NPF_LASTQUAD_SOFTPLUS_BETA:-20.0}
+NPF_LASTQUAD_INIT_EPS=${NPF_LASTQUAD_INIT_EPS:-1e-2}
+NPF_LASTQUAD_IDENTITY_INIT=${NPF_LASTQUAD_IDENTITY_INIT:-0}
 NPF_LASTQUAD_STRONG_CONVEXITY=${NPF_LASTQUAD_STRONG_CONVEXITY:-1.0}
+NPF_LASTQUAD_POS_WEIGHTS=${NPF_LASTQUAD_POS_WEIGHTS:-1}
+NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER=${NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER:-exp}
 
 HIDDEN_TAG="$(printf "%s" "$NPF_LASTQUAD_HIDDEN" | tr -s '[:space:]' 'x' | tr -cd '[:alnum:]_.=-')"
 OPT_TAG=""
@@ -277,7 +295,8 @@ FROZEN_TAG=""
 if [ "${FROZEN_ADVERSARY_EPOCHS}" != "0" ]; then
     FROZEN_TAG="_frozenadv${FROZEN_ADVERSARY_EPOCHS}x${FROZEN_ADVERSARY_MAP_STEPS}"
 fi
-AUTO_RUN_NAME="npf_lastquad_seed${SEED}_ep${EPOCHS_ADV}${WARM_TAG}${FROZEN_TAG}_K${K}_ddp${NPROC}_lr${LR_THETA}_lam${PENALTY_LAMBDA}_eps${INP_EPS}_margin${USE_MARGIN_LOSS}_act${NPF_LASTQUAD_ACTIVATION}_init${NPF_LASTQUAD_INIT_EPS}_hidden${HIDDEN_TAG}${OPT_TAG}"
+ANCHOR_TAG="$(printf "%s" "$NPF_PGD_ANCHOR_WEIGHT" | tr -cd '[:alnum:]_.=-' | sed -e 's/[.]/p/g' -e 's/-/m/g')"
+AUTO_RUN_NAME="npf_lastquad_seed${SEED}_ep${EPOCHS_ADV}${WARM_TAG}${FROZEN_TAG}_K${K}_ddp${NPROC}_lr${LR_THETA}_lam${PENALTY_LAMBDA}_eps${INP_EPS}_margin${USE_MARGIN_LOSS}_act${NPF_LASTQUAD_ACTIVATION}_init${NPF_LASTQUAD_INIT_EPS}_idinit${NPF_LASTQUAD_IDENTITY_INIT}_proj${NPF_PROJECT_TO_INPUT_BALL}_anch${ANCHOR_TAG}_hidden${HIDDEN_TAG}${OPT_TAG}"
 RUN_NAME="${RUN_NAME:-${AUTO_RUN_NAME}}"
 OUTPUT_FOLDER_NAME="${OUTPUT_FOLDER_NAME:-${RUN_NAME}}"
 if [ -n "$RESULTS_DIR_OVERRIDE" ]; then
@@ -340,7 +359,7 @@ ACTIVE_ALGOS_CSV="$(join_by_comma "${ACTIVE_ALGOS[@]}")"
 
 NPF_MUON_NESTEROV_FLAG="--npf-muon-nesterov"
 case "$NPF_MUON_NESTEROV" in
-    0|false|False|FALSE|no|No|NO)
+    0|false|False|FALSE|no|No|NO|off|Off|OFF)
         NPF_MUON_NESTEROV_FLAG="--no-npf-muon-nesterov"
         ;;
 esac
@@ -359,7 +378,28 @@ NPF_OPT_ARGS=(
   --npf-muon-adam-beta2 "${NPF_MUON_ADAM_BETA2}"
   --npf-muon-adam-eps "${NPF_MUON_ADAM_EPS}"
   --npf-muon-max-grad-norm "${NPF_MUON_MAX_GRAD_NORM}"
+  --npf-omega-weight-decay "${NPF_OMEGA_WEIGHT_DECAY}"
+  --npf-pgd-anchor-weight "${NPF_PGD_ANCHOR_WEIGHT}"
+  --npf-pgd-anchor-steps "${NPF_PGD_ANCHOR_STEPS}"
+  --npf-pgd-anchor-restarts "${NPF_PGD_ANCHOR_RESTARTS}"
+  --npf-pgd-anchor-loss "${NPF_PGD_ANCHOR_LOSS}"
 )
+case "$NPF_RESET_OMEGA_EACH_BATCH" in
+    1|true|True|TRUE|yes|Yes|YES|on|On|ON)
+        NPF_OPT_ARGS+=(--npf-reset-omega-each-batch)
+        ;;
+    *)
+        NPF_OPT_ARGS+=(--no-npf-reset-omega-each-batch)
+        ;;
+esac
+case "$NPF_PROJECT_TO_INPUT_BALL" in
+    1|true|True|TRUE|yes|Yes|YES|on|On|ON)
+        NPF_OPT_ARGS+=(--npf-project-to-input-ball)
+        ;;
+    *)
+        NPF_OPT_ARGS+=(--no-npf-project-to-input-ball)
+        ;;
+esac
 
 # ---- Pre-flight ----
 echo ""
@@ -376,6 +416,7 @@ echo "  Reset parametric BB each batch: ${RESET_PARAMETRIC_BB_EACH_BATCH}"
 echo "  Frozen-adversary post phase: epochs=${FROZEN_ADVERSARY_EPOCHS}  map_steps=${FROZEN_ADVERSARY_MAP_STEPS}"
 echo "  Freeze BatchNorm running stats: ${FREEZE_BATCHNORM}"
 echo "  Freeze BatchNorm affine params: ${FREEZE_BATCHNORM_AFFINE}"
+echo "  Adversary-side classifier eval mode: ${ADVERSARY_CLASSIFIER_EVAL}"
 echo "  Online clean BatchNorm refresh: ${BATCHNORM_ONLINE_REFRESH}  momentum=${BATCHNORM_ONLINE_REFRESH_MOMENTUM:-module-default}"
 echo "  Recalibrate BatchNorm after adv epochs: ${RECALIBRATE_BATCHNORM}  batches=${BATCHNORM_RECALIBRATION_BATCHES}  reset=${BATCHNORM_RECALIBRATION_RESET}  momentum=${BATCHNORM_RECALIBRATION_MOMENTUM:-cumulative}"
 if [ -n "$LAMBDA_SCHEDULE" ]; then
@@ -384,10 +425,18 @@ fi
 echo "  Active algos: ${ACTIVE_ALGOS[*]}"
 echo "  Margin loss: ${USE_MARGIN_LOSS}"
 echo "  Input-PGD eval loss: ${INPUT_PGD_LOSS}"
+echo "  Input-PGD geometry: ${INPUT_PGD_GEOMETRY}"
 echo "  Input PGD eval: p=${INP_P} eps=${INP_EPS} steps=${INP_STEPS} restarts=${INP_RESTARTS} samples=${EVAL_PGD_SAMPLES}"
+if [ -n "${WRM_NORMALIZED_RADIUS_PROTOCOL:-}" ]; then
+    echo "  WRM normalized-radius protocol: ${WRM_NORMALIZED_RADIUS_PROTOCOL} mode=${WRM_PGD_EPS_MODE:-} C_p=${WRM_CP:-} rho=${WRM_NORMALIZED_RADIUS:-} effective_eps=${WRM_EFFECTIVE_INP_EPS:-${INP_EPS}}"
+fi
+echo "  Transport-vs-PGD alignment: ${EVAL_TRANSPORT_PGD_ALIGNMENT} samples=${EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES}"
 echo "  Skip PGD during train: ${SKIP_PGD_DURING_TRAIN}  Benchmark mode: ${BENCHMARK_MODE}"
 echo "  Inner profiling: ${PROFILE_INNER}  batches=${PROFILE_INNER_BATCHES}"
 echo "  NPF optimizer: ${NPF_INNER_OPTIMIZER}"
+echo "  Reset NPF omega each batch: ${NPF_RESET_OMEGA_EACH_BATCH}"
+echo "  Project NPF transport to input-PGD ball: ${NPF_PROJECT_TO_INPUT_BALL}"
+echo "  NPF PGD anchor: weight=${NPF_PGD_ANCHOR_WEIGHT} steps=${NPF_PGD_ANCHOR_STEPS} restarts=${NPF_PGD_ANCHOR_RESTARTS} loss=${NPF_PGD_ANCHOR_LOSS}"
 echo "  BB+Armijo:   alpha0=${BB_ALPHA0}  alpha=[${BB_ALPHA_MIN}, ${BB_ALPHA_MAX}]"
 echo "                ls_c=${BB_LS_C}  shrink=${BB_LS_SHRINK}  ls_max=${BB_LS_MAX_STEPS}"
 echo "                parametric_grad_clip=${PARAMETRIC_BB_MAX_GRAD_NORM}"
@@ -412,13 +461,15 @@ if [[ " ${ACTIVE_ALGOS[*]} " == *" npf_lastquad "* ]]; then
     echo "  NPF-LastQuad: hidden=${NPF_LASTQUAD_HIDDEN}"
     echo "                output_rank=${NPF_LASTQUAD_OUTPUT_RANK}"
     echo "                activation=${NPF_LASTQUAD_ACTIVATION} beta=${NPF_LASTQUAD_SOFTPLUS_BETA}"
-    echo "                init_eps=${NPF_LASTQUAD_INIT_EPS} strong_convexity=${NPF_LASTQUAD_STRONG_CONVEXITY}"
+    echo "                init_eps=${NPF_LASTQUAD_INIT_EPS} identity_init=${NPF_LASTQUAD_IDENTITY_INIT} strong_convexity=${NPF_LASTQUAD_STRONG_CONVEXITY}"
+    echo "                pos_weights=${NPF_LASTQUAD_POS_WEIGHTS} rectifier=${NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER}"
 fi
 if [[ " ${ACTIVE_ALGOS[*]} " == *" npf "* ]]; then
     echo "  NPF:          hidden=${NPF_HIDDEN}"
     echo "                outer_rank=${NPF_OUTER_RANK} inner_rank=${NPF_INNER_RANK}"
-    echo "                activation=${NPF_ACTIVATION} beta=${NPF_SOFTPLUS_BETA}"
-    echo "                init_eps=${NPF_INIT_EPS} strong_convexity=${NPF_STRONG_CONVEXITY}"
+    echo "                activation=${NPF_ACTIVATION} elu_alpha=${NPF_ELU_ALPHA} beta=${NPF_SOFTPLUS_BETA}"
+    echo "                init_eps=${NPF_INIT_EPS} identity_init=${NPF_IDENTITY_INIT} strong_convexity=${NPF_STRONG_CONVEXITY}"
+    echo "                pos_weights=${NPF_POS_WEIGHTS} rectifier=${NPF_POSITIVE_WEIGHT_RECTIFIER}"
 fi
 echo "  Results: ${RESULTS_DIR}"
 echo "  Started: $(date)"
@@ -446,13 +497,41 @@ algo_args() {
     # standard pixel-space l2-PGD, so --madry-pgd-step-size is honoured when set
     # (>0) and otherwise defaults to 2*epsilon/K.
     local algo="$1" k="$2"
+    local npf_identity_arg="--npf-identity-init"
+    case "$NPF_IDENTITY_INIT" in
+        0|false|False|FALSE|no|No|NO|off|Off|OFF)
+            npf_identity_arg="--no-npf-identity-init"
+            ;;
+    esac
+    local npf_pos_weights_arg="--npf-pos-weights"
+    case "$NPF_POS_WEIGHTS" in
+        0|false|False|FALSE|no|No|NO|off|Off|OFF)
+            npf_pos_weights_arg="--no-npf-pos-weights"
+            ;;
+    esac
+    local npf_lastquad_identity_arg="--npf-lastquad-identity-init"
+    case "$NPF_LASTQUAD_IDENTITY_INIT" in
+        0|false|False|FALSE|no|No|NO|off|Off|OFF)
+            npf_lastquad_identity_arg="--no-npf-lastquad-identity-init"
+            ;;
+    esac
+    local npf_lastquad_pos_weights_arg="--npf-lastquad-pos-weights"
+    case "$NPF_LASTQUAD_POS_WEIGHTS" in
+        0|false|False|FALSE|no|No|NO|off|Off|OFF)
+            npf_lastquad_pos_weights_arg="--no-npf-lastquad-pos-weights"
+            ;;
+    esac
     case "$algo" in
         npf)
             echo "--omega-steps-per-batch ${k} \
                 --npf-hidden ${NPF_HIDDEN} \
                 --npf-outer-rank ${NPF_OUTER_RANK} --npf-inner-rank ${NPF_INNER_RANK} \
-                --npf-activation ${NPF_ACTIVATION} --npf-softplus-beta ${NPF_SOFTPLUS_BETA} \
-                --npf-init-eps ${NPF_INIT_EPS} --npf-strong-convexity ${NPF_STRONG_CONVEXITY}"
+                --npf-activation ${NPF_ACTIVATION} --npf-elu-alpha ${NPF_ELU_ALPHA} \
+                --npf-softplus-beta ${NPF_SOFTPLUS_BETA} \
+                --npf-init-eps ${NPF_INIT_EPS} ${npf_identity_arg} \
+                --npf-strong-convexity ${NPF_STRONG_CONVEXITY} \
+                ${npf_pos_weights_arg} \
+                --npf-positive-weight-rectifier ${NPF_POSITIVE_WEIGHT_RECTIFIER}"
             ;;
         npf_lastquad)
             echo "--omega-steps-per-batch ${k} \
@@ -462,7 +541,10 @@ algo_args() {
                 --npf-lastquad-elu-alpha ${NPF_LASTQUAD_ELU_ALPHA} \
                 --npf-lastquad-softplus-beta ${NPF_LASTQUAD_SOFTPLUS_BETA} \
                 --npf-lastquad-init-eps ${NPF_LASTQUAD_INIT_EPS} \
-                --npf-lastquad-strong-convexity ${NPF_LASTQUAD_STRONG_CONVEXITY}"
+                ${npf_lastquad_identity_arg} \
+                --npf-lastquad-strong-convexity ${NPF_LASTQUAD_STRONG_CONVEXITY} \
+                ${npf_lastquad_pos_weights_arg} \
+                --npf-lastquad-positive-weight-rectifier ${NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER}"
             ;;
         nn_dro)
             echo "--omega-steps-per-batch ${k} \
@@ -575,6 +657,7 @@ run_algo() {
             printf "RESET_PARAMETRIC_BB_EACH_BATCH=%q\n" "$RESET_PARAMETRIC_BB_EACH_BATCH"
             printf "FREEZE_BATCHNORM=%q\n" "$FREEZE_BATCHNORM"
             printf "FREEZE_BATCHNORM_AFFINE=%q\n" "$FREEZE_BATCHNORM_AFFINE"
+            printf "ADVERSARY_CLASSIFIER_EVAL=%q\n" "$ADVERSARY_CLASSIFIER_EVAL"
             printf "BATCHNORM_ONLINE_REFRESH=%q\n" "$BATCHNORM_ONLINE_REFRESH"
             printf "BATCHNORM_ONLINE_REFRESH_MOMENTUM=%q\n" "$BATCHNORM_ONLINE_REFRESH_MOMENTUM"
             printf "RECALIBRATE_BATCHNORM=%q\n" "$RECALIBRATE_BATCHNORM"
@@ -588,16 +671,32 @@ run_algo() {
             printf "USE_MARGIN_LOSS=%q\n" "$USE_MARGIN_LOSS"
             printf "INP_P=%q\n" "$INP_P"
             printf "INP_EPS=%q\n" "$INP_EPS"
+            printf "WRM_NORMALIZED_RADIUS_PROTOCOL=%q\n" "${WRM_NORMALIZED_RADIUS_PROTOCOL:-}"
+            printf "WRM_PGD_EPS_MODE=%q\n" "${WRM_PGD_EPS_MODE:-}"
+            printf "WRM_NORMALIZED_RADIUS_REQUESTED=%q\n" "${WRM_NORMALIZED_RADIUS_REQUESTED:-}"
+            printf "WRM_NORMALIZED_RADIUS=%q\n" "${WRM_NORMALIZED_RADIUS:-}"
+            printf "WRM_CP=%q\n" "${WRM_CP:-}"
+            printf "WRM_EFFECTIVE_INP_EPS=%q\n" "${WRM_EFFECTIVE_INP_EPS:-}"
             printf "INP_STEPS=%q\n" "$INP_STEPS"
             printf "INP_RESTARTS=%q\n" "$INP_RESTARTS"
             printf "EVAL_PGD_SAMPLES=%q\n" "$EVAL_PGD_SAMPLES"
+            printf "EVAL_TRANSPORT_PGD_ALIGNMENT=%q\n" "$EVAL_TRANSPORT_PGD_ALIGNMENT"
+            printf "EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES=%q\n" "$EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES"
             printf "INPUT_PGD_LOSS=%q\n" "$INPUT_PGD_LOSS"
+            printf "INPUT_PGD_GEOMETRY=%q\n" "$INPUT_PGD_GEOMETRY"
             printf "PROFILE_INNER=%q\n" "$PROFILE_INNER"
             printf "PROFILE_INNER_BATCHES=%q\n" "$PROFILE_INNER_BATCHES"
             printf "RESUME_CHECKPOINT=%q\n" "$RESUME_CHECKPOINT"
             printf "SAVE_EVERY_EPOCH_DIR=%q\n" "$SAVE_EVERY_EPOCH_DIR"
             printf "CHECKPOINT_EPOCH_OFFSET=%q\n" "$CHECKPOINT_EPOCH_OFFSET"
             printf "NPF_INNER_OPTIMIZER=%q\n" "$NPF_INNER_OPTIMIZER"
+            printf "NPF_RESET_OMEGA_EACH_BATCH=%q\n" "$NPF_RESET_OMEGA_EACH_BATCH"
+            printf "NPF_PROJECT_TO_INPUT_BALL=%q\n" "$NPF_PROJECT_TO_INPUT_BALL"
+            printf "NPF_OMEGA_WEIGHT_DECAY=%q\n" "$NPF_OMEGA_WEIGHT_DECAY"
+            printf "NPF_PGD_ANCHOR_WEIGHT=%q\n" "$NPF_PGD_ANCHOR_WEIGHT"
+            printf "NPF_PGD_ANCHOR_STEPS=%q\n" "$NPF_PGD_ANCHOR_STEPS"
+            printf "NPF_PGD_ANCHOR_RESTARTS=%q\n" "$NPF_PGD_ANCHOR_RESTARTS"
+            printf "NPF_PGD_ANCHOR_LOSS=%q\n" "$NPF_PGD_ANCHOR_LOSS"
             printf "NPF_MUON_LR=%q\n" "$NPF_MUON_LR"
             printf "NPF_MUON_MOMENTUM=%q\n" "$NPF_MUON_MOMENTUM"
             printf "NPF_MUON_NESTEROV=%q\n" "$NPF_MUON_NESTEROV"
@@ -612,15 +711,22 @@ run_algo() {
             printf "NPF_OUTER_RANK=%q\n" "$NPF_OUTER_RANK"
             printf "NPF_INNER_RANK=%q\n" "$NPF_INNER_RANK"
             printf "NPF_ACTIVATION=%q\n" "$NPF_ACTIVATION"
+            printf "NPF_ELU_ALPHA=%q\n" "$NPF_ELU_ALPHA"
             printf "NPF_SOFTPLUS_BETA=%q\n" "$NPF_SOFTPLUS_BETA"
             printf "NPF_INIT_EPS=%q\n" "$NPF_INIT_EPS"
+            printf "NPF_IDENTITY_INIT=%q\n" "$NPF_IDENTITY_INIT"
             printf "NPF_STRONG_CONVEXITY=%q\n" "$NPF_STRONG_CONVEXITY"
+            printf "NPF_POS_WEIGHTS=%q\n" "$NPF_POS_WEIGHTS"
+            printf "NPF_POSITIVE_WEIGHT_RECTIFIER=%q\n" "$NPF_POSITIVE_WEIGHT_RECTIFIER"
             printf "NPF_LASTQUAD_HIDDEN=%q\n" "$NPF_LASTQUAD_HIDDEN"
             printf "NPF_LASTQUAD_OUTPUT_RANK=%q\n" "$NPF_LASTQUAD_OUTPUT_RANK"
             printf "NPF_LASTQUAD_ACTIVATION=%q\n" "$NPF_LASTQUAD_ACTIVATION"
             printf "NPF_LASTQUAD_SOFTPLUS_BETA=%q\n" "$NPF_LASTQUAD_SOFTPLUS_BETA"
             printf "NPF_LASTQUAD_INIT_EPS=%q\n" "$NPF_LASTQUAD_INIT_EPS"
+            printf "NPF_LASTQUAD_IDENTITY_INIT=%q\n" "$NPF_LASTQUAD_IDENTITY_INIT"
             printf "NPF_LASTQUAD_STRONG_CONVEXITY=%q\n" "$NPF_LASTQUAD_STRONG_CONVEXITY"
+            printf "NPF_LASTQUAD_POS_WEIGHTS=%q\n" "$NPF_LASTQUAD_POS_WEIGHTS"
+            printf "NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER=%q\n" "$NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER"
             printf "BB_ALPHA0=%q\n" "$BB_ALPHA0"
             printf "BB_ALPHA_MIN=%q\n" "$BB_ALPHA_MIN"
             printf "BB_ALPHA_MAX=%q\n" "$BB_ALPHA_MAX"
@@ -646,6 +752,11 @@ run_algo() {
         local -a COMMON_EXTRA_FLAGS=()
         if [ "$USE_MARGIN_LOSS" = "1" ]; then
             COMMON_EXTRA_FLAGS+=(--use-margin-loss)
+        else
+            # Explicit both ways: the argparse default is margin=True, so a
+            # falsy USE_MARGIN_LOSS must pass the negative flag rather than
+            # silently inherit the default.
+            COMMON_EXTRA_FLAGS+=(--no-use-margin-loss)
         fi
         if [ "$SKIP_PGD_DURING_TRAIN" = "1" ]; then
             COMMON_EXTRA_FLAGS+=(--skip-pgd-during-train)
@@ -654,7 +765,7 @@ run_algo() {
             COMMON_EXTRA_FLAGS+=(--benchmark-mode)
         fi
         case "$ATTACK_CLEAN_CORRECT_ONLY" in
-            0|false|False|FALSE|no|No|NO)
+            0|false|False|FALSE|no|No|NO|off|Off|OFF)
                 COMMON_EXTRA_FLAGS+=(--attack-all-samples)
                 ;;
             *)
@@ -662,7 +773,7 @@ run_algo() {
                 ;;
         esac
         case "$RESET_PARAMETRIC_BB_EACH_BATCH" in
-            0|false|False|FALSE|no|No|NO)
+            0|false|False|FALSE|no|No|NO|off|Off|OFF)
                 COMMON_EXTRA_FLAGS+=(--persistent-parametric-bb)
                 ;;
             *)
@@ -670,7 +781,7 @@ run_algo() {
                 ;;
         esac
         case "$FREEZE_BATCHNORM" in
-            0|false|False|FALSE|no|No|NO)
+            0|false|False|FALSE|no|No|NO|off|Off|OFF)
                 COMMON_EXTRA_FLAGS+=(--no-freeze-batchnorm)
                 ;;
             *)
@@ -678,15 +789,23 @@ run_algo() {
                 ;;
         esac
         case "$FREEZE_BATCHNORM_AFFINE" in
-            1|true|True|TRUE|yes|Yes|YES)
+            1|true|True|TRUE|yes|Yes|YES|on|On|ON)
                 COMMON_EXTRA_FLAGS+=(--freeze-batchnorm-affine)
                 ;;
             *)
                 COMMON_EXTRA_FLAGS+=(--no-freeze-batchnorm-affine)
                 ;;
         esac
+        case "$ADVERSARY_CLASSIFIER_EVAL" in
+            0|false|False|FALSE|no|No|NO|off|Off|OFF)
+                COMMON_EXTRA_FLAGS+=(--adversary-classifier-train)
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--adversary-classifier-eval)
+                ;;
+        esac
         case "$BATCHNORM_ONLINE_REFRESH" in
-            1|true|True|TRUE|yes|Yes|YES)
+            1|true|True|TRUE|yes|Yes|YES|on|On|ON)
                 COMMON_EXTRA_FLAGS+=(--online-batchnorm-refresh)
                 ;;
             *)
@@ -697,7 +816,7 @@ run_algo() {
             COMMON_EXTRA_FLAGS+=(--batchnorm-online-refresh-momentum "$BATCHNORM_ONLINE_REFRESH_MOMENTUM")
         fi
         case "$RECALIBRATE_BATCHNORM" in
-            1|true|True|TRUE|yes|Yes|YES)
+            1|true|True|TRUE|yes|Yes|YES|on|On|ON)
                 COMMON_EXTRA_FLAGS+=(--recalibrate-batchnorm)
                 ;;
             *)
@@ -706,7 +825,7 @@ run_algo() {
         esac
         COMMON_EXTRA_FLAGS+=(--batchnorm-recalibration-batches "$BATCHNORM_RECALIBRATION_BATCHES")
         case "$BATCHNORM_RECALIBRATION_RESET" in
-            0|false|False|FALSE|no|No|NO)
+            0|false|False|FALSE|no|No|NO|off|Off|OFF)
                 COMMON_EXTRA_FLAGS+=(--no-batchnorm-recalibration-reset)
                 ;;
             *)
@@ -719,6 +838,17 @@ run_algo() {
         if [ "$PROFILE_INNER" = "1" ]; then
             COMMON_EXTRA_FLAGS+=(--profile-inner --profile-inner-batches "$PROFILE_INNER_BATCHES")
         fi
+        case "$EVAL_TRANSPORT_PGD_ALIGNMENT" in
+            1|true|True|TRUE|yes|Yes|YES|on|On|ON)
+                COMMON_EXTRA_FLAGS+=(
+                    --eval-transport-pgd-alignment
+                    --eval-transport-pgd-alignment-samples "$EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES"
+                )
+                ;;
+            *)
+                COMMON_EXTRA_FLAGS+=(--no-eval-transport-pgd-alignment)
+                ;;
+        esac
         if [ -n "$LAMBDA_SCHEDULE" ]; then
             LAMBDA_SCHEDULE_RAW="${LAMBDA_SCHEDULE//,/ }"
             read -r -a LAMBDA_SCHEDULE_ARGS <<< "$LAMBDA_SCHEDULE_RAW"
@@ -734,6 +864,24 @@ run_algo() {
             COMMON_EXTRA_FLAGS+=(--save-every-epoch-dir "$SAVE_EVERY_EPOCH_DIR")
         fi
         COMMON_EXTRA_FLAGS+=(--checkpoint-epoch-offset "$CHECKPOINT_EPOCH_OFFSET")
+        if [ -n "${WRM_NORMALIZED_RADIUS_PROTOCOL:-}" ]; then
+            COMMON_EXTRA_FLAGS+=(--wrm-normalized-radius-protocol "$WRM_NORMALIZED_RADIUS_PROTOCOL")
+        fi
+        if [ -n "${WRM_PGD_EPS_MODE:-}" ]; then
+            COMMON_EXTRA_FLAGS+=(--wrm-pgd-eps-mode "$WRM_PGD_EPS_MODE")
+        fi
+        if [ -n "${WRM_NORMALIZED_RADIUS_REQUESTED:-}" ]; then
+            COMMON_EXTRA_FLAGS+=(--wrm-normalized-radius-requested "$WRM_NORMALIZED_RADIUS_REQUESTED")
+        fi
+        if [ -n "${WRM_NORMALIZED_RADIUS:-}" ]; then
+            COMMON_EXTRA_FLAGS+=(--wrm-normalized-radius "$WRM_NORMALIZED_RADIUS")
+        fi
+        if [ -n "${WRM_CP:-}" ]; then
+            COMMON_EXTRA_FLAGS+=(--wrm-cp "$WRM_CP")
+        fi
+        if [ -n "${WRM_EFFECTIVE_INP_EPS:-}" ]; then
+            COMMON_EXTRA_FLAGS+=(--wrm-effective-inp-eps "$WRM_EFFECTIVE_INP_EPS")
+        fi
 
         # The shared --bb-* knobs are passed to every algorithm. They
         # are consumed only by methods using BB+Armijo (NPF, NN-DRO,
@@ -760,6 +908,7 @@ run_algo() {
             --eval-input-pgd \
             --eval-input-pgd-samples "$EVAL_PGD_SAMPLES" \
             --input-pgd-loss "$INPUT_PGD_LOSS" \
+            --input-pgd-geometry "$INPUT_PGD_GEOMETRY" \
             "${COMMON_EXTRA_FLAGS[@]}" \
             "${BB_ARGS[@]}" \
             "${NPF_OPT_ARGS[@]}" \

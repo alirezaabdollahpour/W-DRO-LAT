@@ -62,3 +62,6 @@ worst-case-generation-MLP
 Drifting-ICNN/
 Drifting-ICNN/*
 Drifting-ICNN
+# training run outputs (checkpoints, epoch logs) — regenerate via launchers
+input_icnn_ddp_runs/
+input_icnn_ddp_runs_v1/

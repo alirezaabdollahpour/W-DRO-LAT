@@ -98,7 +98,7 @@ class NewPPATrainer(BaseAdvTrainer):
             bb_ls_max_steps=cfg.bb_ls_max_steps,
         )
 
-        with frozen_module(clf):
+        with frozen_module(clf, eval_mode=self._adversary_classifier_eval_mode()):
             # Round 0: BB+Armijo ascent (replaces diminishing-LR WRM).
             z = _bb_armijo_ascent(
                 x, x, clf, y, lam,

@@ -224,7 +224,10 @@ class SDRODualTrainer(BaseAdvTrainer):
 
         # Freeze classifier during sampling — autograd through z still
         # works; we just don't accumulate gradients on classifier params.
-        with frozen_module(self._classifier_module):
+        with frozen_module(
+            self._classifier_module,
+            eval_mode=self._adversary_classifier_eval_mode(),
+        ):
             accept_rate = float("nan")
             if self.langevin_steps > 0:
                 # Optional burn-in: discard the leading post-init iterations

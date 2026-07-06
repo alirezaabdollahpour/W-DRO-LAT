@@ -40,6 +40,7 @@ from ..utils import (
     adversary_loss_per_sample,
     cuda_sync,
     evaluate_clean,
+    evaluate_transport_pgd_alignment,
     evaluate_under_input_pgd,
     evaluate_under_transport,
     normalized_mse,
@@ -145,6 +146,7 @@ class BaseAdvTrainer:
         self._profile_epoch_accum: Dict[str, float] = {}
         self._profile_epoch_batches: int = 0
         self._profile_current: Optional[Dict[str, float]] = None
+        self._current_train_phase: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Distributed helpers (no-op in single-GPU mode)
@@ -268,12 +270,19 @@ class BaseAdvTrainer:
     def _clean_correct_attack_mask(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Return clean-correct mask without mutating classifier training modes."""
         module_training = self._classifier_training_modes()
-        self.classifier_module.eval()
+        if self._adversary_classifier_eval_mode():
+            self.classifier_module.eval()
         try:
             with torch.no_grad():
                 return self.classifier_module(x).argmax(dim=1).eq(y)
         finally:
             self._restore_classifier_training_modes(module_training)
+
+    def _adversary_classifier_eval_mode(self) -> bool:
+        """Whether adversary-side classifier forwards should force eval mode."""
+        if self._current_train_phase == "warmup":
+            return True
+        return bool(getattr(self.config, "adversary_classifier_eval", True))
 
     @staticmethod
     def _masked_sum_and_count(
@@ -852,6 +861,7 @@ class BaseAdvTrainer:
         phase: str = "adv",
     ) -> EpochMetrics:
         cfg = self.config
+        self._current_train_phase = phase
         is_warmup = phase == "warmup"
         is_frozen_adversary = phase == "frozen_adversary"
         frozen_map_steps = max(
@@ -867,6 +877,8 @@ class BaseAdvTrainer:
         total_transport_cost = 0.0
         total_weighted_penalty = 0.0
         total_inner_objective = 0.0
+        total_npf_pgd_anchor_mse = 0.0
+        total_npf_pgd_anchor_samples = 0
         total_bn_online_seconds = 0.0
         total_bn_online_batches = 0.0
         total_bn_online_samples = 0.0
@@ -920,7 +932,19 @@ class BaseAdvTrainer:
             if not torch.is_tensor(x_adv):
                 raise TypeError("step() must return a tensor")
             x_adv = x_adv.detach()
-            if not torch.isfinite(x_adv).all():
+            skip_batch = not bool(torch.isfinite(x_adv).all())
+            if self.dist.is_distributed:
+                # The skip decision must be GLOBAL: if one rank bails out of
+                # this batch while the others enter the DDP backward, the
+                # ranks desynchronize on the gradient all-reduce and the run
+                # hangs or corrupts. Skip on every rank if any rank overflows.
+                flag = torch.tensor(
+                    float(skip_batch), device=x_adv.device, dtype=torch.float32
+                )
+                skip_batch = bool(
+                    dist_helpers.all_reduce_sum_scalar(flag).item() > 0.0
+                )
+            if skip_batch:
                 continue
             diagnostics = self._batch_adversary_diagnostics(x, x_adv, y)
             if is_warmup:
@@ -950,12 +974,15 @@ class BaseAdvTrainer:
             total_transport_cost += diagnostics["train_transport_cost"] * bs
             total_weighted_penalty += diagnostics["train_weighted_penalty"] * bs
             total_inner_objective += diagnostics["train_inner_objective"] * bs
+            anchor_mse = getattr(self, "_last_npf_pgd_anchor_mse", None)
+            if anchor_mse is not None:
+                total_npf_pgd_anchor_mse += float(anchor_mse) * bs
+                total_npf_pgd_anchor_samples += bs
             total_samples += bs
             inner = float(getattr(self, "_last_inner_loss", 0.0))
             total_inner += inner * bs
             if total_samples > 0:
-                progress.set_postfix(
-                    {
+                postfix = {
                         "outer_ce": f"{total_loss/total_samples:.4f}",
                         "acc": f"{total_acc/total_samples*100:.2f}%",
                         primary_name: f"{total_train_adv_loss/total_samples:.4f}",
@@ -963,7 +990,11 @@ class BaseAdvTrainer:
                         "pen": f"{total_weighted_penalty/total_samples:.4f}",
                         "obj": f"{total_inner_objective/total_samples:.4f}",
                     }
-                )
+                if total_npf_pgd_anchor_samples > 0:
+                    postfix["anchor"] = (
+                        f"{total_npf_pgd_anchor_mse/total_npf_pgd_anchor_samples:.4f}"
+                    )
+                progress.set_postfix(postfix)
         progress.close()
         cuda_sync()
         epoch_seconds = time.perf_counter() - epoch_start
@@ -980,6 +1011,10 @@ class BaseAdvTrainer:
             extras["bn_online_refresh_seconds"] = float(total_bn_online_seconds)
             extras["bn_online_refresh_batches"] = float(total_bn_online_batches)
             extras["bn_online_refresh_samples"] = float(total_bn_online_samples)
+        if total_npf_pgd_anchor_samples > 0:
+            extras["npf_pgd_anchor_mse"] = (
+                total_npf_pgd_anchor_mse / total_npf_pgd_anchor_samples
+            )
         extras.update(self._finish_parameter_delta_epoch())
         extras.update(
             self._inner_profile_epoch_extras(
@@ -987,7 +1022,7 @@ class BaseAdvTrainer:
                 train_samples_total=total_samples,
             )
         )
-        return EpochMetrics(
+        metrics = EpochMetrics(
             train_loss=total_loss / n,
             train_acc=total_acc / n,
             train_mse=total_mse / n,
@@ -995,6 +1030,8 @@ class BaseAdvTrainer:
             epoch_seconds=epoch_seconds,
             extras=extras,
         )
+        self._current_train_phase = None
+        return metrics
 
     def _batch_adversary_diagnostics(
         self,
@@ -1041,7 +1078,7 @@ class BaseAdvTrainer:
             self.classifier_module, self.test_loader, self.device
         )
 
-        adv_loss, adv_acc, adv_cost, adv_pen = evaluate_under_transport(
+        adv_loss, adv_acc, adv_cost, adv_pen, adv_info = evaluate_under_transport(
             self.classifier_module,
             lambda x: self.repeated_transport_for_eval(x, steps=transport_steps),
             self.test_loader,
@@ -1060,6 +1097,13 @@ class BaseAdvTrainer:
             "adv_penalty": adv_pen,
             "eval_transport_cost": adv_cost,
             "eval_transport_weighted_penalty": adv_pen,
+            "eval_transport_avg_l2": adv_info["avg_l2"],
+            "eval_transport_avg_linf": adv_info["avg_linf"],
+            "eval_transport_max_l2": adv_info["max_l2"],
+            "eval_transport_max_linf": adv_info["max_linf"],
+            "eval_transport_avg_normalized_mse": adv_info["avg_normalized_mse"],
+            "eval_transport_max_normalized_mse": adv_info["max_normalized_mse"],
+            "eval_transport_samples": adv_info["samples"],
             "transport_adv_loss": adv_loss,
             "transport_adv_acc": adv_acc,
         }
@@ -1068,7 +1112,7 @@ class BaseAdvTrainer:
             cfg.eval_input_pgd
             and not getattr(cfg, "skip_pgd_during_train", False)
             and cfg.inp_steps > 0
-            and cfg.inp_eps > 0
+            and cfg.inp_eps >= 0
         ):
             sample_limit = cfg.eval_input_pgd_samples
             max_batches: Optional[int] = None
@@ -1096,6 +1140,7 @@ class BaseAdvTrainer:
                 max_batches=max_batches,
                 max_samples=sample_limit,
                 loss=getattr(cfg, "input_pgd_loss", "margin"),
+                geometry=getattr(cfg, "input_pgd_geometry", "pixel_l2_squared"),
             )
             result["input_pgd_acc"] = pgd_acc
             result["input_pgd_clean_acc"] = pgd_info["clean_acc"]
@@ -1105,10 +1150,71 @@ class BaseAdvTrainer:
             result["input_pgd_avg_linf"] = pgd_info["avg_linf"]
             result["input_pgd_max_l2"] = pgd_info["max_l2"]
             result["input_pgd_max_linf"] = pgd_info["max_linf"]
+            result["input_pgd_avg_normalized_mse"] = pgd_info["avg_normalized_mse"]
+            result["input_pgd_max_normalized_mse"] = pgd_info["max_normalized_mse"]
             result["input_pgd_samples"] = pgd_info["samples"]
             result["input_pgd_loss"] = pgd_info.get(
                 "loss", getattr(cfg, "input_pgd_loss", "margin")
             )
+            result["input_pgd_geometry"] = pgd_info.get(
+                "geometry", getattr(cfg, "input_pgd_geometry", "pixel_l2_squared")
+            )
+            if getattr(cfg, "eval_transport_pgd_alignment", False):
+                align_limit = int(
+                    getattr(cfg, "eval_transport_pgd_alignment_samples", 256) or 0
+                )
+                align_limit = sample_limit if align_limit <= 0 else align_limit
+                if align_limit is not None and hasattr(self.test_loader, "dataset"):
+                    align_limit = min(int(align_limit), len(self.test_loader.dataset))
+                align_max_batches: Optional[int] = None
+                if align_limit is not None and align_limit > 0:
+                    batch_size = (
+                        getattr(self.test_loader, "batch_size", align_limit)
+                        or align_limit
+                    )
+                    align_max_batches = max(1, math.ceil(align_limit / batch_size))
+                align_info = evaluate_transport_pgd_alignment(
+                    self.classifier_module,
+                    lambda x: self.repeated_transport_for_eval(
+                        x, steps=transport_steps
+                    ),
+                    self.test_loader,
+                    self.device,
+                    p=p_input,
+                    eps=cfg.inp_eps,
+                    steps=cfg.inp_steps,
+                    step_size=cfg.inp_step_size,
+                    restarts=1,
+                    max_batches=align_max_batches,
+                    max_samples=align_limit,
+                    loss=getattr(cfg, "input_pgd_loss", "margin"),
+                    geometry=getattr(cfg, "input_pgd_geometry", "pixel_l2_squared"),
+                )
+                result["transport_pgd_align_samples"] = align_info["samples"]
+                result["transport_pgd_align_valid_cos_samples"] = align_info[
+                    "valid_cos_samples"
+                ]
+                result["transport_pgd_cos_mean"] = align_info["cos_mean"]
+                result["transport_pgd_cos_median"] = align_info["cos_median"]
+                result["transport_pgd_cos_p10"] = align_info["cos_p10"]
+                result["transport_pgd_cos_p90"] = align_info["cos_p90"]
+                result["transport_pgd_transport_acc"] = align_info["transport_acc"]
+                result["transport_pgd_transport_projected_acc"] = align_info[
+                    "transport_projected_acc"
+                ]
+                result["transport_pgd_pgd_acc"] = align_info["pgd_acc"]
+                result["transport_pgd_transport_loss"] = align_info["transport_loss"]
+                result["transport_pgd_transport_projected_loss"] = align_info[
+                    "transport_projected_loss"
+                ]
+                result["transport_pgd_pgd_loss"] = align_info["pgd_loss"]
+                result["transport_pgd_transport_avg_l2"] = align_info[
+                    "transport_avg_l2"
+                ]
+                result["transport_pgd_transport_projected_avg_l2"] = align_info[
+                    "transport_projected_avg_l2"
+                ]
+                result["transport_pgd_pgd_avg_l2"] = align_info["pgd_avg_l2"]
         dist_helpers.barrier()
         return result
 
@@ -1131,6 +1237,8 @@ class BaseAdvTrainer:
             f"pen {entry.get('train_weighted_penalty', 0.0):.4f}",
             f"obj {entry.get('train_inner_objective', entry.get('inner_loss', 0.0)):.4f}",
         ]
+        if entry.get("npf_pgd_anchor_mse") is not None:
+            parts.append(f"anchor_mse {entry.get('npf_pgd_anchor_mse', 0.0):.4f}")
         if entry.get("phase") == "frozen_adversary":
             parts.insert(
                 3,
@@ -1141,10 +1249,20 @@ class BaseAdvTrainer:
                 f"clean {entry.get('test_loss', 0.0):.4f}/{entry['test_acc']*100:.2f}%"
             )
         if "adv_acc" in entry:
+            transport_label = (
+                "transport_last_omega"
+                if bool(getattr(self.config, "npf_reset_omega_each_batch", False))
+                else "transport"
+            )
             parts.append(
-                f"transport {entry.get('adv_loss', 0.0):.4f}/{entry['adv_acc']*100:.2f}%"
+                f"{transport_label} {entry.get('adv_loss', 0.0):.4f}/"
+                f"{entry['adv_acc']*100:.2f}%"
             )
             parts.append(f"eval_pen {entry.get('adv_penalty', 0.0):.4f}")
+            parts.append(
+                f"T_l2 {entry.get('eval_transport_avg_l2', 0.0):.3f}/"
+                f"{entry.get('eval_transport_max_l2', 0.0):.3f}"
+            )
         if entry.get("input_pgd_acc") is not None:
             parts.append(
                 f"pgd_robust {entry['input_pgd_acc']*100:.2f}% "
@@ -1154,6 +1272,12 @@ class BaseAdvTrainer:
             )
         else:
             parts.append("pgd_robust n/a")
+        if entry.get("transport_pgd_cos_mean") is not None:
+            parts.append(
+                f"TvsPGD cos {entry.get('transport_pgd_cos_mean', 0.0):.3f} "
+                f"Tproj {entry.get('transport_pgd_transport_projected_acc', 0.0)*100:.2f}% "
+                f"PGD1 {entry.get('transport_pgd_pgd_acc', 0.0)*100:.2f}%"
+            )
         if epoch_seconds is not None:
             parts.append(f"t={epoch_seconds:.2f}s")
         if entry.get("theta_l2_delta") is not None:

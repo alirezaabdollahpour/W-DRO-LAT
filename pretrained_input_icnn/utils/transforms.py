@@ -41,6 +41,82 @@ def clamped_normalized_copy(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp(x, min=lower, max=upper)
 
 
+def project_normalized_to_pixel_lp_ball(
+    x_adv_norm: torch.Tensor,
+    x_clean_norm: torch.Tensor,
+    *,
+    eps: float,
+    p,
+) -> torch.Tensor:
+    """Project normalized adversarial inputs into a pixel-space Lp ball."""
+    eps = float(eps)
+    if eps < 0.0:
+        raise ValueError(f"eps must be non-negative; got {eps}.")
+    x_clean_pix = to_pixel(x_clean_norm)
+    x_adv_pix = to_pixel(x_adv_norm)
+    delta = x_adv_pix - x_clean_pix
+    p_label = str(p).lower()
+    if p == 2 or p_label == "2":
+        flat = delta.reshape(delta.size(0), -1)
+        norms = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+        scale = (eps / norms).clamp(max=1.0)
+        delta = (flat * scale).view_as(delta)
+    elif p == float("inf") or p_label in {"inf", "infinity"}:
+        delta = delta.clamp(min=-eps, max=eps)
+    else:
+        raise ValueError(f"Unsupported pixel Lp projection p={p!r}.")
+    return to_normalized((x_clean_pix + delta).clamp(0.0, 1.0))
+
+
+def project_normalized_to_normalized_mse_ball(
+    x_adv_norm: torch.Tensor,
+    x_clean_norm: torch.Tensor,
+    *,
+    budget: float,
+) -> torch.Tensor:
+    """Project into mean((x_adv_norm - x_clean_norm)^2) <= budget."""
+    budget = float(budget)
+    if budget < 0.0:
+        raise ValueError(f"budget must be non-negative; got {budget}.")
+    delta = x_adv_norm - x_clean_norm
+    flat = delta.reshape(delta.size(0), -1)
+    radius = (budget * max(1, flat.size(1))) ** 0.5
+    norms = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+    scale = (radius / norms).clamp(max=1.0)
+    projected = x_clean_norm + (flat * scale).view_as(delta)
+    return clamped_normalized_copy(projected)
+
+
+def project_normalized_to_input_ball(
+    x_adv_norm: torch.Tensor,
+    x_clean_norm: torch.Tensor,
+    *,
+    eps: float,
+    p,
+    geometry: str,
+) -> torch.Tensor:
+    """Project normalized inputs to the configured input-adversary threat set."""
+    geometry = str(geometry).lower()
+    if geometry in {"pixel", "pixel_l2", "pixel_l2_squared"}:
+        return project_normalized_to_pixel_lp_ball(
+            x_adv_norm,
+            x_clean_norm,
+            eps=eps,
+            p=p,
+        )
+    if geometry in {"normalized", "normalized_mse"}:
+        if not (p == 2 or str(p).lower() == "2"):
+            raise ValueError("normalized_mse projection requires p=2.")
+        return project_normalized_to_normalized_mse_ball(
+            x_adv_norm,
+            x_clean_norm,
+            budget=eps,
+        )
+    raise ValueError(
+        "input projection geometry must be 'pixel_l2_squared' or 'normalized_mse'."
+    )
+
+
 def normalized_mse(
     x_adv_norm: torch.Tensor,
     x_clean_norm: torch.Tensor,

@@ -82,7 +82,10 @@ class NNDROTrainer(BaseAdvTrainer):
         self.adversary.train()
         set_requires_grad(self.adversary, True)
 
-        with frozen_module(self._classifier_module):
+        with frozen_module(
+            self._classifier_module,
+            eval_mode=self._adversary_classifier_eval_mode(),
+        ):
             def omega_objective(create_graph: bool) -> torch.Tensor:
                 x_adv = self._transport(x)  # MLP forward; create_graph unused
                 logits = self._classifier_module(x_adv)
