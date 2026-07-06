@@ -349,8 +349,12 @@ echo "  OOD sweep split ${SPLIT} complete at $(date)"
 echo "  Manifest: ${OOD_MANIFEST}"
 echo "================================================================"
 
+OPTIMIZER_NAME="${OPTIMIZER_NAME:-BB+Armijo}"
+
 SPLIT="${SPLIT}" \
 SEED="${SEED}" \
+K="${K}" \
+OPTIMIZER_NAME="${OPTIMIZER_NAME}" \
 OOD_ROOT="${OOD_ROOT}" \
 OOD_ALGOS="${OOD_ALGOS[*]}" \
 CHECKPOINT_KIND="${CHECKPOINT_KIND}" \
@@ -580,4 +584,44 @@ for row in rows:
 print(f"\nSaved raw summary: {summary_path}")
 print(f"Saved CSV table:   {csv_path}")
 print(f"Saved LaTeX table: {latex_path}")
+
+# ---------------------------------------------------------------------------
+# Visible LaTeX output: (1) the full generated table, (2) paste-ready rows in
+# the paper's runtime-table format
+#   Method & Optimizer & K & Clean & PGD & 10.1 & 10.2 & 1 & 2 & 3 & 4 & 5 & Avg & runtime
+# under the \multicolumn{6}{c}{CIFAR-10-C (Common Corruption)} header.
+# ---------------------------------------------------------------------------
+K = os.environ.get("K", "--")
+OPTIMIZER_NAME = os.environ.get("OPTIMIZER_NAME", "BB+Armijo")
+
+print()
+print("=" * 132)
+print("  LaTeX (full generated table)")
+print("=" * 132)
+print("\n".join(latex_lines))
+
+print("=" * 132)
+print("  LaTeX paste-ready rows for tab:CIFAR-10-CIFAR101-CIFAR102-LQ-runtime")
+print("  column layout: Method & Optimizer & K & Clean & PGD & 10.1 & 10.2 & "
+      r"\multicolumn{6}{c}{CIFAR-10-C (Common Corruption)} (1 2 3 4 5 Avg) & runtime")
+print("=" * 132)
+for row in rows:
+    cells = [
+        row["method"],
+        OPTIMIZER_NAME,
+        str(K),
+        fmt_plain(row["cifar10_clean"]),
+        fmt_plain(row["cifar10_pgd"]),
+        fmt_plain(row["cifar10_1_clean"]),
+        fmt_plain(row["cifar10_2_clean"]),
+        fmt_plain(row["cifar10c_s1"]),
+        fmt_plain(row["cifar10c_s2"]),
+        fmt_plain(row["cifar10c_s3"]),
+        fmt_plain(row["cifar10c_s4"]),
+        fmt_plain(row["cifar10c_s5"]),
+        fmt_plain(row["cifar10c_avg"]),
+        "--",  # wall-clock runtime: fill from the training run log
+    ]
+    print("            " + " & ".join(cells) + r" \\")
+print("=" * 132)
 PYTHON_AGG
