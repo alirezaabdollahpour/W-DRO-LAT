@@ -308,20 +308,35 @@ class TrainConfig:
     #     reassignment fires at z=x (best same-class training sample as the
     #     ascent start) and, like ascent_first, the schedule ends with a
     #     reassignment so the theta-update sees within-class best responses.
+    #   * "reassign_first_v2": identical to reassign_first except the ROUND-0
+    #     reassignment is priced at λ₀ = λ / ppa_round0_lambda_damping
+    #     (graduated multi-start). At full λ the round-0 reassignment at z=x
+    #     is inert (measured 0.3% jumps at λ=30 on the 95.3% R2.pth); the
+    #     damped score activates confidence-driven jumps while the retained
+    #     cost term keeps the argmax anchor-dependent, preserving particle
+    #     diversity. Everything else (rounds >= 1, closing reassignment,
+    #     ascent objective, logged metrics) uses the full λ.
     # All other knobs (steps, LRs, min_rounds, gain_rtol) are shared.
     ppa_round_order: str = "ascent_first"
+    # α for reassign_first_v2's round-0 penalty discount: λ₀ = λ/α. Only
+    # read by reassign_first_v2; 1.0 reduces v2 to reassign_first exactly.
+    # Measured round-0 activation on the current R2.pth at λ=30:
+    # α=6 (λ₀=5) -> 52.8% of samples jump; α=10 (λ₀=3) -> 72.7%.
+    ppa_round0_lambda_damping: float = 6.0
     ppa_num_rounds: int = 5
     ppa_min_rounds: int = 2
     ppa_round0_steps: int = 30
-    # const_lr defaults calibrated on the R2.pth PreActResNet18 (2026-07-08,
-    # margin loss, lambda=30 normalized_mse, K=20, clean-correct subset):
-    # round0 lr=0.1 reaches inner obj ~6.9 at mean pixel-L2 ~0.27 (the eval
-    # radius scale); 0.3 -> obj 24 / L2 0.82; >=1 blows past the threat model
-    # (L2 2.3+). BB+Armijo at the same K barely moves z (obj -2.3, L2 0.015).
-    # Refine keeps the MNIST 2:1 round0:refine ratio.
-    ppa_round0_lr: float = 0.1
+    # const_lr defaults calibrated on the CURRENT R2.pth (2026-07-08 swap:
+    # 95.3%-clean PreActResNet18, 'last' weights; margin loss, lambda=30
+    # normalized_mse, K=20). This model is much steeper than the old
+    # 87.3% R2_Old.pth: round0 lr=0.03 reaches inner obj ~46 at mean
+    # pixel-L2 ~0.59 (the eval-radius scale); 0.1 -> obj 91 / L2 1.28 /
+    # acc 0%. BB+Armijo at the same K stays at obj ~1.2 / L2 0.16.
+    # Refine keeps the MNIST 2:1 round0:refine ratio. Old-model calibration
+    # (R2_Old.pth) was 0.1 / 0.05.
+    ppa_round0_lr: float = 0.03
     ppa_refine_steps: int = 15
-    ppa_refine_lr: float = 0.05
+    ppa_refine_lr: float = 0.015
     ppa_gain_rtol: float = 1e-4
 
     # --- Benchmarking ---
@@ -1097,14 +1112,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ppa-round-order",
         type=str,
         default="ascent_first",
-        choices=["ascent_first", "reassign_first"],
+        choices=["ascent_first", "reassign_first", "reassign_first_v2"],
         help=(
             "Within-round order for MPA. ascent_first = Algorithm 1 rounds "
             "of {K ascent steps; reassign}. reassign_first = mirrored rounds "
             "of {reassign; K ascent steps} closed by a final reassignment "
             "(R=3: R-A-R-A-R-A-R); its round-0 reassignment at z=x starts "
-            "each ascent from the best same-class training sample. All "
-            "other hyperparameters are shared."
+            "each ascent from the best same-class training sample. "
+            "reassign_first_v2 = same, but the round-0 reassignment is "
+            "priced at lambda/--ppa-round0-lambda-damping so confidence-"
+            "driven multi-start jumps activate at z=x. All other "
+            "hyperparameters are shared."
+        ),
+    )
+    ppa.add_argument(
+        "--ppa-round0-lambda-damping",
+        type=float,
+        default=6.0,
+        help=(
+            "alpha for reassign_first_v2: the round-0 reassignment scores "
+            "candidates with lambda/alpha while everything else keeps the "
+            "full lambda. 1.0 = identical to reassign_first. On the current "
+            "R2.pth at lambda=30: alpha=6 activates ~53%% of round-0 jumps, "
+            "alpha=10 ~73%%."
         ),
     )
     ppa.add_argument("--ppa-num-rounds", type=int, default=5)
@@ -1113,18 +1143,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ppa.add_argument(
         "--ppa-round0-lr",
         type=float,
-        default=0.1,
+        default=0.03,
         help=(
             "const_lr rule only: round-0 base LR for the WRM diminishing "
             "schedule lr/sqrt(s). Calibrated for margin+lambda=30 nmse on "
-            "the pretrained CIFAR-10 ResNet."
+            "the current 95.3%%-clean R2.pth (old R2_Old.pth wanted 0.1)."
         ),
     )
     ppa.add_argument("--ppa-refine-steps", type=int, default=15)
     ppa.add_argument(
         "--ppa-refine-lr",
         type=float,
-        default=0.05,
+        default=0.015,
         help="const_lr rule only: constant LR for refinement-round ascent.",
     )
     ppa.add_argument("--ppa-gain-rtol", type=float, default=1e-4)
@@ -1437,6 +1467,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "dual_burn_in": "dual_burn_in",
         "ppa_step_rule": "ppa_step_rule",
         "ppa_round_order": "ppa_round_order",
+        "ppa_round0_lambda_damping": "ppa_round0_lambda_damping",
         "ppa_num_rounds": "ppa_num_rounds",
         "ppa_min_rounds": "ppa_min_rounds",
         "ppa_round0_steps": "ppa_round0_steps",

@@ -257,13 +257,16 @@ PPA_GAIN_RTOL=${PPA_GAIN_RTOL:-1e-4}
 # sharding; the reassignment pool is all-gathered to the global batch either
 # way, so MPA's multi-start pool is COMMON_BATCH regardless of NPROC.
 PPA_STEP_RULE=${PPA_STEP_RULE:-bb_armijo}
-PPA_ROUND0_LR=${PPA_ROUND0_LR:-0.1}
-PPA_REFINE_LR=${PPA_REFINE_LR:-0.05}
+PPA_ROUND0_LR=${PPA_ROUND0_LR:-0.03}
+PPA_REFINE_LR=${PPA_REFINE_LR:-0.015}
 # ascent_first = Algorithm 1 rounds {ascend; reassign};
 # reassign_first = mirrored rounds {reassign; ascend} closed by a final
 # reassignment (R=3: R-A-R-A-R-A-R); round-0 reassignment at z=x picks each
 # sample's best same-class start.
+# reassign_first_v2 = reassign_first with the round-0 reassignment priced at
+# lambda/PPA_ROUND0_LAMBDA_DAMPING (graduated multi-start; damping 1 = v1).
 PPA_ROUND_ORDER=${PPA_ROUND_ORDER:-ascent_first}
+PPA_ROUND0_LAMBDA_DAMPING=${PPA_ROUND0_LAMBDA_DAMPING:-6.0}
 
 # ---- NPF architecture knobs ----
 RUN_ONLY_ALGO=${RUN_ONLY_ALGO:-}
@@ -496,6 +499,9 @@ if [[ " ${ACTIVE_ALGOS[*]} " == *" npf_lastquad "* ]]; then
 fi
 if [[ " ${ACTIVE_ALGOS[*]} " == *" new_ppa "* ]]; then
     echo "  New_PPA/MPA:  step_rule=${PPA_STEP_RULE} round_order=${PPA_ROUND_ORDER} rounds=${PPA_NUM_ROUNDS} min_rounds=${PPA_MIN_ROUNDS}"
+    if [ "${PPA_ROUND_ORDER}" = "reassign_first_v2" ]; then
+        echo "                round0_lambda_damping=${PPA_ROUND0_LAMBDA_DAMPING} (round-0 reassignment priced at lambda/damping)"
+    fi
     echo "                round0_steps=${PPA_ROUND0_STEPS:-${K}} refine_steps=${PPA_REFINE_STEPS:-${K}} gain_rtol=${PPA_GAIN_RTOL}"
     echo "                round0_lr=${PPA_ROUND0_LR} refine_lr=${PPA_REFINE_LR} (const_lr rule only)"
 fi
@@ -617,6 +623,7 @@ algo_args() {
         new_ppa)
             echo "--ppa-step-rule ${PPA_STEP_RULE} \
                 --ppa-round-order ${PPA_ROUND_ORDER} \
+                --ppa-round0-lambda-damping ${PPA_ROUND0_LAMBDA_DAMPING} \
                 --ppa-num-rounds ${PPA_NUM_ROUNDS} --ppa-min-rounds ${PPA_MIN_ROUNDS} \
                 --ppa-round0-steps ${PPA_ROUND0_STEPS:-${k}} \
                 --ppa-refine-steps ${PPA_REFINE_STEPS:-${k}} \
@@ -776,6 +783,7 @@ run_algo() {
             printf "PARAMETRIC_BB_MAX_GRAD_NORM=%q\n" "$PARAMETRIC_BB_MAX_GRAD_NORM"
             printf "PPA_STEP_RULE=%q\n" "$PPA_STEP_RULE"
             printf "PPA_ROUND_ORDER=%q\n" "$PPA_ROUND_ORDER"
+            printf "PPA_ROUND0_LAMBDA_DAMPING=%q\n" "$PPA_ROUND0_LAMBDA_DAMPING"
             printf "PPA_NUM_ROUNDS=%q\n" "$PPA_NUM_ROUNDS"
             printf "PPA_MIN_ROUNDS=%q\n" "$PPA_MIN_ROUNDS"
             printf "PPA_ROUND0_STEPS=%q\n" "${PPA_ROUND0_STEPS:-$KEFF}"

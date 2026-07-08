@@ -17,6 +17,16 @@ Implements Algorithm ``implicit_mpa`` per batch: R rounds of
   z = x, so each sample's ascent starts from the best same-class training
   sample under the DRO score; like ascent_first, the theta-update always
   sees within-class best responses.
+* ``reassign_first_v2``: same schedule as reassign_first, but the ROUND-0
+  reassignment is priced at the damped penalty λ₀ = λ /
+  ``ppa_round0_lambda_damping`` (graduated multi-start): at z = x the full-λ
+  score freezes every particle (raw-image loss gaps cannot pay raw-image
+  transport prices), while a damped score lets each sample jump to its own
+  nearest low-confidence same-class image — the retained cost term keeps
+  the argmax anchor-dependent, so diversity is preserved (unlike deleting
+  the penalty, which collapses each class onto one particle). Rounds >= 1,
+  the closing reassignment, and all ascent objectives use the full λ.
+  Damping 1.0 makes v2 identical to reassign_first.
 
 Two step rules for (a), selected by ``cfg.ppa_step_rule``:
 
@@ -241,6 +251,7 @@ class NewPPATrainer(BaseAdvTrainer):
         mask: torch.Tensor,
         *,
         global_pool: bool,
+        lam_override: Optional[float] = None,
     ) -> Tuple[torch.Tensor, float, float]:
         """Within-class best-response reassignment of the attacked subset.
 
@@ -250,10 +261,17 @@ class NewPPATrainer(BaseAdvTrainer):
         filtered — so ranks with differently sized attacked subsets stay
         collective-compatible. The local anchors always have their own
         particle in the pool, preserving per-sample monotonicity.
+
+        ``lam_override`` replaces cfg.lambda_param in the reassignment SCORE
+        only (candidate pricing and the gain baseline) — used by
+        reassign_first_v2 to discount the round-0 penalty to λ/α so
+        confidence-driven multi-start jumps become affordable while anchor-
+        dependence (and hence particle diversity) is preserved. The ascent
+        objective and every other reassignment stay at the full λ.
         """
         cfg = self.config
         clf = self._classifier_module
-        lam = float(cfg.lambda_param)
+        lam = float(cfg.lambda_param) if lam_override is None else float(lam_override)
         use_margin = bool(cfg.use_margin_loss)
         transport_cost = str(getattr(cfg, "transport_cost", "normalized_mse"))
 
@@ -360,7 +378,7 @@ class NewPPATrainer(BaseAdvTrainer):
         num_rounds = max(1, int(cfg.ppa_num_rounds))
         order = str(getattr(cfg, "ppa_round_order", "ascent_first")).lower()
 
-        if order == "reassign_first":
+        if order in ("reassign_first", "reassign_first_v2"):
             # Mirrored rounds: {reassign; K ascent steps} x R, closed by a
             # FINAL reassignment (R=3: R-A-R-A-R-A-R). The round-0
             # reassignment happens at z = x, i.e. each sample starts its
@@ -372,9 +390,23 @@ class NewPPATrainer(BaseAdvTrainer):
             # knobs to ascent_first. _should_stop's round_idx argument is the
             # number of COMPLETED rounds, so ppa_min_rounds guarantees the
             # same number of full rounds in both orders.
+            #
+            # v2 = graduated multi-start: ONLY the round-0 reassignment is
+            # priced at λ₀ = λ / ppa_round0_lambda_damping, making
+            # confidence-driven jumps affordable at z = x while the cost
+            # term still personalizes the argmax per anchor (no collapse of
+            # the particle set). Rounds >= 1, the final reassignment, and
+            # the ascent objective all use the full λ, so the DRO objective
+            # being optimized and reported is unchanged. Damping 1.0 makes
+            # v2 identical to reassign_first.
+            damping = float(getattr(cfg, "ppa_round0_lambda_damping", 1.0))
             for round_idx in range(num_rounds):
+                lam_override = None
+                if order == "reassign_first_v2" and round_idx == 0:
+                    lam_override = float(cfg.lambda_param) / max(damping, 1e-12)
                 z_att, gain, obj_scale = self._reassign(
-                    z_att, x_att, y_att, x, y, mask, global_pool=global_pool
+                    z_att, x_att, y_att, x, y, mask,
+                    global_pool=global_pool, lam_override=lam_override,
                 )
                 if self._should_stop(
                     round_idx, gain, obj_scale, int(z_att.size(0)), sync=sync
