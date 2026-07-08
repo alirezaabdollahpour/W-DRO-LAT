@@ -180,6 +180,10 @@ INP_EPS=${INP_EPS:-0.5}
 INP_STEPS=${INP_STEPS:-20}
 INP_RESTARTS=${INP_RESTARTS:-5}
 EVAL_PGD_SAMPLES=${EVAL_PGD_SAMPLES:-1024}
+# 0 = evaluate the transport adversary on the full test set (cheap for
+# learned maps). new_ppa/MPA runs a full inner maximization per eval batch,
+# so its launcher caps this (e.g. 1024) to keep rank-0 eval time bounded.
+EVAL_TRANSPORT_SAMPLES=${EVAL_TRANSPORT_SAMPLES:-0}
 EVAL_TRANSPORT_PGD_ALIGNMENT=${EVAL_TRANSPORT_PGD_ALIGNMENT:-0}
 EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES=${EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES:-256}
 INPUT_PGD_LOSS=${INPUT_PGD_LOSS:-ce}  # legacy 57% benchmark convention
@@ -234,6 +238,32 @@ DUAL_LANGEVIN_STEP_SIZE=${DUAL_LANGEVIN_STEP_SIZE:-5e-3}
 DUAL_MALA=${DUAL_MALA:-1}
 DUAL_BURN_IN=${DUAL_BURN_IN:-0}
 DUAL_SAMPLE_LEVEL=${DUAL_SAMPLE_LEVEL:-3}  # m=8 — keeps wallclock comparable
+
+# ---- New_PPA (MPA) knobs ----
+# MPA = Algorithm 1 with R rounds of {K-step BB+Armijo ascent on z anchored at
+# the original x; within-class free-weight reassignment}. R=1 collapses to PA.
+# The exact 2-round MPA schedule (K ascent -> reassign -> K ascent -> reassign)
+# needs PPA_NUM_ROUNDS=2 PPA_MIN_ROUNDS=2 so the gain-based early stop can
+# never skip the post-reassignment ascent burst. Round0/refine steps default
+# to the shared inner budget K.
+PPA_NUM_ROUNDS=${PPA_NUM_ROUNDS:-5}
+PPA_MIN_ROUNDS=${PPA_MIN_ROUNDS:-2}
+PPA_ROUND0_STEPS=${PPA_ROUND0_STEPS:-}
+PPA_REFINE_STEPS=${PPA_REFINE_STEPS:-}
+PPA_GAIN_RTOL=${PPA_GAIN_RTOL:-1e-4}
+# bb_armijo = shared line-searched step (uniform with other DRO methods);
+# const_lr = per-sample MNIST/paper ascent (round0 diminishing lr/sqrt(s),
+# refinement constant lr). const_lr makes the ascent invariant to DDP
+# sharding; the reassignment pool is all-gathered to the global batch either
+# way, so MPA's multi-start pool is COMMON_BATCH regardless of NPROC.
+PPA_STEP_RULE=${PPA_STEP_RULE:-bb_armijo}
+PPA_ROUND0_LR=${PPA_ROUND0_LR:-0.1}
+PPA_REFINE_LR=${PPA_REFINE_LR:-0.05}
+# ascent_first = Algorithm 1 rounds {ascend; reassign};
+# reassign_first = mirrored rounds {reassign; ascend} closed by a final
+# reassignment (R=3: R-A-R-A-R-A-R); round-0 reassignment at z=x picks each
+# sample's best same-class start.
+PPA_ROUND_ORDER=${PPA_ROUND_ORDER:-ascent_first}
 
 # ---- NPF architecture knobs ----
 RUN_ONLY_ALGO=${RUN_ONLY_ALGO:-}
@@ -316,7 +346,7 @@ fi
 DEFAULT_ALGOS=(npf_lastquad)
 # Full runtime sweep disabled for the current NPF-LastQuad launch:
 # DEFAULT_ALGOS=(npf nn_dro madry wrm wfr dual new_ppa)
-KNOWN_ALGOS=(npf npf_lastquad)
+KNOWN_ALGOS=(npf npf_lastquad new_ppa)
 # KNOWN_ALGOS=(npf npf_lastquad nn_dro madry wrm wfr dual new_ppa)
 
 is_known_algo() {
@@ -464,6 +494,11 @@ if [[ " ${ACTIVE_ALGOS[*]} " == *" npf_lastquad "* ]]; then
     echo "                init_eps=${NPF_LASTQUAD_INIT_EPS} identity_init=${NPF_LASTQUAD_IDENTITY_INIT} strong_convexity=${NPF_LASTQUAD_STRONG_CONVEXITY}"
     echo "                pos_weights=${NPF_LASTQUAD_POS_WEIGHTS} rectifier=${NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER}"
 fi
+if [[ " ${ACTIVE_ALGOS[*]} " == *" new_ppa "* ]]; then
+    echo "  New_PPA/MPA:  step_rule=${PPA_STEP_RULE} round_order=${PPA_ROUND_ORDER} rounds=${PPA_NUM_ROUNDS} min_rounds=${PPA_MIN_ROUNDS}"
+    echo "                round0_steps=${PPA_ROUND0_STEPS:-${K}} refine_steps=${PPA_REFINE_STEPS:-${K}} gain_rtol=${PPA_GAIN_RTOL}"
+    echo "                round0_lr=${PPA_ROUND0_LR} refine_lr=${PPA_REFINE_LR} (const_lr rule only)"
+fi
 if [[ " ${ACTIVE_ALGOS[*]} " == *" npf "* ]]; then
     echo "  NPF:          hidden=${NPF_HIDDEN}"
     echo "                outer_rank=${NPF_OUTER_RANK} inner_rank=${NPF_INNER_RANK}"
@@ -580,10 +615,14 @@ algo_args() {
                 ${mala_flag}"
             ;;
         new_ppa)
-            echo "--ppa-num-rounds 5 --ppa-min-rounds 2 \
-                --ppa-round0-steps ${k} \
-                --ppa-refine-steps ${k} \
-                --ppa-gain-rtol 1e-4"
+            echo "--ppa-step-rule ${PPA_STEP_RULE} \
+                --ppa-round-order ${PPA_ROUND_ORDER} \
+                --ppa-num-rounds ${PPA_NUM_ROUNDS} --ppa-min-rounds ${PPA_MIN_ROUNDS} \
+                --ppa-round0-steps ${PPA_ROUND0_STEPS:-${k}} \
+                --ppa-refine-steps ${PPA_REFINE_STEPS:-${k}} \
+                --ppa-round0-lr ${PPA_ROUND0_LR} \
+                --ppa-refine-lr ${PPA_REFINE_LR} \
+                --ppa-gain-rtol ${PPA_GAIN_RTOL}"
             ;;
     esac
 }
@@ -680,6 +719,7 @@ run_algo() {
             printf "INP_STEPS=%q\n" "$INP_STEPS"
             printf "INP_RESTARTS=%q\n" "$INP_RESTARTS"
             printf "EVAL_PGD_SAMPLES=%q\n" "$EVAL_PGD_SAMPLES"
+            printf "EVAL_TRANSPORT_SAMPLES=%q\n" "$EVAL_TRANSPORT_SAMPLES"
             printf "EVAL_TRANSPORT_PGD_ALIGNMENT=%q\n" "$EVAL_TRANSPORT_PGD_ALIGNMENT"
             printf "EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES=%q\n" "$EVAL_TRANSPORT_PGD_ALIGNMENT_SAMPLES"
             printf "INPUT_PGD_LOSS=%q\n" "$INPUT_PGD_LOSS"
@@ -734,6 +774,15 @@ run_algo() {
             printf "BB_LS_SHRINK=%q\n" "$BB_LS_SHRINK"
             printf "BB_LS_MAX_STEPS=%q\n" "$BB_LS_MAX_STEPS"
             printf "PARAMETRIC_BB_MAX_GRAD_NORM=%q\n" "$PARAMETRIC_BB_MAX_GRAD_NORM"
+            printf "PPA_STEP_RULE=%q\n" "$PPA_STEP_RULE"
+            printf "PPA_ROUND_ORDER=%q\n" "$PPA_ROUND_ORDER"
+            printf "PPA_NUM_ROUNDS=%q\n" "$PPA_NUM_ROUNDS"
+            printf "PPA_MIN_ROUNDS=%q\n" "$PPA_MIN_ROUNDS"
+            printf "PPA_ROUND0_STEPS=%q\n" "${PPA_ROUND0_STEPS:-$KEFF}"
+            printf "PPA_REFINE_STEPS=%q\n" "${PPA_REFINE_STEPS:-$KEFF}"
+            printf "PPA_ROUND0_LR=%q\n" "$PPA_ROUND0_LR"
+            printf "PPA_REFINE_LR=%q\n" "$PPA_REFINE_LR"
+            printf "PPA_GAIN_RTOL=%q\n" "$PPA_GAIN_RTOL"
             printf "RESULTS_DIR=%q\n" "$RESULTS_DIR"
             printf "OUT_DIR=%q\n" "$OUT_DIR"
             printf "FINAL_CHECKPOINT=%q\n" "$FINAL_CKPT"
@@ -907,6 +956,7 @@ run_algo() {
             --inp-restarts "$INP_RESTARTS" \
             --eval-input-pgd \
             --eval-input-pgd-samples "$EVAL_PGD_SAMPLES" \
+            --eval-transport-samples "$EVAL_TRANSPORT_SAMPLES" \
             --input-pgd-loss "$INPUT_PGD_LOSS" \
             --input-pgd-geometry "$INPUT_PGD_GEOMETRY" \
             "${COMMON_EXTRA_FLAGS[@]}" \

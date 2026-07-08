@@ -289,13 +289,39 @@ class TrainConfig:
     # on the post-burn-in state. 0 = no burn-in.
     dual_burn_in: int = 0
 
-    # --- New_PPA hyperparameters ---
+    # --- New_PPA (MPA) hyperparameters ---
+    # Step rule for the per-round ascent bursts:
+    #   * "bb_armijo" — shared BB+Armijo line search on the batch-mean
+    #     objective (uniform with the other DRO adversaries here). The
+    #     ppa_*_lr fields are unused.
+    #   * "const_lr" — faithful MNIST_Cuturi / Algorithm-1 semantics:
+    #     per-sample updates with round 0 on the WRM diminishing schedule
+    #     eta_s = ppa_round0_lr / sqrt(s) and refinement rounds at the
+    #     constant ppa_refine_lr. No cross-sample coupling, so the ascent is
+    #     invariant to how the batch is sharded across DDP ranks.
+    ppa_step_rule: str = "bb_armijo"
+    # Within-round order:
+    #   * "ascent_first" (Algorithm 1): rounds of {K ascent steps; reassign};
+    #     R=1 is plain PA (no reassignment).
+    #   * "reassign_first": mirrored rounds of {reassign; K ascent steps},
+    #     closed by a final reassignment (R=3: R-A-R-A-R-A-R) — the round-0
+    #     reassignment fires at z=x (best same-class training sample as the
+    #     ascent start) and, like ascent_first, the schedule ends with a
+    #     reassignment so the theta-update sees within-class best responses.
+    # All other knobs (steps, LRs, min_rounds, gain_rtol) are shared.
+    ppa_round_order: str = "ascent_first"
     ppa_num_rounds: int = 5
     ppa_min_rounds: int = 2
     ppa_round0_steps: int = 30
-    ppa_round0_lr: float = 1e-2
+    # const_lr defaults calibrated on the R2.pth PreActResNet18 (2026-07-08,
+    # margin loss, lambda=30 normalized_mse, K=20, clean-correct subset):
+    # round0 lr=0.1 reaches inner obj ~6.9 at mean pixel-L2 ~0.27 (the eval
+    # radius scale); 0.3 -> obj 24 / L2 0.82; >=1 blows past the threat model
+    # (L2 2.3+). BB+Armijo at the same K barely moves z (obj -2.3, L2 0.015).
+    # Refine keeps the MNIST 2:1 round0:refine ratio.
+    ppa_round0_lr: float = 0.1
     ppa_refine_steps: int = 15
-    ppa_refine_lr: float = 5e-3
+    ppa_refine_lr: float = 0.05
     ppa_gain_rtol: float = 1e-4
 
     # --- Benchmarking ---
@@ -321,6 +347,13 @@ class TrainConfig:
     # --- Evaluation (input-space PGD) ---
     eval_input_pgd: bool = True
     eval_input_pgd_samples: int = 1024
+    # Cap on test points for the per-epoch transport-adversary evaluation.
+    # 0 = full test set (fine for cheap learned maps like NPF; the legacy
+    # behavior). Set to e.g. 1024 for transductive attacks (new_ppa/MPA)
+    # where transport_for_eval runs a full inner maximization per batch —
+    # uncapped it serializes minutes of attack compute onto rank 0 every
+    # epoch while other DDP ranks wait at the barrier.
+    eval_transport_samples: int = 0
     eval_transport_pgd_alignment: bool = False
     eval_transport_pgd_alignment_samples: int = 256
     input_pgd_loss: str = "ce"
@@ -1048,12 +1081,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # New_PPA
     ppa = parser.add_argument_group("new_ppa")
+    ppa.add_argument(
+        "--ppa-step-rule",
+        type=str,
+        default="bb_armijo",
+        choices=["bb_armijo", "const_lr"],
+        help=(
+            "Ascent step rule for MPA rounds. bb_armijo = shared line-searched "
+            "step on the batch-mean objective; const_lr = per-sample "
+            "MNIST-style ascent (round 0: ppa-round0-lr/sqrt(s) diminishing, "
+            "refinement: constant ppa-refine-lr)."
+        ),
+    )
+    ppa.add_argument(
+        "--ppa-round-order",
+        type=str,
+        default="ascent_first",
+        choices=["ascent_first", "reassign_first"],
+        help=(
+            "Within-round order for MPA. ascent_first = Algorithm 1 rounds "
+            "of {K ascent steps; reassign}. reassign_first = mirrored rounds "
+            "of {reassign; K ascent steps} closed by a final reassignment "
+            "(R=3: R-A-R-A-R-A-R); its round-0 reassignment at z=x starts "
+            "each ascent from the best same-class training sample. All "
+            "other hyperparameters are shared."
+        ),
+    )
     ppa.add_argument("--ppa-num-rounds", type=int, default=5)
     ppa.add_argument("--ppa-min-rounds", type=int, default=2)
     ppa.add_argument("--ppa-round0-steps", type=int, default=30)
-    ppa.add_argument("--ppa-round0-lr", type=float, default=1e-2)
+    ppa.add_argument(
+        "--ppa-round0-lr",
+        type=float,
+        default=0.1,
+        help=(
+            "const_lr rule only: round-0 base LR for the WRM diminishing "
+            "schedule lr/sqrt(s). Calibrated for margin+lambda=30 nmse on "
+            "the pretrained CIFAR-10 ResNet."
+        ),
+    )
     ppa.add_argument("--ppa-refine-steps", type=int, default=15)
-    ppa.add_argument("--ppa-refine-lr", type=float, default=5e-3)
+    ppa.add_argument(
+        "--ppa-refine-lr",
+        type=float,
+        default=0.05,
+        help="const_lr rule only: constant LR for refinement-round ascent.",
+    )
     ppa.add_argument("--ppa-gain-rtol", type=float, default=1e-4)
 
     # Benchmarking
@@ -1095,6 +1168,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-eval-input-pgd", dest="eval_input_pgd", action="store_false")
     parser.set_defaults(eval_input_pgd=True)
     parser.add_argument("--eval-input-pgd-samples", type=int, default=1024)
+    parser.add_argument(
+        "--eval-transport-samples",
+        type=int,
+        default=0,
+        help=(
+            "Cap on test samples for the per-epoch transport-adversary "
+            "evaluation. 0 evaluates the full test set (legacy behavior; "
+            "fine for cheap learned maps). Use ~1024 for transductive "
+            "attacks like new_ppa where the eval transport is a full inner "
+            "maximization."
+        ),
+    )
     parser.add_argument(
         "--eval-transport-pgd-alignment",
         dest="eval_transport_pgd_alignment",
@@ -1350,6 +1435,8 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "dual_mala": "dual_mala",
         "dual_init_noise_scale": "dual_init_noise_scale",
         "dual_burn_in": "dual_burn_in",
+        "ppa_step_rule": "ppa_step_rule",
+        "ppa_round_order": "ppa_round_order",
         "ppa_num_rounds": "ppa_num_rounds",
         "ppa_min_rounds": "ppa_min_rounds",
         "ppa_round0_steps": "ppa_round0_steps",
@@ -1359,6 +1446,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "ppa_gain_rtol": "ppa_gain_rtol",
         "eval_input_pgd": "eval_input_pgd",
         "eval_input_pgd_samples": "eval_input_pgd_samples",
+        "eval_transport_samples": "eval_transport_samples",
         "eval_transport_pgd_alignment": "eval_transport_pgd_alignment",
         "eval_transport_pgd_alignment_samples": "eval_transport_pgd_alignment_samples",
         "input_pgd_loss": "input_pgd_loss",

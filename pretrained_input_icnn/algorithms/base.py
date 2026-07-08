@@ -1085,6 +1085,7 @@ class BaseAdvTrainer:
             self.device,
             penalty_lambda=getattr(cfg, "lambda_param", 0.0),
             cost_fn=self._transport_cost,
+            max_samples=int(getattr(cfg, "eval_transport_samples", 0) or 0),
         )
 
         result: Dict[str, Any] = {

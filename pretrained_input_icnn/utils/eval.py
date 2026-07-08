@@ -79,14 +79,19 @@ def evaluate_under_transport(
     device: torch.device,
     penalty_lambda: float,
     cost_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+    max_samples: Optional[int] = None,
 ) -> Tuple[float, float, float, float, Dict[str, Any]]:
     """Eval CE / acc / transport cost when adversary maps clean -> adversarial inputs.
 
     ``transport_fn`` must accept normalized inputs and return normalized
-    adversarial inputs of the same shape (no grad needed).
+    adversarial inputs of the same shape (no grad needed). ``max_samples``
+    caps the number of evaluated test points (None/0 = full test set) — used
+    when the transport is an expensive per-batch attack (e.g. MPA) rather
+    than a cheap learned map.
     """
     if cost_fn is None:
         cost_fn = pixel_l2_squared
+    sample_cap = int(max_samples) if max_samples else 0
     training_modes = _module_training_modes(classifier)
     classifier.eval()
     try:
@@ -101,6 +106,8 @@ def evaluate_under_transport(
         max_l2 = 0.0
         max_linf = 0.0
         for x, y in loader:
+            if sample_cap > 0 and total >= sample_cap:
+                break
             x = x.to(device)
             y = y.to(device)
             x_adv = transport_fn(x).detach()

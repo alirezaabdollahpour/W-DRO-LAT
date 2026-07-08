@@ -147,6 +147,28 @@ def all_reduce_sum_scalar(x: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def all_gather_concat(x: torch.Tensor) -> torch.Tensor:
+    """All-gather equal-shaped per-rank tensors and concat along dim 0.
+
+    Used by MPA (new_ppa) to build the GLOBAL reassignment candidate pool:
+    every rank contributes its full-batch-shard particles/labels/losses so
+    each sample best-responds over all B global candidates regardless of
+    world size. Requires the local tensor shape to match across ranks —
+    guaranteed per training batch because DistributedSampler hands every
+    rank equally sized shards. Returns ``x`` unchanged when not distributed.
+    """
+    if not _DIST.is_distributed:
+        return x
+    x = x.detach().contiguous()
+    parts = [torch.empty_like(x) for _ in range(_DIST.world_size)]
+    dist.all_gather(parts, x)
+    # Keep this rank's slot bitwise-identical to its local tensor (all_gather
+    # round-trips through NCCL buffers; identity for the local slot keeps the
+    # self-inclusion property of the reassignment exact).
+    parts[_DIST.rank] = x
+    return torch.cat(parts, dim=0)
+
+
 def all_reduce_grads_(params) -> None:
     """In-place mean-reduce ``param.grad`` across ranks for an iterable of Parameters."""
     if not _DIST.is_distributed:
