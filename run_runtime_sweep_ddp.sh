@@ -263,10 +263,18 @@ PPA_REFINE_LR=${PPA_REFINE_LR:-0.015}
 # reassign_first = mirrored rounds {reassign; ascend} closed by a final
 # reassignment (R=3: R-A-R-A-R-A-R); round-0 reassignment at z=x picks each
 # sample's best same-class start.
-# reassign_first_v2 = reassign_first with the round-0 reassignment priced at
-# lambda/PPA_ROUND0_LAMBDA_DAMPING (graduated multi-start; damping 1 = v1).
+# reassign_first_v2 = reassign_first with the round-0 reassignment (at z=x)
+# priced at lambda/PPA_ROUND0_LAMBDA_DAMPING (graduated multi-start;
+# damping 1 = v1). The damping is read ONLY by reassign_first_v2.
 PPA_ROUND_ORDER=${PPA_ROUND_ORDER:-ascent_first}
 PPA_ROUND0_LAMBDA_DAMPING=${PPA_ROUND0_LAMBDA_DAMPING:-6.0}
+
+# ---- WRM knobs (WRM == MPA with R=1: K-step per-sample ascent, no
+# reassignment; shares lambda / transport cost / margin / mask with MPA) ----
+# const_lr = MPA-parity diminishing schedule wrm_inner_lr/sqrt(s);
+# bb_armijo = legacy shared line-searched rule.
+WRM_STEP_RULE=${WRM_STEP_RULE:-const_lr}
+WRM_INNER_LR=${WRM_INNER_LR:-0.03}
 
 # ---- NPF architecture knobs ----
 RUN_ONLY_ALGO=${RUN_ONLY_ALGO:-}
@@ -349,7 +357,7 @@ fi
 DEFAULT_ALGOS=(npf_lastquad)
 # Full runtime sweep disabled for the current NPF-LastQuad launch:
 # DEFAULT_ALGOS=(npf nn_dro madry wrm wfr dual new_ppa)
-KNOWN_ALGOS=(npf npf_lastquad new_ppa)
+KNOWN_ALGOS=(npf npf_lastquad new_ppa wrm)
 # KNOWN_ALGOS=(npf npf_lastquad nn_dro madry wrm wfr dual new_ppa)
 
 is_known_algo() {
@@ -505,6 +513,9 @@ if [[ " ${ACTIVE_ALGOS[*]} " == *" new_ppa "* ]]; then
     echo "                round0_steps=${PPA_ROUND0_STEPS:-${K}} refine_steps=${PPA_REFINE_STEPS:-${K}} gain_rtol=${PPA_GAIN_RTOL}"
     echo "                round0_lr=${PPA_ROUND0_LR} refine_lr=${PPA_REFINE_LR} (const_lr rule only)"
 fi
+if [[ " ${ACTIVE_ALGOS[*]} " == *" wrm "* ]]; then
+    echo "  WRM (MPA R=1): step_rule=${WRM_STEP_RULE} K=${K} inner_lr=${WRM_INNER_LR} (const_lr: lr/sqrt(s) diminishing)"
+fi
 if [[ " ${ACTIVE_ALGOS[*]} " == *" npf "* ]]; then
     echo "  NPF:          hidden=${NPF_HIDDEN}"
     echo "                outer_rank=${NPF_OUTER_RANK} inner_rank=${NPF_INNER_RANK}"
@@ -598,7 +609,9 @@ algo_args() {
                 --madry-pgd-step-size ${MADRY_PGD_STEP_SIZE} --madry-pgd-restarts 1"
             ;;
         wrm)
-            echo "--wrm-inner-steps ${k}"
+            echo "--wrm-step-rule ${WRM_STEP_RULE} \
+                --wrm-inner-steps ${k} \
+                --wrm-inner-lr ${WRM_INNER_LR}"
             ;;
         wfr)
             echo "--wfr-inner-steps ${k} --wfr-num-samples 8 --wfr-epsilon 0.1"
@@ -784,6 +797,8 @@ run_algo() {
             printf "PPA_STEP_RULE=%q\n" "$PPA_STEP_RULE"
             printf "PPA_ROUND_ORDER=%q\n" "$PPA_ROUND_ORDER"
             printf "PPA_ROUND0_LAMBDA_DAMPING=%q\n" "$PPA_ROUND0_LAMBDA_DAMPING"
+            printf "WRM_STEP_RULE=%q\n" "$WRM_STEP_RULE"
+            printf "WRM_INNER_LR=%q\n" "$WRM_INNER_LR"
             printf "PPA_NUM_ROUNDS=%q\n" "$PPA_NUM_ROUNDS"
             printf "PPA_MIN_ROUNDS=%q\n" "$PPA_MIN_ROUNDS"
             printf "PPA_ROUND0_STEPS=%q\n" "${PPA_ROUND0_STEPS:-$KEFF}"

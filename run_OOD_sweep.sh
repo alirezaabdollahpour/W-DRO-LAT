@@ -45,6 +45,17 @@ INP_EPS_SWEEP_RAW="${INP_EPS_SWEEP_RAW//,/ }"
 read -r -a INP_EPS_SWEEP <<< "${INP_EPS_SWEEP_RAW}"
 INP_SWEEP_MAX_SAMPLES="${INP_SWEEP_MAX_SAMPLES:--1}"
 
+# SuperDeepFool: adv_lib L2 minimum-norm attack (vendored fallback in
+# third_party/adv_lib_vendored). SDF_ITERS maps to the upstream 'steps'
+# parameter; every other SDF parameter keeps the upstream default
+# (df_steps=100, overshoot=0.02, search_iter=10). Robust accuracy is
+# reported at INP_EPS (and each INP_EPS_SWEEP epsilon) by thresholding the
+# per-sample minimum norms.
+RUN_SDF="${RUN_SDF:-1}"
+SDF_ITERS="${SDF_ITERS:-100}"
+SDF_BS="${SDF_BS:-256}"
+SDF_MAX_EXAMPLES="${SDF_MAX_EXAMPLES:--1}"
+
 RUN_AUTOATTACK="${RUN_AUTOATTACK:-1}"
 AA_VERSION="${AA_VERSION:-custom}"
 AA_NORM="${AA_NORM:-L2}"
@@ -195,6 +206,11 @@ if [ "${RUN_AUTOATTACK}" = "1" ]; then
 else
     echo "        AutoAttack disabled"
 fi
+if [ "${RUN_SDF}" = "1" ]; then
+    echo "        SuperDeepFool L2 min-norm, iters=${SDF_ITERS}, bs=${SDF_BS}, max_examples=${SDF_MAX_EXAMPLES} (robust acc thresholded at eps=${INP_EPS})"
+else
+    echo "        SuperDeepFool disabled"
+fi
 if [ "${SKIP_CIFAR10C}" = "1" ]; then
     echo "        CIFAR-10-C disabled"
 else
@@ -301,6 +317,17 @@ run_one() {
         fi
     fi
 
+    if [ "${RUN_SDF}" = "1" ]; then
+        eval_args+=(
+            --superdeepfool
+            --sdf-steps "${SDF_ITERS}"
+            --sdf-bs "${SDF_BS}"
+        )
+        if [ "${SDF_MAX_EXAMPLES}" != "-1" ]; then
+            eval_args+=(--sdf-max-examples "${SDF_MAX_EXAMPLES}")
+        fi
+    fi
+
     local started_utc ended_utc t0 t1 elapsed status
     started_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     t0="$(date +%s)"
@@ -311,6 +338,18 @@ run_one() {
     t1="$(date +%s)"
     ended_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     elapsed=$((t1 - t0))
+
+    # The eval script appends checkpoint/eps/steps metadata to the JSON name
+    # (parameterized_filename), so the canonical ${save_json} the manifest,
+    # skip logic, and aggregator expect never exists. Canonicalize the newest
+    # parameterized output to the expected name.
+    if [ "${status}" -eq 0 ] && [ ! -f "${save_json}" ]; then
+        latest_json="$(ls -t "${out_dir}/ood_eval_${CHECKPOINT_KIND}"_*.json 2>/dev/null | head -n 1)"
+        if [ -n "${latest_json}" ]; then
+            cp -f "${latest_json}" "${save_json}"
+            echo "[info] canonicalized $(basename "${latest_json}") -> $(basename "${save_json}")"
+        fi
+    fi
 
     if [ "${status}" -eq 0 ]; then
         touch "${done_file}"
@@ -455,6 +494,8 @@ def load_row(algo):
         "cifar10_clean": scores.get("cifar10", scores.get("cifar10_test")),
         "cifar10_pgd": get(scores, "cifar10_pgd", "acc", default=get(scores, "cifar10_test_pgd", "acc")),
         "cifar10_aa": get(scores, "autoattack", "acc", default=get(scores, "cifar10_autoattack", "acc")),
+        "cifar10_sdf": get(scores, "superdeepfool", "robust_acc_at_inp_eps"),
+        "sdf_median_l2": get(scores, "superdeepfool", "median_l2"),
         "cifar10_1_clean": scores.get("cifar10.1_v6"),
         "cifar10_2_clean": scores.get("cifar10.2_test"),
         "cifar10c_s1": c10c_sev["1"],
@@ -474,6 +515,7 @@ metric_cols = [
     "cifar10_clean",
     "cifar10_pgd",
     "cifar10_aa",
+    "cifar10_sdf",
     "cifar10_1_clean",
     "cifar10_2_clean",
     "cifar10c_s1",
@@ -506,7 +548,7 @@ summary_path = OOD_ROOT / f"summary_seed{SEED}.json"
 summary_path.write_text(json.dumps({row["algo"]: row for row in rows}, indent=2))
 
 csv_path = OOD_ROOT / f"table_seed{SEED}.csv"
-csv_cols = ["method", "algo", *metric_cols, "ckpt", "json"]
+csv_cols = ["method", "algo", *metric_cols, "sdf_median_l2", "ckpt", "json"]
 with csv_path.open("w", newline="") as fh:
     writer = csv.DictWriter(fh, fieldnames=csv_cols)
     writer.writeheader()
@@ -518,14 +560,14 @@ latex_lines = [
     r"\begin{table*}[!t]",
     r"    \centering",
     r"    \renewcommand{\arraystretch}{1.15}",
-    r"    \caption{Accuracy (\%) under adversarial attacks, natural domain shifts and image corruptions. The left section reports results for the original CIFAR-10 test set (Clean, PGD, and AA). The center columns evaluate accuracy on the unseen domains of CIFAR-10.1 and 10.2. The right section (CIFAR-10-C) details performance across five increasing levels of corruption severity, with the final column representing the mean accuracy across all five levels. Bold values indicate the best results.}",
+    r"    \caption{Accuracy (\%) under adversarial attacks, natural domain shifts and image corruptions. The left section reports results for the original CIFAR-10 test set (Clean, PGD, AA, and SuperDeepFool). The center columns evaluate accuracy on the unseen domains of CIFAR-10.1 and 10.2. The right section (CIFAR-10-C) details performance across five increasing levels of corruption severity, with the final column representing the mean accuracy across all five levels. Bold values indicate the best results.}",
     r"    \vspace{-0.25cm}",
     r"    \resizebox{\linewidth}{!}{",
-    r"        \begin{tabular}{l ccc c c cccccc}",
+    r"        \begin{tabular}{l cccc c c cccccc}",
     r"            \toprule",
-    r"            \multirow{2.5}{*}{Method} & \multicolumn{3}{c}{CIFAR-10} & \multicolumn{1}{c}{CIFAR-10.1} & \multicolumn{1}{c}{CIFAR-10.2} & \multicolumn{6}{c}{CIFAR-10-C (Common Corruption)} \\",
-    r"            \cmidrule(lr){2-4} \cmidrule(lr){5-5} \cmidrule(lr){6-6} \cmidrule(lr){7-12}",
-    f"            & Clean & PGD$_{{\\varepsilon={INP_EPS}}}$ & AA$_{{\\varepsilon={AA_EPS}}}$ & Clean & Clean & 1 & 2 & 3 & 4 & 5 & Avg \\\\",
+    r"            \multirow{2.5}{*}{Method} & \multicolumn{4}{c}{CIFAR-10} & \multicolumn{1}{c}{CIFAR-10.1} & \multicolumn{1}{c}{CIFAR-10.2} & \multicolumn{6}{c}{CIFAR-10-C (Common Corruption)} \\",
+    r"            \cmidrule(lr){2-5} \cmidrule(lr){6-6} \cmidrule(lr){7-7} \cmidrule(lr){8-13}",
+    f"            & Clean & PGD$_{{\\varepsilon={INP_EPS}}}$ & AA$_{{\\varepsilon={AA_EPS}}}$ & SDF$_{{\\varepsilon={INP_EPS}}}$ & Clean & Clean & 1 & 2 & 3 & 4 & 5 & Avg \\\\",
     r"            \midrule",
 ]
 for row in rows:
@@ -534,6 +576,7 @@ for row in rows:
         fmt_latex(row, "cifar10_clean"),
         fmt_latex(row, "cifar10_pgd"),
         fmt_latex(row, "cifar10_aa"),
+        fmt_latex(row, "cifar10_sdf"),
         fmt_latex(row, "cifar10_1_clean"),
         fmt_latex(row, "cifar10_2_clean"),
         fmt_latex(row, "cifar10c_s1"),
@@ -560,7 +603,7 @@ print("=" * 132)
 print(f"  OOD evaluation summary (seed={SEED}, root={OOD_ROOT})")
 print("=" * 132)
 header = (
-    f"{'Method':<14} {'Clean':>8} {'PGD':>8} {'AA':>8} "
+    f"{'Method':<14} {'Clean':>8} {'PGD':>8} {'AA':>8} {'SDF':>8} {'SDF-mL2':>8} "
     f"{'10.1':>8} {'10.2':>8} {'C-s1':>8} {'C-s2':>8} {'C-s3':>8} "
     f"{'C-s4':>8} {'C-s5':>8} {'C-Avg':>8}"
 )
@@ -572,6 +615,8 @@ for row in rows:
         f"{fmt_plain(row['cifar10_clean']):>8} "
         f"{fmt_plain(row['cifar10_pgd']):>8} "
         f"{fmt_plain(row['cifar10_aa']):>8} "
+        f"{fmt_plain(row['cifar10_sdf']):>8} "
+        f"{fmt_plain(row['sdf_median_l2']):>8} "
         f"{fmt_plain(row['cifar10_1_clean']):>8} "
         f"{fmt_plain(row['cifar10_2_clean']):>8} "
         f"{fmt_plain(row['cifar10c_s1']):>8} "

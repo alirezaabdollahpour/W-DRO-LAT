@@ -340,6 +340,18 @@ case "${LOCAL_RUN_ONLY_ALGO}" in
     ;;
 esac
 
+# strong_convexity is the FIXED coefficient mu of the frozen outer potential
+# 0.5*mu*||x||^2, i.e. the identity component mu*x of the transport map
+# T = grad psi. The model constructor rejects negatives; validate here so a
+# bad ablation value fails before the cluster job burns its GPU allocation.
+for sc_var in LOCAL_NPF_STRONG_CONVEXITY LOCAL_NPF_LASTQUAD_STRONG_CONVEXITY; do
+  sc_val="${!sc_var}"
+  if ! [[ "${sc_val}" =~ ^[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$ ]]; then
+    echo "[FATAL] ${sc_var} must be a non-negative float, got: ${sc_val}" >&2
+    exit 1
+  fi
+done
+
 if ! is_truthy "${LOCAL_WRM_NORMALIZED_RADIUS_PROTOCOL}" && ! is_falsy "${LOCAL_WRM_NORMALIZED_RADIUS_PROTOCOL}"; then
   echo "[FATAL] LOCAL_WRM_NORMALIZED_RADIUS_PROTOCOL must be true/false-like, got: ${LOCAL_WRM_NORMALIZED_RADIUS_PROTOCOL}" >&2
   exit 1
@@ -472,11 +484,13 @@ if [ "${LOCAL_RUN_ONLY_ALGO}" = "npf" ]; then
   RANK_TAG="o$(tag_token "${LOCAL_NPF_OUTER_RANK}")_i$(tag_token "${LOCAL_NPF_INNER_RANK}")"
   ID_TAG="$(tag_token "${LOCAL_NPF_IDENTITY_INIT}")"
   RECT_TAG="$(tag_token "${LOCAL_NPF_POSITIVE_WEIGHT_RECTIFIER}")"
+  SC_TAG="$(tag_token "${LOCAL_NPF_STRONG_CONVEXITY}")"
 else
   ACT_TAG="$(tag_token "${LOCAL_NPF_LASTQUAD_ACTIVATION}")"
   RANK_TAG="$(tag_token "${LOCAL_NPF_LASTQUAD_OUTPUT_RANK}")"
   ID_TAG="$(tag_token "${LOCAL_NPF_LASTQUAD_IDENTITY_INIT}")"
   RECT_TAG="$(tag_token "${LOCAL_NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER}")"
+  SC_TAG="$(tag_token "${LOCAL_NPF_LASTQUAD_STRONG_CONVEXITY}")"
 fi
 RESET_TAG="$(tag_token "${LOCAL_NPF_RESET_OMEGA_EACH_BATCH}")"
 PROJ_TAG="$(tag_token "${LOCAL_NPF_PROJECT_TO_INPUT_BALL}")"
@@ -508,7 +522,7 @@ else
   IEPS_TAG="$(tag_token "${LOCAL_NPF_LASTQUAD_INIT_EPS}")"
   HID_TAG="$(tag_token "${LOCAL_NPF_LASTQUAD_HIDDEN}")"
 fi
-RUN_TAG=${RUN_TAG:-${ALG_TAG}_ott_lam${LAM_TAG}_cost${COST_TAG}_adv${TRAIN_LOSS_TAG}_lr${LR_TAG}_K${K_TAG}_ep${LOCAL_ADV_EPOCHS}_warm${LOCAL_WARMUP_EPOCHS}_rank${RANK_TAG}_id${ID_TAG}_ieps${IEPS_TAG}_act${ACT_TAG}_rect${RECT_TAG}_hid${HID_TAG}_reset${RESET_TAG}_proj${PROJ_TAG}_anch${ANCHOR_TAG}_${BN_TAG}_${ADV_MODE_TAG}_opt${OPT_TAG}_pgd${LOSS_TAG}_${GEOM_TAG}_${LOCAL_INP_EPS_PROTOCOL_TAG}${EPS_REQ_TAG}_eff${EPS_EFF_TAG}_rho${RHO_TAG}n${PGDN_TAG}_align${ALIGN_TAG}_seed${LOCAL_SEED}}
+RUN_TAG=${RUN_TAG:-${ALG_TAG}_ott_lam${LAM_TAG}_cost${COST_TAG}_adv${TRAIN_LOSS_TAG}_lr${LR_TAG}_K${K_TAG}_ep${LOCAL_ADV_EPOCHS}_warm${LOCAL_WARMUP_EPOCHS}_rank${RANK_TAG}_sc${SC_TAG}_id${ID_TAG}_ieps${IEPS_TAG}_act${ACT_TAG}_rect${RECT_TAG}_hid${HID_TAG}_reset${RESET_TAG}_proj${PROJ_TAG}_anch${ANCHOR_TAG}_${BN_TAG}_${ADV_MODE_TAG}_opt${OPT_TAG}_pgd${LOSS_TAG}_${GEOM_TAG}_${LOCAL_INP_EPS_PROTOCOL_TAG}${EPS_REQ_TAG}_eff${EPS_EFF_TAG}_rho${RHO_TAG}n${PGDN_TAG}_align${ALIGN_TAG}_seed${LOCAL_SEED}}
 
 export OMP_NUM_THREADS="${LOCAL_OMP_NUM_THREADS}"
 export MKL_NUM_THREADS="${LOCAL_MKL_NUM_THREADS}"

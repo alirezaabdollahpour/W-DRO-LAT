@@ -213,6 +213,38 @@ def _load_resume_payload(path: str) -> Dict[str, Any]:
     return payload
 
 
+# The strong-convexity coefficient mu lives in the psi_omega state_dict as the
+# outer PosDef diag_kernel, so on resume the checkpoint value silently wins
+# over the CLI flag. For npf_lastquad the outer quadratic is frozen (never
+# trained), meaning a mismatched resume would run the entire continuation at
+# the old mu while every new provenance artifact (summary.json, history CSV,
+# RUN_CONFIG env dump) records the new CLI value.
+_RESUME_STRONG_CONVEXITY_FIELDS = {
+    "npf_lastquad": ("npf_lastquad_strong_convexity",),
+    "npf": ("npf_strong_convexity",),
+}
+
+
+def _check_resume_strong_convexity(payload: Dict[str, Any], cfg) -> None:
+    stored_config = payload.get("config")
+    if not isinstance(stored_config, dict):
+        return
+    for field in _RESUME_STRONG_CONVEXITY_FIELDS.get(cfg.algorithm, ()):
+        if stored_config.get(field) is None:
+            continue
+        stored = float(stored_config[field])
+        requested = float(getattr(cfg, field))
+        if stored != requested:
+            raise ValueError(
+                f"--resume-checkpoint was trained with {field}={stored:g} but "
+                f"this run requests {field}={requested:g}. The resumed "
+                "psi_omega state dict carries the old outer PosDef diagonal, "
+                "so the requested value would be silently ignored while the "
+                "run's logs claim it. Re-launch with the matching value, or "
+                "train the ablation arm from scratch."
+            )
+
+
 def _metric_definitions(use_margin_loss: bool, transport_cost: str = "normalized_mse") -> Dict[str, str]:
     adv_loss = (
         "Mean logsumexp margin on T_omega(x): logsumexp_{j != y}(logit_j - logit_y)."
@@ -587,6 +619,7 @@ def main() -> None:
     )
 
     if resume_payload is not None:
+        _check_resume_strong_convexity(resume_payload, cfg)
         trainer.load_adversary_state_dicts(resume_payload, strict=True)
         if is_main:
             print(f"[input-icnn] resumed adversary from {cfg.resume_checkpoint}")

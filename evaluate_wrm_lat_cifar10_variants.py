@@ -1055,6 +1055,38 @@ def parse_args():
         action="store_true",
         help="Stream adv_lib attack metrics to a Visdom server (requires visdom).",
     )
+    # SuperDeepFool (L2 minimum-norm) evaluation
+    p.add_argument(
+        "--superdeepfool",
+        action="store_true",
+        help=(
+            "Enable SuperDeepFool L2 minimum-norm attack evaluation on the "
+            "CIFAR-10 test set (adv_lib implementation; vendored fallback in "
+            "third_party/adv_lib_vendored)."
+        ),
+    )
+    p.add_argument(
+        "--sdf-steps",
+        type=int,
+        default=100,
+        help=(
+            "SuperDeepFool iterations ('steps'; upstream default 100). All "
+            "other SDF parameters keep the upstream adv_lib defaults "
+            "(df_steps=100, overshoot=0.02, search_iter=10)."
+        ),
+    )
+    p.add_argument(
+        "--sdf-bs",
+        type=int,
+        default=256,
+        help="Batch size for the SuperDeepFool evaluation.",
+    )
+    p.add_argument(
+        "--sdf-max-examples",
+        type=int,
+        default=-1,
+        help="Cap on CIFAR-10 test examples for SuperDeepFool (-1 = all).",
+    )
     p.add_argument(
         "--advlib-visdom-port",
         type=int,
@@ -1418,6 +1450,42 @@ def main():
                         sev_line = f"{sev_line} | mean={corr_mean:.2f}%"
                     print(f"  {corruption:<18} {sev_line}")
 
+                # Per-severity averages over the evaluated corruption classes
+                # (matches the aggregation used by run_OOD_sweep.sh tables).
+                severity_means = {}
+                for sev in cifar10c_severities:
+                    vals = [
+                        float(summary[str(sev)])
+                        for summary in corruption_summaries.values()
+                        if isinstance(summary, dict)
+                        and isinstance(summary.get(str(sev)), (int, float))
+                    ]
+                    severity_means[str(sev)] = (
+                        round(float(np.mean(vals)), 2) if vals else None
+                    )
+                print("  " + "-" * 60)
+                for sev in cifar10c_severities:
+                    n_corr = sum(
+                        1
+                        for summary in corruption_summaries.values()
+                        if isinstance(summary, dict)
+                        and isinstance(summary.get(str(sev)), (int, float))
+                    )
+                    mean_val = severity_means[str(sev)]
+                    if mean_val is not None:
+                        print(
+                            f"  CIFAR-10-C severity {sev} avg "
+                            f"({n_corr} corruptions): {mean_val:.2f}%"
+                        )
+                    else:
+                        print(f"  CIFAR-10-C severity {sev} avg : (no data)")
+                sev_avg_vals = [v for v in severity_means.values() if v is not None]
+                if sev_avg_vals:
+                    print(
+                        f"  CIFAR-10-C average (mean of severity avgs): "
+                        f"{float(np.mean(sev_avg_vals)):.2f}%"
+                    )
+
                 overall_mean = float(np.mean(all_acc)) if all_acc else None
                 if overall_mean is not None:
                     print(f"  CIFAR-10-C mean : {overall_mean:.2f}%")
@@ -1435,6 +1503,7 @@ def main():
                 cifar10c_eval_summary = {
                     "corruptions": corruption_summaries,
                     "severities": cifar10c_severities,
+                    "severity_means": severity_means,
                     "max_examples": cifar10c_max_examples,
                     "mean": round(overall_mean, 2) if overall_mean is not None else None,
                     "data_dir": os.path.abspath(data_dir),
@@ -1835,6 +1904,183 @@ def main():
                         "iters": advlib_steps,
                         "max_examples": adv_eval_max_examples,
                     }
+
+    if args.superdeepfool:
+        print("\nEvaluating SuperDeepFool (L2 minimum-norm attack)...")
+        sdf_attack = None
+        sdf_impl = None
+        try:
+            from adv_lib.attacks.superdeepfool import sdf as sdf_attack  # type: ignore
+            sdf_impl = "adv_lib"
+        except ImportError:
+            try:
+                from third_party.adv_lib_vendored.superdeepfool import sdf as sdf_attack
+                sdf_impl = "vendored adv_lib@main"
+            except ImportError as err:
+                print(f"  SuperDeepFool unavailable: {err}")
+                results["scores"]["superdeepfool"] = {
+                    "status": "unavailable",
+                    "error": str(err),
+                }
+        if sdf_attack is not None:
+            # Record the exact non-exposed parameters actually in effect
+            # (upstream defaults: df_steps=100, overshoot=0.02, search_iter=10).
+            sdf_defaults = {
+                name: param.default
+                for name, param in inspect.signature(sdf_attack).parameters.items()
+                if param.default is not inspect.Parameter.empty
+                and name not in ("steps", "targeted")
+            }
+            pixel_model = PixelModelWrapper(base)
+            pixel_model.eval()
+            x_pix_sdf, y_sdf = collect_pixels_and_labels(
+                c10_loader,
+                max_examples=args.sdf_max_examples,
+                desc="SDF CIFAR-10",
+            )
+            num_samples = int(y_sdf.numel())
+            if num_samples == 0:
+                print("  SuperDeepFool : no samples collected.")
+                results["scores"]["superdeepfool"] = {"status": "empty"}
+            else:
+                print(
+                    f"  SuperDeepFool [{sdf_impl}]: steps={int(args.sdf_steps)}, "
+                    + ", ".join(f"{k}={v}" for k, v in sdf_defaults.items())
+                    + f", samples={num_samples}, bs={int(args.sdf_bs)}"
+                )
+                det_enabled = (
+                    torch.are_deterministic_algorithms_enabled()
+                    if hasattr(torch, "are_deterministic_algorithms_enabled")
+                    else False
+                )
+                set_det = getattr(torch, "use_deterministic_algorithms", None)
+                sdf_bs = max(1, int(args.sdf_bs))
+                clean_ok_parts, adv_ok_parts, norm_parts = [], [], []
+                try:
+                    if det_enabled and set_det is not None:
+                        set_det(False)
+                    for start in tqdm(
+                        range(0, num_samples, sdf_bs),
+                        desc="SuperDeepFool",
+                        leave=False,
+                        dynamic_ncols=True,
+                    ):
+                        x_b = (
+                            x_pix_sdf[start:start + sdf_bs]
+                            .to(device=device, dtype=torch.float32)
+                            .clamp_(0.0, 1.0)
+                        )
+                        y_b = y_sdf[start:start + sdf_bs].to(device)
+                        with torch.no_grad():
+                            clean_ok_b = pixel_model(x_b).argmax(dim=1) == y_b
+                        adv_b = sdf_attack(
+                            model=pixel_model,
+                            inputs=x_b,
+                            labels=y_b,
+                            steps=int(args.sdf_steps),
+                        )
+                        adv_b = adv_b.detach().clamp_(0.0, 1.0)
+                        with torch.no_grad():
+                            adv_ok_b = pixel_model(adv_b).argmax(dim=1) == y_b
+                        norms_b = (adv_b - x_b).flatten(1).norm(p=2, dim=1)
+                        clean_ok_parts.append(clean_ok_b.cpu())
+                        adv_ok_parts.append(adv_ok_b.cpu())
+                        norm_parts.append(norms_b.cpu())
+                finally:
+                    if det_enabled and set_det is not None:
+                        set_det(True)
+
+                clean_ok = torch.cat(clean_ok_parts)
+                adv_ok = torch.cat(adv_ok_parts)
+                norms = torch.cat(norm_parts)
+                attack_success = clean_ok & ~adv_ok
+
+                clean_acc = 100.0 * clean_ok.float().mean().item()
+                acc_unbounded = 100.0 * adv_ok.float().mean().item()
+                n_cc = int(clean_ok.sum())
+                success_rate = (
+                    100.0 * attack_success.sum().item() / n_cc if n_cc else None
+                )
+                # Min-norm statistics over clean-correct samples; failed
+                # attacks count as +inf (robust median convention).
+                norms_cc = norms[clean_ok]
+                success_cc = attack_success[clean_ok]
+                eff_norms = torch.where(
+                    success_cc,
+                    norms_cc,
+                    torch.full_like(norms_cc, float("inf")),
+                )
+                median_l2 = float(eff_norms.median().item()) if n_cc else None
+                if median_l2 is not None and not math.isfinite(median_l2):
+                    median_l2 = None
+                mean_l2_success = (
+                    float(norms_cc[success_cc].mean().item())
+                    if bool(success_cc.any())
+                    else None
+                )
+
+                def sdf_robust_acc_at(eps: float) -> float:
+                    # Same numerator convention as the PGD eval: a sample
+                    # counts as robust iff clean-correct AND (attack failed
+                    # OR the minimum-norm perturbation exceeds the budget).
+                    robust = clean_ok & (adv_ok | (norms > float(eps)))
+                    return 100.0 * robust.float().mean().item()
+
+                thresholds = [float(args.inp_eps)]
+                if args.inp_eps_sweep:
+                    thresholds.extend(float(e) for e in args.inp_eps_sweep)
+                thresholds = sorted(dict.fromkeys(thresholds))
+                robust_acc_at = {
+                    f"{eps:g}": round(sdf_robust_acc_at(eps), 2)
+                    for eps in thresholds
+                }
+                robust_acc_inp_eps = round(sdf_robust_acc_at(args.inp_eps), 2)
+
+                print(
+                    f"  clean acc={clean_acc:.2f}%, unbounded adv acc="
+                    f"{acc_unbounded:.2f}%, attack success (clean-correct)="
+                    + (f"{success_rate:.2f}%" if success_rate is not None else "--")
+                )
+                print(
+                    "  min-norm L2 (pixel space, clean-correct, failures=inf): "
+                    + (f"median={median_l2:.4f}" if median_l2 is not None else "median=inf")
+                    + (
+                        f", mean(successful)={mean_l2_success:.4f}"
+                        if mean_l2_success is not None
+                        else ""
+                    )
+                )
+                for eps in thresholds:
+                    print(
+                        f"  SDF robust acc @ eps={eps:g} : "
+                        f"{robust_acc_at[f'{eps:g}']:.2f}%"
+                    )
+                results["scores"]["superdeepfool"] = {
+                    "status": "ok",
+                    "impl": sdf_impl,
+                    "norm": "L2",
+                    "steps": int(args.sdf_steps),
+                    "params": {k: float(v) if isinstance(v, float) else v
+                               for k, v in sdf_defaults.items()},
+                    "num_examples": num_samples,
+                    "bs": sdf_bs,
+                    "clean_acc": round(clean_acc, 2),
+                    "acc_unbounded": round(acc_unbounded, 2),
+                    "attack_success_rate": (
+                        round(success_rate, 2) if success_rate is not None else None
+                    ),
+                    "median_l2": (
+                        round(median_l2, 6) if median_l2 is not None else None
+                    ),
+                    "mean_l2_success": (
+                        round(mean_l2_success, 6)
+                        if mean_l2_success is not None
+                        else None
+                    ),
+                    "inp_eps": float(args.inp_eps),
+                    "robust_acc_at_inp_eps": robust_acc_inp_eps,
+                    "robust_acc_at": robust_acc_at,
+                }
 
     # 5) Save JSON
     save_path = parameterized_filename(

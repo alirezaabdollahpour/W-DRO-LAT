@@ -183,9 +183,15 @@ class DiagnosticConfig:
         cfg.npf_lastquad_init_eps = float(
             env.get("LOCAL_NPF_LASTQUAD_INIT_EPS", cfg.npf_lastquad_init_eps)
         )
+        cfg.npf_lastquad_strong_convexity = float(
+            env.get("LOCAL_NPF_LASTQUAD_STRONG_CONVEXITY", cfg.npf_lastquad_strong_convexity)
+        )
         cfg.npf_lastquad_positive_weight_rectifier = env.get(
             "LOCAL_NPF_LASTQUAD_POSITIVE_WEIGHT_RECTIFIER",
             cfg.npf_lastquad_positive_weight_rectifier,
+        )
+        cfg.npf_strong_convexity = float(
+            env.get("LOCAL_NPF_STRONG_CONVEXITY", cfg.npf_strong_convexity)
         )
         cfg.inp_p = env.get("LOCAL_INP_P", cfg.inp_p)
         cfg.inp_eps = float(env.get("LOCAL_INP_EPS", cfg.inp_eps))

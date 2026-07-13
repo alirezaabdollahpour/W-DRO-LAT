@@ -154,7 +154,8 @@ class TrainConfig:
     #   * NPF      — BB+Armijo on ω parameters when
     #                npf_inner_optimizer="bb_armijo" (default)
     #   * NN-DRO   — BB+Armijo on MLP adversary parameters (replaces Adam)
-    #   * WRM      — BB+Armijo on z (input-space variant)
+    #   * WRM      — only with --wrm-step-rule bb_armijo (default is the
+    #                MPA-parity per-sample const_lr ascent)
     #   * Madry / RO is exempt: it uses fixed-step pixel-space l2-PGD
     #     with epsilon and no lambda penalty.
     #   * WFR      — BB+Armijo on the deterministic gradient step;
@@ -250,8 +251,21 @@ class TrainConfig:
     madry_pgd_restarts: int = 1
 
     # --- WRM hyperparameters ---
+    # WRM == MPA with R=1 (pure K-step per-sample particle ascent, no
+    # reassignment), sharing lambda_param / transport_cost / use_margin_loss
+    # / attack_clean_correct_only with MPA.
+    #   * "const_lr" (default): per-sample ascent on the WRM diminishing
+    #     schedule eta_s = wrm_inner_lr / sqrt(s) — the exact same code path
+    #     as MPA's round-0 burst, so WRM(K, lr) is bitwise MPA(R=1,
+    #     round0_steps=K, round0_lr=lr). Shard-invariant under DDP.
+    #   * "bb_armijo": the legacy shared line-searched rule on the
+    #     batch-mean objective (cross-method parity arm).
+    wrm_step_rule: str = "const_lr"
     wrm_inner_steps: int = 100
-    wrm_inner_lr: float = 1e-2
+    # Calibrated like MPA's ppa_round0_lr on the current 95.3%-clean R2.pth
+    # (margin, lambda=30 normalized_mse, K=20): 0.03 -> inner obj ~46 at
+    # mean pixel-L2 ~0.59 (the eval-radius scale).
+    wrm_inner_lr: float = 0.03
 
     # --- WFR hyperparameters ---
     wfr_epsilon: float = 0.1
@@ -318,10 +332,11 @@ class TrainConfig:
     #     ascent objective, logged metrics) uses the full λ.
     # All other knobs (steps, LRs, min_rounds, gain_rtol) are shared.
     ppa_round_order: str = "ascent_first"
-    # α for reassign_first_v2's round-0 penalty discount: λ₀ = λ/α. Only
-    # read by reassign_first_v2; 1.0 reduces v2 to reassign_first exactly.
-    # Measured round-0 activation on the current R2.pth at λ=30:
-    # α=6 (λ₀=5) -> 52.8% of samples jump; α=10 (λ₀=3) -> 72.7%.
+    # α for reassign_first_v2's round-0 penalty discount: λ₀ = λ/α. Read
+    # ONLY by reassign_first_v2 (ascent_first and reassign_first ignore
+    # it); 1.0 reduces v2 to reassign_first exactly. Measured round-0
+    # activation on the current R2.pth at λ=30 (z=x): α=6 (λ₀=5) -> 52.8%
+    # of samples jump; α=10 (λ₀=3) -> 72.7%.
     ppa_round0_lambda_damping: float = 6.0
     ppa_num_rounds: int = 5
     ppa_min_rounds: int = 2
@@ -1057,8 +1072,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # WRM
     wrm = parser.add_argument_group("wrm")
-    wrm.add_argument("--wrm-inner-steps", type=int, default=100)
-    wrm.add_argument("--wrm-inner-lr", type=float, default=1e-2)
+    wrm.add_argument(
+        "--wrm-step-rule",
+        type=str,
+        default="const_lr",
+        choices=["const_lr", "bb_armijo"],
+        help=(
+            "const_lr = per-sample ascent on the WRM diminishing schedule "
+            "wrm-inner-lr/sqrt(s), byte-identical to MPA's round-0 burst "
+            "(WRM == MPA with R=1). bb_armijo = legacy shared line-searched "
+            "rule on the batch-mean objective."
+        ),
+    )
+    wrm.add_argument(
+        "--wrm-inner-steps",
+        type=int,
+        default=100,
+        help="K: number of gradient-ascent steps per batch.",
+    )
+    wrm.add_argument(
+        "--wrm-inner-lr",
+        type=float,
+        default=0.03,
+        help=(
+            "const_lr rule only: base LR for the diminishing schedule "
+            "lr/sqrt(s). Calibrated like MPA's --ppa-round0-lr on the "
+            "current R2.pth."
+        ),
+    )
 
     # WFR
     wfr = parser.add_argument_group("wfr")
@@ -1121,8 +1162,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "each ascent from the best same-class training sample. "
             "reassign_first_v2 = same, but the round-0 reassignment is "
             "priced at lambda/--ppa-round0-lambda-damping so confidence-"
-            "driven multi-start jumps activate at z=x. All other "
-            "hyperparameters are shared."
+            "driven multi-start jumps activate at z=x; the damping affects "
+            "ONLY this order. All other hyperparameters are shared."
         ),
     )
     ppa.add_argument(
@@ -1130,10 +1171,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=6.0,
         help=(
-            "alpha for reassign_first_v2: the round-0 reassignment scores "
-            "candidates with lambda/alpha while everything else keeps the "
-            "full lambda. 1.0 = identical to reassign_first. On the current "
-            "R2.pth at lambda=30: alpha=6 activates ~53%% of round-0 jumps, "
+            "alpha for reassign_first_v2 ONLY (ascent_first/reassign_first "
+            "ignore it): the round-0 reassignment scores candidates with "
+            "lambda/alpha while everything else keeps the full lambda. "
+            "1.0 = identical to reassign_first. On the current R2.pth at "
+            "lambda=30: alpha=6 activates ~53%% of round-0 jumps, "
             "alpha=10 ~73%%."
         ),
     )
@@ -1452,6 +1494,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         "madry_pgd_steps": "madry_pgd_steps",
         "madry_pgd_step_size": "madry_pgd_step_size",
         "madry_pgd_restarts": "madry_pgd_restarts",
+        "wrm_step_rule": "wrm_step_rule",
         "wrm_inner_steps": "wrm_inner_steps",
         "wrm_inner_lr": "wrm_inner_lr",
         "wfr_epsilon": "wfr_epsilon",

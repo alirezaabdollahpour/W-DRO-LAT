@@ -26,7 +26,8 @@ Implements Algorithm ``implicit_mpa`` per batch: R rounds of
   the argmax anchor-dependent, so diversity is preserved (unlike deleting
   the penalty, which collapses each class onto one particle). Rounds >= 1,
   the closing reassignment, and all ascent objectives use the full λ.
-  Damping 1.0 makes v2 identical to reassign_first.
+  Damping 1.0 makes v2 identical to reassign_first. The damping is read
+  ONLY by reassign_first_v2 — ascent_first and reassign_first ignore it.
 
 Two step rules for (a), selected by ``cfg.ppa_step_rule``:
 
@@ -424,7 +425,9 @@ class NewPPATrainer(BaseAdvTrainer):
                 z_att, x_att, y_att, x, y, mask, global_pool=global_pool
             )
         elif order == "ascent_first":
-            # Algorithm 1: {K ascent steps; reassign} x R.
+            # Algorithm 1: {K ascent steps; reassign} x R. Always at the full
+            # λ — ppa_round0_lambda_damping is read ONLY by
+            # reassign_first_v2 and never affects this order.
             z_att = self._ascend(
                 z_att, x_att, y_att, int(cfg.ppa_round0_steps), round_idx=0
             )
