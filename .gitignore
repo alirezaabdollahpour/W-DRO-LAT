@@ -13,8 +13,8 @@ results/
 results/*
 fig/
 figs/
-# models/
-# models/*
+models/
+models/*
 checkpoints/
 checkpoints/*
 *json
@@ -65,3 +65,6 @@ Drifting-ICNN
 # training run outputs (checkpoints, epoch logs) — regenerate via launchers
 input_icnn_ddp_runs/
 input_icnn_ddp_runs_v1/
+*.pth
+Causal_Hedge
+Causal_Hedge/*
